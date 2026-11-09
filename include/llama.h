@@ -355,6 +355,14 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // [QLH-SPLIT] Load only source layers [split_layer_lo, split_layer_hi) and expose
+        // them as this model's local layers 0..N-1. A split context loads several ranges
+        // inside one process, so the range cannot come from LLAMA_LAYER_RANGE (process
+        // wide); that env var stays as the fallback for one-process-per-stage entry points.
+        // Both -1 means "the whole model", which is the only value that behaves as before.
+        int32_t split_layer_lo;
+        int32_t split_layer_hi;
     };
 
     struct llama_sampler_seq_config {
@@ -417,6 +425,14 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // [C-scheme] Return the pre-output_norm hidden state as the embedding.
+        //
+        // A layer-segment chain relays the raw output of layer hi-1 into layer hi, so the
+        // vector it forwards must not have been through the model's final RMSNorm -- doing so
+        // applies the norm twice and the logits diverge at the first token. Upstream sets
+        // t_embd after build_norm because pooling wants the normalised value.
+        bool embeddings_pre_norm;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -601,9 +617,20 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
+    // [QLH DFLASH-01] Encoder-input width. DFlash/EAGLE3 draft graphs consume
+    // target_layers * n_embd (8 x 2048 = 16384) wide rows, which is neither n_embd_inp
+    // (2048) nor n_embd_out (2048). Without this accessor the only way to size a buffer
+    // for those graphs is to guess -- and guessing n_embd_out made the warmup empty-run
+    // read past a 2048-wide zero state and take an access violation.
+    LLAMA_API int32_t llama_model_n_embd_inp_enc(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    // [QLH-SPLIT] Trunk layer count of the source model, for a model loaded with
+    // llama_model_params::split_layer_lo/hi. llama_model_n_layer() is the local depth of that
+    // range, so it says nothing about where the range sits in the source model. Returns 0 when
+    // the model was loaded whole (no range was requested).
+    LLAMA_API int32_t llama_model_n_layer_src  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -1008,6 +1035,39 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // [QLH-SPLIT] Attach continuation stages to a context. `stages` are borrowed: the
+    // caller owns them and must keep them alive while `ctx` decodes. With zero stages the
+    // context behaves exactly as before. A context with stages acts as the head of a
+    // pipeline: decode() runs the whole chain and the final logits stay reachable through
+    // the usual llama_get_logits* calls on `ctx`.
+    //
+    // The stages must tile the source model around the head: the head must start at layer 0
+    // (otherwise the layers below it would never be computed, and the head would decode from
+    // hidden states that nobody produced), the first stage starts where the head ends, every
+    // stage starts where the previous one ended, and the last one ends at the source model's
+    // trunk depth. Returns the number of stages attached, or -1 (with a logged reason) when
+    // the chain is inconsistent or the arguments are invalid; on failure the context keeps
+    // the chain it had.
+    LLAMA_API int32_t llama_split_attach(
+            struct llama_context * ctx,
+            struct llama_context ** stages,
+                          int32_t   n_stages);
+
+    LLAMA_API int32_t llama_split_n_stages(const struct llama_context * ctx);
+
+    // [QLH-SPLIT] Attach remote stages (host:port) to a context. The chain is then
+    // local head + remote tails; mixing with llama_split_attach is rejected. Returns the
+    // number attached, or -1 when it could not connect, when the chain already has local
+    // stages, or when the context cannot be expressed over the stage protocol (n_seq_max > 1
+    // is refused, with the reason in err_out). Decode refuses any batch whose M-RoPE position
+    // the protocol cannot carry (more than one nonzero position dimension per token).
+    LLAMA_API int32_t llama_split_attach_remote(
+            struct llama_context * ctx,
+            const char * const   * endpoints,
+                          int32_t   n_endpoints,
+                            char *      err_out,
+                          size_t      err_len);
 
     //
     // Extended batch API

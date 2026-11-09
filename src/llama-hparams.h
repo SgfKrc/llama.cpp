@@ -74,6 +74,15 @@ struct llama_hparams {
     uint32_t n_layer_nextn = 0;
     uint32_t n_layer_decision = 0; // trailing blocks that form the decision head
 
+    // [QLH-SPLIT] The source model's trunk depth and the source range this model exposes.
+    // n_layer_all above is the *local* block count for a range load (the loader overrides
+    // block_count before this is read), so neither the chain nor split-stage can recover the
+    // source depth from it. A whole-model load leaves n_layer_src = 0 and layer_hi = -1:
+    // there is no range to continue, and a chain must not treat it as one.
+    int32_t n_layer_src = 0;
+    int32_t layer_lo    = 0;
+    int32_t layer_hi    = -1;
+
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;

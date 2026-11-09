@@ -69,6 +69,27 @@ struct llama_model_loader {
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
 
+    // [C-scheme] load source layers [layer_lo, layer_hi) and expose them as local layers 0..N-1.
+    // Local blk.i is served from source blk.(i + layer_lo); block_count is overridden to hi-lo
+    // and nextn_predict_layers to 0 at metadata level (see the constructor).
+    int32_t layer_lo = 0;
+    int32_t layer_hi = -1;
+
+    // [C-scheme] the source model's trunk depth, read before block_count is overridden.
+    // Needed to tell a tail segment (hi == total) from a middle one.
+    //
+    // Named n_layer_src, NOT n_layer_all: llama_hparams has an n_layer_all of its own and it
+    // means the opposite thing for a range load -- the *local* block count (hi - lo, plus the
+    // MTP block when this is the tail). Two fields with the same name and opposite meanings is
+    // how "does this range reach the end of the model" gets answered with the wrong number.
+    int32_t n_layer_src = 0;
+
+    bool layer_range_active() const { return layer_hi > 0; }
+
+    // [C-scheme] which globals this range actually reads; non-range loads keep both.
+    bool needs_tok_embd() const { return !layer_range_active() || layer_lo == 0; }
+    bool needs_output()   const { return !layer_range_active() || layer_hi >= n_layer_src; }
+
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
@@ -82,11 +103,21 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // [C-scheme] set when the active layer range ends at the model's last layer and the file
+    // carries a NextN/MTP head. The range override forces load_mtp=false upstream, so the tail
+    // range re-enables it here rather than relying on a constructor argument it cannot change.
+    bool tail_keeps_mtp = false;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+
+        // [C-scheme] ignore the AUTO size threshold in add(). Set when a layer range makes a
+        // global tensor provably unread; those are ~0.5 GiB, well under the 4 GiB default, so
+        // the size heuristic would otherwise refuse to make them lazy.
+        bool force = false;
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
@@ -136,6 +167,17 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+
+    // [C-scheme] The file tensors this load takes, keyed by the weight they resolve to, for the
+    // "skipped" log. size_done cannot stand in for them: it counts *created* tensors, and a tied
+    // model creates token_embd twice (the embedding and its output alias) from one file range, so
+    // subtracting it from the file total would subtract that range twice. And a tensor can be
+    // created yet never read: under a layer range the globals this stage cannot use are mapped
+    // lazily, which costs address space but no IO and no resident pages, so it belongs in neither
+    // "loaded" nor "skipped".
+    std::set<const llama_tensor_weight *> weights_loaded; // read into a buffer, or mapped and used
+    std::set<const llama_tensor_weight *> weights_lazy;   // mapped but deliberately never faulted
+
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -181,7 +223,9 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        int32_t param_split_layer_lo = -1,
+        int32_t param_split_layer_hi = -1);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

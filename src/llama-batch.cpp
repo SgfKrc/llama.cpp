@@ -180,6 +180,13 @@ bool llama_batch_allocr::init(
     // token entry: [p, p, p, 0] (M-RoPE text position)
     // embd entry:  tokens[i].pos as-is
     //
+    // [QLH-SPLIT] This loop is the authority for the expansion rule. A split chain feeds its
+    // later stages embedding entries, which are NOT expanded here, so decode_split() has to
+    // expand them itself before they go on the wire or into a local hop: split_expand_pos()
+    // in src/llama-context.cpp reproduces this expression verbatim. The two must change
+    // together -- a chain that expands on one side only diverges silently (position 0 is
+    // identical either way, so a one-token test passes).
+    //
 
     pos.resize((size_t) n_tok*n_pos_per_embd);
     for (int32_t i = 0; i < n_tok; ++i) {

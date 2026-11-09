@@ -440,3 +440,20 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# [QLH-SPLIT] End-to-end check for split chains: whole model vs 0:N + N:M, compared bit for
+# bit. Built but NOT registered with ctest -- it needs a real GGUF, and a hardcoded path to
+# someone's disk is worse than a test that has to be run by hand. The model path comes from
+# argv[1], else QLH_SPLIT_MODEL; when neither is given the test prints one line and exits 0.
+# ONLY_SPLIT=1 and QLH_SPLIT_REMOTE=host:port switch it to the chain-only and cross-process modes.
+llama_build(split-smoke.cpp LINK llama)
+
+# [QLH-SPLIT] Two numeric preconditions of speculative decoding on a chain: every row the
+# caller marked as an output has its own logits row (verification reads k+1 argmaxes), and the
+# MTP draft context built over the tail segment produces bitwise the same logits as the one
+# built over the whole model. Also a manual test for the same reasons as split-smoke.
+llama_build(split-rows.cpp LINK llama)
+
+# [QLH-SPLIT] DFlash 草稿模型的 8 个 tap（源层 2/7/12/17/23/28/33/38）在链上的逐位验证：
+# 单 ubatch 下比「整模 8 路」与「head 6 路 + tail 2 路」的拼接，以及两边的 logits。
+llama_build(dflash-taps.cpp LINK llama)

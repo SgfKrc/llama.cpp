@@ -7,3 +7,6 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+
+# [QLH-SPLIT] built by hand and by cmake, needs a real gguf, never belongs in git
+split-smoke.exe

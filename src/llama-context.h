@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-split-remote.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -26,6 +27,11 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+
+// [QLH-SPLIT] The aggregate memory view over a chain; defined in llama-memory-split.h. Only a
+// unique_ptr to it is held here, and the destructor of llama_context lives in the .cpp that
+// includes the definition, so a forward declaration is enough.
+struct llama_memory_split;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -162,7 +168,29 @@ struct llama_context {
                        ggml_status & ret);
 
     int encode(const llama_batch_ext & batch_inp);
+    // [QLH-SPLIT] decode() dispatches: with split_stages empty it is exactly decode_plain(),
+    // which is the pre-existing whole-model path.
     int decode(const llama_batch_ext & batch_inp);
+    int decode_plain(const llama_batch_ext & batch_inp);
+    int decode_split(const llama_batch_ext & batch_inp);
+
+    // Borrowed continuation stages; see split_stages.
+    int  split_attach(llama_context ** stages, int32_t n);
+    int  split_attach_remote(const std::vector<std::string> & endpoints, std::string & err);
+    // Both carriers count: a chain can be local, remote, or (never both -- see split_attach)
+    // one or the other, and a caller asking how long the chain is means what decode drives.
+    int32_t split_n_stages() const { return (int32_t) (split_stages.size() + split_remotes.size()); }
+
+    // [QLH-SPLIT] Whether the chain is still trustworthy, and why not. Defined in the .cpp: the
+    // answer lives in llama_memory_split, which is only forward-declared here. See
+    // llama_context_split_failed() in llama-ext.h for the contract.
+    bool         split_failed()  const;
+    const char * split_failure() const;
+
+    // [QLH-SPLIT] v6: the last state restore found a snapshot the stage no longer holds. Not a
+    // chain failure -- nothing was applied -- so it is answered separately. See
+    // llama_context_split_state_stale() in llama-ext.h.
+    bool         split_state_stale() const;
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -286,7 +314,88 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // [QLH-SPLIT] v5: the remote candidate channel. These are the three operations llama-ext.h
+    // exports; they live here because the state they touch (split_remotes, split_cand_*) is
+    // private, and because "does this context have a remote stage" must not be answered by
+    // inspecting a member from outside the class.
+    bool     split_has_remote() const { return !split_remotes.empty(); }
+
+    // Arms the next remote decode. Safe for a local chain and a whole model: it just clears.
+    void     split_request_candidates(const qlh_split::cand_req * req,
+                                      const llama_logit_bias * biases, uint32_t n_bias,
+                                      const llama_token * hist, uint32_t n_hist);
+
+    // Candidates of the last remote decode; see llama-ext.h for the row contract.
+    uint32_t split_take_candidates(const llama_split_token_cand ** cands, int32_t * row) const;
+
+    // [QLH-SPLIT] v7: the per-row verify channel, same shape as the two above. `on` arms the next
+    // remote decode; a local chain and a whole model ignore it (there is no wire to spare), which
+    // is why the caller does not have to distinguish the chain kinds.
+    void        split_request_verify_rows(bool on);
+    llama_token split_verified_token(int32_t idx) const;
+
+    // [QLH-SPLIT] v8: the remote MTP draft. Same rule as the channels above -- a local chain and a
+    // whole model answer "no" and the caller keeps its own path, so nothing upstream has to know
+    // which kind of chain it is driving.
+    //
+    // `split_mtp_ready()` is a startup property (the tail reported a draft context in OP_HELLO);
+    // `split_mtp_draft()` is the per-round call. The latter runs one round trip, not k: the tail
+    // runs the recursive draft loop in its own memory, which is the only way the draft can be
+    // remote at all (draft i needs draft i-1's h, so the steps cannot be batched).
+    bool split_mtp_ready() const;
+
+    // Arms the next remote decode to answer with the h_nextn rows of the rows it answers for.
+    // Ignored by a local chain and a whole model, like every other arming call here.
+    void     split_request_nextn_rows(bool on);
+
+    // h_nextn rows of the last remote decode, for the caller that feeds the draft. `row0` is the
+    // batch row the first returned row belongs to; `n_embd` the width. All are 0 when the last
+    // decode did not carry them.
+    uint32_t split_take_nextn(const float ** rows, int32_t * row0, uint32_t * n_embd) const;
+
+    // Runs one draft round on the remote tail. Returns the number of drafts written to `out`
+    // (0 when the chain cannot draft -- whole model, local chain, or a stage that lost its MTP
+    // context) and -1 on a transport failure, which the caller turns into "no drafts" as well.
+    int split_mtp_draft(const float * h, int32_t token, int32_t pos, uint32_t k,
+                        int32_t seq_id, int32_t * out, uint32_t * n_out);
+
+    // [QLH-SPLIT] v9: the layer-input tap channel. Unlike the three remote channels above this one is
+    // *not* armed per frame: which layers a draft model reads is a property of the chain, so the set
+    // is sticky and every decode asks for it until it is cleared. That is also what keeps the arming
+    // out of the server's per-frame path -- the speculative driver sets it once, from the draft
+    // model's own target_layers.
+    //
+    // Ignored by a local chain and by a whole model (both clear the set): a local chain reads the
+    // taps out of the context that owns them, which is the same process.
+    void split_set_layer_inp(const uint32_t * ids, uint32_t n);
+
+    // The taps the last remote decode answered: `n` blocks, each `n_rows` rows of `n_embd` floats and
+    // the source-layer id it belongs to. Only the ids some remote stage owned are here, so a caller
+    // must look its layers up by id rather than by position.
+    uint32_t split_take_layer_inp_n() const { return (uint32_t) split_remote_tap.size(); }
+    const float * split_take_layer_inp(uint32_t i, uint32_t * id, uint32_t * n_rows, uint32_t * n_embd) const;
+
 private:
+    // [QLH-SPLIT] decode_split() is composed of these. They are members only because they reach
+    // into the chain (split_stages / split_remotes / split_cand_*); everything that needs nothing
+    // but the public context API stays a file-local helper in llama-context.cpp. Splitting it
+    // this way is what puts "admit, head, then remote-or-local" on one screen.
+    int  split_admit_batch(const llama_batch_ext & batch_inp);
+    int  split_self_heal(const llama_batch_ext & batch_inp);
+    int  split_drive_remote(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
+                            int32_t n_tok, int32_t n_embd);
+    int  split_drive_local(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
+                           int32_t n_tok, int32_t n_embd);
+
+    // [QLH-SPLIT] The split_remote_* answer slots are written only through these three, and both
+    // stores start by resetting them: "clear before fill" is a property of writing at all, not a
+    // step a caller has to remember. reset() on its own is the frame-start clear -- the one that
+    // must happen before anything can fail, so a failed frame answers null from get_logits_ith()
+    // instead of handing back the previous frame's logits.
+    void split_remote_reset();
+    void split_remote_store_cands(std::vector<qlh_split::token_cand> && cands, int32_t row);
+    void split_remote_store_logits(std::vector<float> && logits, uint32_t n_vocab, int32_t row);
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -346,6 +455,100 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // [QLH-SPLIT] Optional continuation stages. Empty means "this context runs the whole
+    // model", which is the only shape that existed before this field and must keep
+    // behaving identically. When non-empty, decode() drives this context as the head and
+    // hands the hidden states to each stage in turn; the stages are borrowed, not owned.
+    // See the split_* comments in llama-context.cpp for the contracts each stage must meet.
+    std::vector<llama_context *> split_stages;
+
+    // Non-null iff the chain has stages (local or remote). It is what llama_get_memory()
+    // returns, so that llama-server's KV bookkeeping sees the whole chain rather than just the
+    // head -- for a remote chain the head is the only stage with a local memory object, which is
+    // exactly why the remote ones are dispatched from this view instead.
+    std::unique_ptr<llama_memory_split> split_memory;
+
+    // [QLH-SPLIT] Remote stages. A chain is either all-local or local-head-plus-remote-tails;
+    // mixing both kinds in one chain is rejected rather than half-supported, because the two
+    // paths have genuinely different failure modes and a half-tested blend of them would be
+    // worse than either.
+    std::vector<std::unique_ptr<llama_split_remote>> split_remotes;
+
+    // Logits produced by the last remote stage. There is no local context holding them, so the
+    // chain keeps them here and get_logits_ith() answers from this buffer. A remote tail sends
+    // exactly one row (its last token), so the batch index that row belongs to is kept next to
+    // it instead of being assumed to be 0.
+    std::vector<float> split_remote_logits;
+    uint32_t           split_remote_n_vocab = 0;
+    int32_t            split_remote_logits_row = -1;
+
+    // [QLH-SPLIT] v5: the candidate channel. The driving side asks for candidates one decode at
+    // a time (llama_split_request_candidates in llama-ext.h), because whether the k candidates
+    // are enough is a property of *this* request's sampler chain -- grammar, pre-sampling
+    // logprobs, top_k <= 0 all change it -- and the tail can only answer what it was asked.
+    //
+    // Kept here rather than in llama_split_remote because the decision is per request and the
+    // connection outlives it: a request that falls back must not leave the flag set for the next
+    // one, and decode_split() clears it after every frame it used.
+    bool                          split_cand_wanted = false;
+    qlh_split::cand_req           split_cand_req{};
+    std::vector<llama_logit_bias> split_cand_bias;
+    std::vector<llama_token>      split_cand_hist;
+
+    // Candidates of the last remote decode (sorted by descending logit), and the batch row they
+    // belong to. Empty when the tail answered with the whole row instead.
+    std::vector<qlh_split::token_cand> split_remote_cands;
+    int32_t                            split_remote_cands_row = -1;
+
+    // [QLH-SPLIT] v7: the per-row verify channel. `split_verify_wanted` is armed by the caller
+    // for exactly one decode (llama_split_request_verify_rows in llama-ext.h), the same way the
+    // candidate channel is; `split_remote_verify` holds the token id the tail chose for every row
+    // of the frame it answered, in row order. Empty means "the last decode did not use this
+    // channel", which is also what makes get_logits_ith() answer null for a verify frame: no row
+    // of logits crossed the wire.
+    bool                 split_verify_wanted = false;
+    std::vector<int32_t> split_remote_verify;
+
+    // [QLH-SPLIT] v7: how many times a verify request had to fall back to the whole-row path
+    // because the frame had more rows than MAX_VERIFY_ROWS. Reported once, so an operator can
+    // tell "the channel is off" from "this batch was too big" without a log line per token.
+    bool split_verify_row_warned = false;
+
+    // [QLH-SPLIT] v8: the h_nextn rows of the last remote decode. The head cannot compute them --
+    // t_h_nextn is RMSNorm(last trunk layer output) and that layer lives in the tail -- so the tail
+    // sends them back on the decode that needs them and they are kept here until the next decode
+    // overwrites them (split_remote_reset).
+    //
+    // `split_nextn_wanted` is armed for exactly one decode by the speculative driver, the same way
+    // the two channels above are; `embd` is stored next to the rows because a stage that answered a
+    // different width must be caught by the caller, not silently reinterpreted.
+    bool               split_nextn_wanted     = false;
+    std::vector<float> split_remote_nextn;
+    uint32_t           split_remote_nextn_embd = 0;
+    int32_t            split_remote_nextn_row0 = -1;
+    // One line per process when a frame asked for those rows and the tail answered none.
+    bool               split_nextn_warned      = false;
+
+    // [QLH-SPLIT] v9: the layer-input tap channel. `split_tap_ids` is the set of *source-model* layer
+    // ids every remote decode asks for (empty for a whole model and for a local chain, where nothing
+    // has to cross a wire). Each stage answers the ids inside its own range, so one set covers a chain
+    // of any length; `split_remote_tap` holds what the last decode actually answered, one block per id,
+    // each block [n_rows][n_embd] -- rows are per *frame* row, because a draft injects every position of
+    // the batch, not one anchor row.
+    std::vector<uint32_t> split_tap_ids;
+
+    struct split_tap_block {
+        uint32_t           id = 0;
+        std::vector<float> rows;
+    };
+
+    std::vector<split_tap_block> split_remote_tap;
+    uint32_t                     split_remote_tap_embd = 0;
+    uint32_t                     split_remote_tap_rows = 0;
+    // One line per process, so a chain whose stages do not own the head's tap layers says so once
+    // instead of once per token.
+    bool                         split_tap_warned      = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

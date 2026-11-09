@@ -31,6 +31,14 @@
 
 #define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
 
+// [QLH-SPLIT] Upper bound for --split-rs-seq. The value is snapshots per sequence, and every
+// stage that holds recurrent state allocates (1 + N) copies of it, so it belongs in the same
+// class as a batch size, not a context length: a speculative draft block is 1 + n_max tokens,
+// which is tens. 4096 is far above any real draft and still far below "an allocation the machine
+// cannot satisfy", which is what an unbounded value (or the wrapped 4294967295 that
+// std::stoul("-1") produced) reached.
+static constexpr int COMMON_SPLIT_RS_SEQ_MAX = 4096;
+
 using json = common_json;
 using namespace common_arg_utils;
 
@@ -835,7 +843,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type");
+                // [QLH-SPLIT] --split-remote is one option per stage, so repeating it is the
+                // intended syntax, not a mistake the comma-separated form would fix.
+                const bool skip = (arg == "--spec-type" || arg == "--split-remote");
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -1228,7 +1238,8 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
             throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
         }
         if (!seen_args.insert(arg).second) {
-            const bool skip = (arg == "--spec-type");
+            // [QLH-SPLIT] see the note in common_params_parse_ex: --split-remote repeats by design.
+            const bool skip = (arg == "--spec-type" || arg == "--split-remote");
 
             if (!skip) {
                 LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -1256,6 +1267,20 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
     return true;
 }
 
+
+// [QLH-SPLIT] Is a layer range in effect for this process? The loader's rule, mirrored: the
+// params win, LLAMA_LAYER_RANGE is the fallback, and only a well-formed lo:hi counts (anything
+// else is ignored there and leaves the whole model loaded).
+static bool common_split_layer_range_in_effect(const common_params & params) {
+    if (params.split_layer_lo >= 0 && params.split_layer_hi > params.split_layer_lo) {
+        return true;
+    }
+    const char * lr = std::getenv("LLAMA_LAYER_RANGE");
+    int lo = -1;
+    int hi = -1;
+    return lr != nullptr && sscanf(lr, "%d:%d", &lo, &hi) == 2 && lo >= 0 && hi > lo;
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
@@ -1278,6 +1303,40 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        // QLH: ngram size cross-validation, done here rather than in each option's callback.
+        // size_m < size_n produces zero drafts on every call: ngram-map.cpp:95-101 takes
+        // copy_max = min(size_m, remaining) and returns empty whenever copy_max <
+        // n_draft_min (= size_n). The defaults are 12/48 so upstream never hits it, but a
+        // user tuning the pair can, silently. Validating after parsing also avoids an order
+        // dependency -- `-size-n 60 -size-m 100` must not fail on the first option.
+        {
+            const auto & ng = ctx_arg.params.speculative.ngram_simple;
+            if (ng.size_m < ng.size_n) {
+                throw std::invalid_argument(string_format(
+                    "ngram size M (%u) must be >= ngram size N (%u): smaller values produce "
+                    "no drafts at all (ngram-map.cpp:95-101)", ng.size_m, ng.size_n));
+            }
+        }
+        // [QLH-SPLIT] --split-remote describes what continues this process's head; the head
+        // itself is whatever --split-layer-range loads here. Without a range this process would
+        // load the whole model, and llama_split_attach_remote() refuses that at startup -- with a
+        // message about the loaded range, several seconds and one model load later. Reject at
+        // parse time so the error names the argument that is actually missing.
+        //
+        // The range has a second entry point, though: LLAMA_LAYER_RANGE, the loader's fallback
+        // for one-process-per-stage runs (--split-layer-range is already accepted by the loader
+        // there, but the env var is what a deployment-typed command line uses). Testing only the
+        // flag rejected `LLAMA_LAYER_RANGE=0:8 --split-remote host:port`, a configuration that
+        // loads and serves exactly the intended head. Ask the same question the loader asks: is
+        // any range in effect for this process?
+        if (!ctx_arg.params.split_remote.empty() && !common_split_layer_range_in_effect(ctx_arg.params)) {
+            throw std::invalid_argument(
+                "--split-remote needs a head layer range: --split-layer-range 0:N or "
+                "LLAMA_LAYER_RANGE=0:N. The remote stages continue this process's head, and "
+                "without a layer range there is no head -- the whole model would be loaded here "
+                "and the remote stage handed nothing to continue. "
+                "Start the head with e.g. --split-layer-range 0:8 --split-remote host:port");
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -2777,6 +2836,105 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    // [QLH-SPLIT] Same range the loader picks up from LLAMA_LAYER_RANGE, but per model
+    // instead of per process -- a split context loads several ranges in one process.
+    add_opt(common_arg(
+        {"--split-layer-range"}, "lo:hi",
+        "load only source layers [lo, hi) and expose them as local layers 0..N-1 "
+        "(default: the whole model)",
+        [](common_params & params, const std::string & value) {
+            int lo = -1;
+            int hi = -1;
+            if (sscanf(value.c_str(), "%d:%d", &lo, &hi) != 2 || lo < 0 || hi <= lo) {
+                throw std::invalid_argument(string_format(
+                    "invalid --split-layer-range '%s': expected lo:hi with 0 <= lo < hi",
+                    value.c_str()));
+            }
+            params.split_layer_lo = lo;
+            params.split_layer_hi = hi;
+        }
+    ));
+
+    add_opt(common_arg(
+        {"--split-tail-range"}, "lo:hi",
+        "[QLH-SPLIT] load a second stage for layers [lo, hi) and drive it as the tail of a "
+        "split chain (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            int lo = -1;
+            int hi = -1;
+            if (sscanf(value.c_str(), "%d:%d", &lo, &hi) != 2 || lo < 0 || hi <= lo) {
+                throw std::invalid_argument(string_format(
+                    "invalid --split-tail-range '%s': expected lo:hi with 0 <= lo < hi",
+                    value.c_str()));
+            }
+            params.split_tail_lo = lo;
+            params.split_tail_hi = hi;
+        }
+    // [QLH-SPLIT] Only llama-server attaches the tail (server-context.cpp); every other example
+    // loads whatever --split-layer-range asked for, ignores the tail, and -- because
+    // split_tail_lo >= 0 also disables the truncated-model check in common.cpp -- serves a model
+    // that is missing its last layers. llama-cli --split-layer-range 0:20 --split-tail-range
+    // 20:24 used to do exactly that: load 0:20, attach nothing, print garbage. Restricting the
+    // option makes that a parse error instead of a wrong answer.
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--split-remote"}, "host:port",
+        "[QLH-SPLIT] drive a split chain whose remaining stages are split-stage processes: "
+        "repeat once per stage, in chain order (e.g. --split-remote 10.0.0.2:9331 "
+        "--split-remote 10.0.0.3:9332). The head is loaded here with --split-layer-range 0:N. "
+        "Every stage must be started with -c and -b at least as large as this server's -c and "
+        "-ubatch-size; the identity handshake checks the stage's layer range, model depth and "
+        "width, not its capacity, so a stage that is too small surfaces as an out-of-space error "
+        "on the prompts it cannot hold. "
+        "Mutually exclusive with --split-tail-range (default: none, the chain is local)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("--split-remote needs host:port");
+            }
+            params.split_remote.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--split-rs-seq"}, "N",
+        "[QLH-SPLIT] recurrent-state snapshots per sequence on every stage of a split chain. "
+        "0 is a supported value for a local chain (the server restores a context checkpoint "
+        "instead of truncating the KV, and a chain's checkpoint covers every stage); a remote "
+        "stage process must be > 0, because its seq_rm arrives over the wire and there is no "
+        "checkpoint out there (split-stage refuses to start with 0). Raise it for speculative "
+        "decoding, where a draft is rolled back without a checkpoint (default: 0, derived from "
+        "the speculative config)",
+        [](common_params & params, const std::string & value) {
+            // [QLH-SPLIT] std::stoul accepts a leading '-' and wraps it (unsigned long max), so
+            // `--split-rs-seq -1` silently became 4294967295 and went straight into the state
+            // buffers, which are allocated as (1 + n_rs_seq) copies of the recurrent state: a
+            // typo turned into an allocation nobody could satisfy. Parse as a signed number and
+            // bound it, and reject trailing junk that stoul would have ignored.
+            long long v = 0;
+            try {
+                size_t used = 0;
+                v = std::stoll(value, &used);
+                if (used != value.size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+            } catch (const std::exception &) {
+                throw std::invalid_argument(string_format(
+                    "invalid --split-rs-seq '%s': expected a number between 0 and %d",
+                    value.c_str(), COMMON_SPLIT_RS_SEQ_MAX));
+            }
+            if (v < 0 || v > COMMON_SPLIT_RS_SEQ_MAX) {
+                throw std::invalid_argument(string_format(
+                    "--split-rs-seq %lld is out of range: 0..%d. It is the number of recurrent-state "
+                    "snapshots kept per sequence and multiplies the state buffers by (1 + N) on "
+                    "every stage that holds state; useful values are the size of a speculative "
+                    "draft block, not a context length",
+                    v, COMMON_SPLIT_RS_SEQ_MAX));
+            }
+            params.split_rs_seq = (uint32_t) v;
+        }
+    ));
+
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -2939,9 +3097,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--op-offload"},
         {"--no-op-offload"},
-        string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
+        string_format("whether to offload host tensor operations to device (default: %s; a split "
+                      "stage runs with it off, see src/qlh-split-defaults.h)", params.no_op_offload ? "false" : "true"),
         [](common_params & params, bool value) {
             params.no_op_offload = !value;
+            // [QLH-SPLIT] v2.4: remember that this was given, so the split-stage default applied
+            // after parsing (tools/server/server-context.cpp) cannot overwrite an explicit flag.
+            params.no_op_offload_explicit = true;
         }
     ));
     add_opt(common_arg(

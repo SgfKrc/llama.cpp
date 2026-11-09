@@ -102,6 +102,12 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// [QLH-SPLIT] true when an implementation keeps its own draft KV across rounds (the keep-KV chain
+// route, QLH_CHAIN_DRAFT_KEEP_KV). The server must then skip its per-round trim of the draft KV
+// after draft(): the rows of the round that was just made are the history this route exists for,
+// and trimming there is indistinguishable from not having the route at all.
+bool common_speculative_keeps_draft_kv(const common_speculative * spec);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

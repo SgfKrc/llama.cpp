@@ -126,10 +126,35 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+            // [QLH-SPLIT] A chain with remote stages carries one seq_id per batch
+            // (src/llama-split-proto.h), so it can only ever drive one slot. "Auto" therefore
+            // means 1 here instead of 4; picking 4 would fail the attach a few seconds later
+            // with a message about seq ids rather than about -np.
+            if (!params.split_remote.empty()) {
+                SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 1 "
+                        "(a remote split chain decodes one sequence at a time)\n");
+                params.n_parallel = 1;
+            } else {
+                SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
-            params.n_parallel = 4;
-            params.kv_unified = true;
+                params.n_parallel = 4;
+                params.kv_unified = true;
+            }
+        }
+
+        if (!params.split_remote.empty() && params.n_parallel > 1) {
+            // [QLH-SPLIT] Same boundary as llama_context::split_attach_remote() -- the full
+            // reasoning is recorded there, next to the n_seq_max check. Caught here first so the
+            // error arrives before a model load, but it has to say what the operator can do,
+            // not just "unsupported": single-sequence is the design, and the ways to run
+            // concurrently are elsewhere.
+            SRV_ERR("a remote split chain is single-sequence by design (its stage protocol carries "
+                    "one seq_id per decode frame), so it drives one slot: use -np 1 (got "
+                    "n_parallel = %d). For concurrency, run one llama-server per chain -- each "
+                    "groups its own chain -- or use a local chain "
+                    "(--split-layer-range 0:N --split-tail-range N:M), which supports -np > 1.\n",
+                    params.n_parallel);
+            return false;
         }
     }
 

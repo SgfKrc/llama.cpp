@@ -50,3 +50,17 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
+
+// [QLH-SPLIT] v9: would this sampler mask `token` from its *current* state?
+//
+// Read-only, and deliberately not implemented by calling apply(): apply() happens to be a pure
+// mask today (it only writes -INFINITY into the candidate array), but the state machine advances
+// in accept() -- on remaining--, on the FORCING -> DONE transition and on the UTF-8 wait -- so a
+// check that went through the stateful entry points would consume budget or advance the forcing
+// position. This one touches nothing, which is what lets the per-row verify channel ask the
+// question per row and then decide whether the frame is usable at all.
+//
+// The answer is exactly apply()'s mask: false while the sampler passes the vocabulary through
+// (IDLE / COUNTING / WAITING_UTF8 / DONE, and FORCING once its forced sequence has been emitted),
+// true only for a token outside the single forced token of the current FORCING position.
+bool common_reasoning_budget_rejects(const struct llama_sampler * smpl, llama_token token);

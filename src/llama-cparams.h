@@ -33,6 +33,8 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    // [C-scheme] expose the pre-output_norm hidden as the embedding (relay vector)
+    bool embeddings_pre_norm;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;

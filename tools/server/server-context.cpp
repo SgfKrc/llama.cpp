@@ -16,6 +16,16 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+// [QLH-SPLIT] llama_context_split_failure()/llama_context_split_failed(): the staging API that
+// says whether a remote chain is still trustworthy, so a failed decode can name the reason
+// instead of only "Compute error.".
+#include "../../src/llama-ext.h"
+// [QLH-SPLIT] v2.3: the VRAM budget check, shared with the split-stage tail so both ends of a
+// chain judge a segment the same way (see the header for why the check exists).
+#include "../../src/qlh-vram-budget.h"
+// [QLH-SPLIT] v2.4: the op_offload default a split stage runs with, shared with tools/split-stage
+// so the head and its stages cannot disagree about the switch (see the header for the measurement).
+#include "../../src/qlh-split-defaults.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -25,6 +35,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>   // [QLH-SPLIT] v7: INT32_MAX for the "no draft cap" sentinel
 #include <cinttypes>
 #include <deque>
 #include <exception>
@@ -300,6 +311,17 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // [QLH-SPLIT] v8: exactly one round of plain decoding after a verify frame that produced no
+    // token (the grammar rejected one of its rows).
+    //
+    // Without it the round repeats itself forever: the first row of the next frame samples the
+    // same position again -- same KV, same token, same grammar state -- so it would be the same
+    // grammar-rejected argmax, and no token would ever reach the client. One plain decode
+    // advances the position, which is all that is needed: the next frame's first row is a
+    // different position, and the row path's own grammar resampling picked its token.
+    bool skip_draft_once = false;
+
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -350,6 +372,16 @@ struct server_slot {
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
+        // [QLH-SPLIT] Zero means this context cannot export its sequence state at all (a chain
+        // with remote stages; see llama_context::state_seq_get_size), not that the state is
+        // empty. An entry with no bytes would be restored "successfully" later and hand the slot
+        // a prompt whose tokens the chain does not actually hold; the following truncating
+        // seq_rm would then abort or, worse, decode from positions that never existed here.
+        // Skipping the save keeps the prompt cache out of a chain it cannot describe.
+        if (cur_size == 0) {
+            return false;
+        }
+
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
@@ -394,6 +426,41 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    // [QLH-SPLIT] v5: the remote candidate channel for *this* request (see common/sampling.h).
+    //
+    // Decided once, when the slot's sampler is created -- i.e. before the first decode of the
+    // request -- and never re-decided per token: grammar, pre-sampling logprobs and the shape of
+    // the sampler chain are all fixed for the request, and a per-token re-check could only turn a
+    // request into a mix of the two paths. `remote_cand_why` is what was logged when the plan was
+    // rejected, kept for the debug line.
+    bool                      remote_cand_ok = false;
+    common_sampler_candidates remote_cand;
+    std::string               remote_cand_why;
+
+    // The logit-bias list the tail must apply, copied out of the sampler at plan time. A copy and
+    // not the sampler's pointer: this struct outlives the sampler -- a checkpoint restore copies
+    // sampler state into it -- and a pointer into a vector that can be reassigned is exactly the
+    // kind of stale state that would silently change which tokens are suppressed.
+    std::vector<llama_logit_bias> remote_cand_bias;
+
+    // [QLH-SPLIT] v7: the per-row verify channel for *this* request (see llama-ext.h and
+    // common/sampling.h). Also decided when the sampler is created, from the same request-level
+    // inputs, for the same reason: a decision per token could only mix the two paths.
+    //
+    // `remote_verify_ok` is true when this request's speculation can verify drafts through the
+    // channel. `spec_blocked` is the other half, and it is the one that changes behaviour: a
+    // remote chain can only speculate *through* the channel (there are no logits for the extra
+    // rows), so a request that cannot use it must not speculate at all. Before this existed, that
+    // case aborted the server inside common_sampler_sample (`GGML_ASSERT(logits != nullptr)`).
+    //
+    // `spec_draft_cap` bounds the draft block so that a verify frame fits MAX_VERIFY_ROWS rows.
+    // INT32_MAX for a whole model and for a local chain, whose tail surfaces every row it is
+    // asked for.
+    bool    remote_verify_ok  = false;
+    bool    spec_blocked      = false;
+    int32_t spec_draft_cap    = INT32_MAX;
+    std::string remote_verify_why;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -435,10 +502,14 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
+        // [QLH-SPLIT] v7: test the module, not can_speculate(). The latter is now also false for a
+        // request whose speculation was blocked, and "this request may not draft" is not "there is
+        // no speculative state to clear".
+        if (spec != nullptr) {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            skip_draft_once = false;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -562,7 +633,9 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        // [QLH-SPLIT] v7: a remote chain can only verify drafts through the per-row channel, so a
+        // request whose sampler cannot use it must not draft at all (see spec_blocked).
+        return !!spec && !spec_blocked;
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -594,6 +667,13 @@ struct server_slot {
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
+
+        // [QLH-SPLIT] v7: a verify frame is draft.size() + 1 rows and the tail answers all of
+        // them through the per-row channel, whose ceiling is MAX_VERIFY_ROWS (a shared constant,
+        // see src/llama-split-proto.h). So the draft block itself is capped here, once, rather
+        // than truncated later: the drafter then proposes a block that fits, instead of
+        // proposing more and having it dropped.
+        n_draft_max = std::min(n_draft_max, spec_draft_cap);
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
@@ -1081,6 +1161,11 @@ private:
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
+    // [QLH-SPLIT] Owns the tail stage's model and context. Declared after llama_init so it
+    // is destroyed before it.
+    common_init_result_ptr llama_init_tail;
+    llama_context * ctx_tail = nullptr;
+
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
@@ -1211,9 +1296,45 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        // [QLH-SPLIT] v2.4: a split head is a *stage*, and a stage defaults op_offload off.
+        //
+        // Upstream defaults it on, and on a range load that is a negative head: the CPU-resident
+        // blocks' weights move into the pinned CUDA host buffer and the GPU runs their matmuls,
+        // costing ~31% of decode speed (segment probe 2026-11-09: head 0:32 -ngl 8 tg 14.60 with
+        // it on vs 22.25 with it off, same build). tools/split-stage has defaulted it off since
+        // v2.2; this server, which is the head of every chain, kept upstream's default, so the
+        // same head measured +36% on the probe and -10% through the server (E 8.44 vs A 9.34).
+        //
+        // The condition is the same one common.cpp uses to turn on the relay output
+        // (embeddings + embeddings_pre_norm): "this process is a stage of a chain". An explicit
+        // --op-offload / --no-op-offload still wins, which is what no_op_offload_explicit is for
+        // -- without it this default would overwrite an operator's flag. The value itself lives
+        // in src/qlh-split-defaults.h so the head and its stages read one constant.
+        const bool split_role = !params_base.split_remote.empty() || params_base.split_tail_lo >= 0;
+        if (split_role) {
+            if (!params_base.no_op_offload_explicit) {
+                params_base.no_op_offload = QLH_SPLIT_DEFAULT_NO_OP_OFFLOAD;
+            }
+            SRV_INF("[split] op_offload = %s (%s)\n",
+                    params_base.no_op_offload ? "off" : "on",
+                    params_base.no_op_offload_explicit
+                            ? "explicit --op-offload/--no-op-offload"
+                            : "default for a split stage, see src/qlh-split-defaults.h");
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+
+        // [QLH-SPLIT] A chain is either all-local or all-remote (llama_context refuses to mix
+        // them too), and saying so before loading two models is the difference between an
+        // immediate usage error and a few seconds of startup followed by the same error.
+        if (!params_base.split_remote.empty() && params_base.split_tail_lo >= 0) {
+            SRV_ERR("%s\n", "--split-remote and --split-tail-range are mutually exclusive: a "
+                    "chain is either all local stages or a local head with remote stages");
+            return false;
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1305,10 +1426,98 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // [QLH-SPLIT] v2.3: VRAM budget pre-check for the segment this server loads.
+        //
+        // The head is the second process on the card in the configuration that spilled silently
+        // on 2026-11-09 (`head -ngl 8` + a fully offloaded tail: 8.4 GiB needed against 7.9 GiB
+        // free, tg 10.76 -> 0.343). By the time the head loads, the tail has usually taken its
+        // share already, so the free number read here is the one that decides -- which is why
+        // this check is per-process and not a chain-wide sum: each process reports what it can
+        // see, and the one that starts last sees the truth.
+        //
+        // -ngl 0 says nothing; a CPU-only build says one line and skips (see the header).
+        qlh_vram::estimate_input vram_in;
+        vram_in.model_path   = params_base.model.path.c_str();
+        vram_in.lo           = params_base.split_layer_lo;
+        vram_in.hi           = params_base.split_layer_hi;
+        vram_in.n_gpu_layers = params_base.n_gpu_layers;
+        vram_in.overrides    = params_base.tensor_buft_overrides.empty()
+                             ? nullptr : params_base.tensor_buft_overrides.data();
+        vram_in.moe_cache    = params_base.moe_cache_size;
+        const qlh_vram::precheck_result vram_pre = qlh_vram::precheck(vram_in, "llama-server");
+        if (vram_pre.v == qlh_vram::VERDICT_REFUSED) {
+            return false;
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+
+        // [QLH-SPLIT] Optional tail stage. It is a full second model over a different layer
+        // range, loaded through the same path so every common_params setting (n_rs_seq
+        // included) reaches it identically. llama_split_attach then makes ctx_tgt drive it.
+        if (params_base.split_tail_lo >= 0 && ctx_tgt != nullptr) {
+            common_params tail_params = params_base;
+            tail_params.split_layer_lo = params_base.split_tail_lo;
+            tail_params.split_layer_hi = params_base.split_tail_hi;
+            tail_params.split_tail_lo  = -1; // no recursion
+            tail_params.split_tail_hi  = -1;
+            // [QLH-SPLIT] This context is the far half of a chain this server is assembling, so
+            // a range that does not start at layer 0 is the correct shape here, not a truncated
+            // model. The fields below cannot say that on their own: a user typing
+            // `--split-layer-range 20:24` produces exactly this common_params and must still be
+            // refused (nothing computes layers 0..19 in that process). The flag is the only
+            // difference, and common.cpp reads it to allow this load while rejecting that one.
+            tail_params.split_range_is_stage = true;
+
+            SRV_INF("[split] loading tail stage for layers [%d, %d)\n",
+                    tail_params.split_layer_lo, tail_params.split_layer_hi);
+
+            llama_init_tail = common_init_from_params(tail_params);
+            ctx_tail = llama_init_tail->context();
+
+            if (ctx_tail == nullptr) {
+                SRV_ERR("%s", "[split] failed to create the tail context\n");
+                return false;
+            }
+
+            // A rejected chain is a startup failure, not a warning: continuing as a single-stage
+            // context would serve plausible logits from a model that is missing layers, and every
+            // request would be silently wrong.
+            if (llama_split_attach(ctx_tgt, &ctx_tail, 1) < 0) {
+                SRV_ERR("%s", "[split] failed to attach the tail stage; check that it starts where "
+                        "the head ends (--split-layer-range / --split-tail-range) and ends at the "
+                        "model's last trunk layer\n");
+                return false;
+            }
+            SRV_INF("[split] attached %d tail stage(s); n_rs_seq=%u\n",
+                    llama_split_n_stages(ctx_tgt), llama_n_rs_seq(ctx_tgt));
+        }
+
+        // [QLH-SPLIT] Remote chain: the head is this process, everything after it is a
+        // split-stage process reached over TCP. A rejected attach is a startup failure for the
+        // same reason as the local one above: serving from a head whose layers are not actually
+        // followed by the rest of the model would be silently wrong, not "degraded".
+        if (!params_base.split_remote.empty() && ctx_tgt != nullptr) {
+            std::vector<const char *> endpoints;
+            endpoints.reserve(params_base.split_remote.size());
+            std::string joined;
+            for (const auto & ep : params_base.split_remote) {
+                endpoints.push_back(ep.c_str());
+                joined += joined.empty() ? ep : ", " + ep;
+            }
+
+            char err[512] = {0};
+            const int n = llama_split_attach_remote(ctx_tgt, endpoints.data(),
+                                                    (int32_t) endpoints.size(), err, sizeof(err));
+            if (n < 0) {
+                SRV_ERR("[split] failed to attach remote stages [%s]: %s\n", joined.c_str(), err);
+                return false;
+            }
+
+            SRV_INF("[split] attached %d remote stage(s): %s\n", n, joined.c_str());
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -1319,6 +1528,14 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        // [QLH-SPLIT] v2.3: post-load VRAM check, once every segment this process owns (the head
+        // and, with --split-tail-range, a local tail) has been loaded and attached.
+        //
+        // Warning only, never fatal: a spill has already happened by this point, and a spilled
+        // tier is sometimes the fastest one measured -- the criterion is throughput, not this
+        // line. What it buys is that a 27x slowdown stops looking like "the model is slow".
+        qlh_vram::after_load(vram_pre.est, vram_pre.dev, "llama-server");
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -1338,14 +1555,111 @@ private:
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
-            {
+            // [QLH-SPLIT] v8: decide whether this chain can draft with MTP *before* any params are
+            // derived from it, so both the context construction below (params_dft) and the
+            // speculative implementation (built later from params_base) see the same answer.
+            //
+            // A remote tail owns the MTP head, and this process cannot build a draft context at
+            // all -- its model is the head range, which loads no NextN layers. What it can do is
+            // ask: the tail reported has_nextn in OP_HELLO at attach time, so spec_init builds no
+            // context and the drafts come over the chain (common/speculative.cpp, is_remote).
+            // When the tail has no NextN block, MTP is dropped from the type list with a warning
+            // instead of failing startup: an ngram drafter in the same request set still works,
+            // and a chain without drafts is still a correct chain.
+            bool spec_mtp_ok = spec_mtp;
+            // [QLH-SPLIT] v9: DFlash/DSpark read the trunk's layer-input taps, so a remote chain
+            // has to tell them the tail is remote too. Without this flag every tap resolves onto
+            // the head context (common/speculative.cpp, tail_remote == false), which then aborts
+            // in set_embeddings_layer_inp on a source layer the head does not have. The tap and
+            // verify channels themselves are already there; this is only their entry switch.
+            if (has_draft && ctx_tail == nullptr && llama_context_split_has_remote(ctx_tgt)) {
+                params_base.speculative.draft.ctx_tail_remote = true;
+                SRV_INF("%s", "[split] remote chain + draft model: layer-input taps cross the wire "
+                              "(the head keeps the draft context, the stages answer the taps)\n");
+            }
+            if (spec_mtp && ctx_tail == nullptr && llama_context_split_has_remote(ctx_tgt)) {
+                if (llama_context_split_mtp_ready(ctx_tgt)) {
+                    params_base.speculative.draft.ctx_tail_remote = true;
+                    SRV_INF("%s", "[split] the remote tail reports a NextN/MTP block: MTP drafts "
+                                  "will run in the stage and cross the chain (one h row out, k "
+                                  "token ids back per round)\n");
+                } else {
+                    SRV_WRN("%s", "[split] --spec-type draft-mtp is not available: the remote tail "
+                                  "reports no NextN/MTP block (its model has none, or its range "
+                                  "does not end at the model's last layer, or its MTP context "
+                                  "failed to build). Dropping it; any other speculative type "
+                                  "stays enabled\n");
+                    auto & types = params_base.speculative.types;
+                    types.erase(std::remove(types.begin(), types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP), types.end());
+                    if (types.empty()) {
+                        types.push_back(COMMON_SPECULATIVE_TYPE_NONE);
+                    }
+                    spec_mtp_ok = false;
+                }
+            }
+
+            // This block builds the draft context. With MTP dropped above and no draft model, there
+            // is nothing to build -- the remaining types (ngram, ngram-map, ...) need no context,
+            // and common_speculative_init() below builds them from params_base.
+            if (has_draft || spec_mtp_ok) {
                 common_params params_dft = common_base_params_to_speculative(params_base);
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                // [QLH-SPLIT] A split chain's MTP head does not live in the head segment: the
+                // head range loads [0, layer_hi) with nextn_keep = 0, so its model has no NextN
+                // layers and llama_init_from_model(ctx_type=MTP) refuses it. The tail range is
+                // the only one that keeps blk.<n_layer>.nextn.*, so the draft context is built
+                // over the tail's model and the target h_nextn rows are read from the tail's
+                // context. Without the chain, both stay the server's own model/context.
+                //
+                // DFlash is the opposite case and needs the head: it consumes layer-input taps
+                // of the trunk, and its token embedding / vocabulary are in the head's range,
+                // so ctx_other (borrowed through llama_init_from_model) has to be the head.
+                // Taps that fall past the head's range are read from the tail's context directly
+                // inside common/speculative.cpp; that is a memory read in this process, not a
+                // transfer, so the chain stays a single round trip.
+                //
+                // This only covers a *local* tail. A remote tail is still not supported for
+                // DFlash, and the blocker is the verification *channel*, not bandwidth:
+                // tools/split-stage asks the tail for the last token's logits only
+                // (main.cpp, `batch.logits[i] = relay ? 0 : (i + 1 == n_tok)`) and replies
+                // with exactly one row, while speculative verification needs k+1 rows.
+                //
+                // [QLH-SPLIT] An earlier version of this comment claimed "k=3 is ~4 MB per
+                // frame, 3-4 s on 1 Gbps". That arithmetic was wrong twice over: 4 MB on
+                // 1 Gbps is 32 ms (250 ms at this repo's measured 16 MB/s), and greedy
+                // verification does not need the full row at all -- argmax computed on the
+                // tail side costs one token id per row (4 B). v2 did exactly that and got
+                // 1.11-1.13x across hosts. What is actually missing here is a "one result
+                // per row" reply, which the candidate channel could carry once it stops
+                // rejecting speculative requests. Full-row logits are only needed for
+                // *sampling* rejection (p and q), and that path is genuinely too expensive
+                // on a slow link -- v2 measured it at 1.9x slower than no speculation.
+                // Note: the name says what the flag *means* for this choice, not which type set it.
+                // DSpark is built by the same implementation as DFlash (common/speculative.cpp
+                // distinguishes them by markov_w1) and reads the same layer-input taps, so it needs
+                // the head here exactly like DFlash does. Leaving it out sent a DSpark chain to the
+                // tail context, whose n_layer() made target layer 20 resolve past the tail (8 layers)
+                // and abort in the impl ctor.
+                const auto & spec_types = params_base.speculative.types;
+                const bool spec_needs_layer_inp =
+                        std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != spec_types.end() ||
+                        std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != spec_types.end();
+                llama_context * ctx_spec_tgt = (ctx_tail != nullptr && !spec_needs_layer_inp) ? ctx_tail : ctx_tgt;
+                llama_model   * mdl_spec_tgt = const_cast<llama_model *>(llama_get_model(ctx_spec_tgt));
+
+                params_dft.speculative.draft.ctx_tail = ctx_tail;
+                // params_dft is what actually reaches common_speculative_init_from_params(): the
+                // remote-MTP flag has to be on it, or the MTP branch there would try to build a
+                // draft context over the head range (and fail, which is exactly the behaviour v8
+                // replaces).
+                params_dft.speculative.draft.ctx_tail_remote = params_base.speculative.draft.ctx_tail_remote;
+
+                spec_init = common_speculative_init_from_params(params_dft, mdl_spec_tgt, ctx_spec_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
@@ -1354,13 +1668,21 @@ private:
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                // [QLH-SPLIT] v8: a remote-MTP chain has no draft context in this process *by
+                // design* -- the head lives in the stage. Only a local MTP chain (or a draft
+                // model) can end up here without one, and that is still a startup failure.
+                if (ctx_dft == nullptr && !params_base.speculative.draft.ctx_tail_remote) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
 
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_tgt = ctx_spec_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+                // [QLH-SPLIT] The speculative implementation is built later from
+                // params_base.speculative, not from the local params_dft above, so the tail
+                // context has to be carried here too: DFlash's impl resolves the taps that
+                // fall past the head's range through this pointer.
+                params_base.speculative.draft.ctx_tail = ctx_tail;
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1951,6 +2273,164 @@ private:
         return output;
     }
 
+    // [QLH-SPLIT] v5: decide, once per request, whether a remote tail may answer this request
+    // with its top-k candidates instead of the whole logits row (993 KB -> 320 B per token; see
+    // src/llama-ext.h).
+    //
+    // Called from launch_slot_with_task(), where the request's sampler has just been built: it is
+    // the only moment where the whole sampling configuration is known and no decode has run yet,
+    // and deciding up front is what keeps a request on one path from its first token to its last.
+    // A per-token decision could only mix the two, and a runtime `token = -1` bail-out would mean
+    // the fallback is discovered *after* the frame that needed the row was already answered.
+    //
+    // The rule itself lives in common/sampling.cpp (common_sampler_candidates_check) so that
+    // there is exactly one copy of it; this function only gathers the request-level inputs and
+    // writes the log line an operator needs to understand a slow request.
+    bool plan_remote_candidates(server_slot & slot, const server_task & task) {
+        slot.remote_cand_ok = false;
+        slot.remote_cand_why.clear();
+
+        if (!llama_context_split_has_remote(ctx_tgt)) {
+            // A local chain and a whole model already hold the row; there is nothing to decide
+            // and nothing worth printing.
+            return false;
+        }
+
+        // Tasks that sample through their own path (TTS / realtime / transcription) read logits
+        // for rows this channel was not built for; they keep the whole-row path silently, because
+        // there is nothing to explain to an operator -- nothing changed for them.
+        if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
+            return false;
+        }
+
+        const bool pre_sampling_logprobs =
+                task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
+
+        common_sampler_candidates plan;
+        std::string why;
+        if (!common_sampler_candidates_check(slot.smpl.get(), true, pre_sampling_logprobs,
+                                             spec != nullptr, plan, why)) {
+            slot.remote_cand_why = why;
+            SLT_INF(slot, "[split] this request takes the whole-logits path: %s\n", why.c_str());
+            return false;
+        }
+
+        slot.remote_cand    = plan;
+        slot.remote_cand.biases = nullptr; // owned by the copy below, never a pointer into smpl
+        slot.remote_cand_bias.clear();
+        if (plan.biases != nullptr) {
+            slot.remote_cand_bias = *plan.biases;
+        }
+        slot.remote_cand_ok = true;
+
+        std::string steps;
+        for (uint32_t i = 0; i < plan.n_steps; ++i) {
+            const char * name = plan.steps[i] == COMMON_CAND_STEP_PENALTIES   ? "penalties"
+                              : plan.steps[i] == COMMON_CAND_STEP_TOP_N_SIGMA ? "top_n_sigma"
+                              : plan.steps[i] == COMMON_CAND_STEP_TOP_K       ? "top_k" : "?";
+            steps += steps.empty() ? name : std::string(" -> ") + name;
+        }
+        SLT_INF(slot, "[split] this request answers with %d candidates instead of the %d-token "
+                      "logits row; the tail runs %s, this side runs the rest of the chain\n",
+                plan.top_k, llama_vocab_n_tokens(vocab), steps.c_str());
+        return true;
+    }
+
+    // [QLH-SPLIT] v7: decide, once per request, whether its speculative drafts may be verified
+    // through the per-row channel, and -- because a remote chain has no other way to verify --
+    // whether this request may speculate at all.
+    //
+    // Called from launch_slot_with_task(), next to plan_remote_candidates() and for the same
+    // reason: the sampler has just been built, so the whole sampling configuration is known and
+    // no decode has run. `slot.spec_blocked` is the half that changes behaviour rather than speed,
+    // and it is the reason this cannot be a runtime fallback: the verify frame is built (the draft
+    // tokens are in the batch) before any answer arrives, so "we cannot verify this one" has to be
+    // decided before the drafter runs.
+    void plan_remote_verify_rows(server_slot & slot, const server_task & task) {
+        slot.remote_verify_ok  = false;
+        slot.remote_verify_why.clear();
+        slot.spec_blocked      = false;
+        slot.spec_draft_cap    = INT32_MAX;
+
+        if (!llama_context_split_has_remote(ctx_tgt)) {
+            // A local chain and a whole model read the tail's rows in this process, so their
+            // drafts are verified exactly as before; no cap and no channel.
+            return;
+        }
+
+        // The chain can only verify through the per-row channel, so this is the draft cap for
+        // every speculative request on it: a verify frame is draft.size() + 1 rows.
+        slot.spec_draft_cap = (int32_t) qlh_split::MAX_VERIFY_ROWS - 1;
+
+        if (spec == nullptr) {
+            // No drafter configured: nothing to verify, nothing to block.
+            return;
+        }
+
+        if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
+            // TTS / realtime / transcription sample through their own paths and do not speculate;
+            // the drafts they would need are rows this channel does not describe.
+            slot.spec_blocked = true;
+            return;
+        }
+
+        const bool want_probs = task.params.sampling.n_probs > 0;
+
+        std::string why;
+        if (!common_sampler_verify_rows_check(slot.smpl.get(), true, want_probs, why)) {
+            slot.remote_verify_why = why;
+            // Not a fallback: there is no row to fall back to. A remote chain's tail answers one
+            // row of logits (the last), which is not enough for a verification batch of k + 1 --
+            // before this existed, such a request aborted the server in common_sampler_sample.
+            slot.spec_blocked = true;
+            SLT_INF(slot, "[split] speculative decoding is off for this request: %s "
+                          "(a remote chain verifies drafts through the per-row token channel, "
+                          "which this sampler cannot use)\n", why.c_str());
+            return;
+        }
+
+        // [QLH-SPLIT] v9: the per-row channel is open to the reasoning budget as well as to a
+        // grammar (v8), and the two verification paths below are not open to either. This is a
+        // deliberate boundary, not an oversight:
+        //
+        //  - rejection sampling compares the target distribution with the draft's (draft_q), and
+        //    accepts the *draft's* token when it wins -- it never asks the grammar or the
+        //    reasoning budget, and common_sampler_accept() on a token either one rejects throws
+        //    (llama_grammar_accept_token) or charges budget for a token the request never
+        //    emitted. Teaching it to mask both distributions is a change to a
+        //    distribution-correctness algorithm, and it is worth doing on its own.
+        //  - synthetic acceptance accepts draft tokens at random *without* advancing either
+        //    sampler (is_generated = false), which would leave the grammar describing a token
+        //    history the request does not have and would leave rbudget's budget unspent for
+        //    tokens it should have counted -- a silent divergence, not a slower request.
+        //
+        // A greedy chain with a grammar and/or a reasoning budget is the agent/tools case these
+        // changes are for, and that case never reaches either branch (both need temp > 0), so
+        // blocking here costs nothing that used to work: before v8 a grammar blocked the channel
+        // entirely, and before v9 a reasoning budget did.
+        const bool grammar_set  = common_sampler_has_grammar(slot.smpl.get());
+        const bool rbudget_set  = common_sampler_has_reasoning_budget(slot.smpl.get());
+        if ((grammar_set || rbudget_set) && (slot.use_spec_rejection() ||
+                (spec && !common_speculative_get_synth_probs(spec.get()).empty()))) {
+            slot.remote_verify_why = slot.use_spec_rejection()
+                ? (grammar_set ? "grammar with rejection sampling" : "reasoning budget with rejection sampling")
+                : (grammar_set ? "grammar with synthetic acceptance" : "reasoning budget with synthetic acceptance");
+            slot.spec_blocked = true;
+            SLT_INF(slot, "[split] speculative decoding is off for this request: %s "
+                          "(the %s path cannot apply a grammar or a reasoning budget to the "
+                          "draft's own tokens)\n",
+                    slot.remote_verify_why.c_str(),
+                    slot.use_spec_rejection() ? "rejection-sampling" : "synthetic-acceptance");
+            return;
+        }
+
+        slot.remote_verify_ok = true;
+        SLT_INF(slot, "[split] this request verifies its drafts through the per-row channel: one "
+                      "argmax token per row crosses the wire (up to %d rows = %d drafts + the "
+                      "target) instead of the %d-float logits row\n",
+                slot.spec_draft_cap + 1, slot.spec_draft_cap, llama_vocab_n_tokens(vocab));
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -2085,6 +2565,13 @@ private:
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
+            // [QLH-SPLIT] v5: the remote candidate channel, decided here and only here.
+            plan_remote_candidates(slot, task);
+
+            // [QLH-SPLIT] v7: and the per-row verify channel, which also decides whether this
+            // request may speculate at all on a remote chain.
+            plan_remote_verify_rows(slot, task);
+
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
@@ -2093,6 +2580,12 @@ private:
             }
         } else {
             slot.smpl.reset();
+            // [QLH-SPLIT] v5: a non-sampling request (embedding, rerank) leaves the candidate
+            // channel off, so nothing later can sample from a previous request's candidates.
+            slot.remote_cand_ok = false;
+            // [QLH-SPLIT] v7: and off for the per-row verify channel too (see above).
+            slot.remote_verify_ok = false;
+            slot.remote_verify_why.clear();
         }
 
         // the per-request limit takes priority over the global one
@@ -2727,6 +3220,16 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // [QLH-SPLIT] Nothing to checkpoint when this context cannot export its sequence state
+        // (a chain with remote stages; see llama_context::state_seq_get_size). An empty
+        // checkpoint loads as a success and rewinds the slot to a position the chain no longer
+        // holds, so leaving it out keeps the server on its existing "no cache data, re-process
+        // the prompt" path -- the only correct recovery for a chain that cannot restore its
+        // tails.
+        if (llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            return;
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2780,8 +3283,18 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const bool ckpt_tgt_ok = cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const bool ckpt_dft_ok = cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (!ckpt_tgt_ok || !ckpt_dft_ok) {
+            // [QLH-SPLIT] No checkpoint this round, instead of aborting the server. Keeping the
+            // entry would be worse than dropping it: load_tgt()/load_dft() treat an empty blob
+            // as "nothing to restore" and report success, so a half-captured checkpoint would
+            // rewind the prompt bookkeeping while leaving the KV where it is. Dropping it costs
+            // one prompt re-processing later, which is exactly what "no checkpoint" means.
+            slot.prompt.checkpoints.pop_back();
+            SLT_WRN(slot, "%s", "context checkpoint could not be captured this round; not reusing it\n");
+            return;
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -3821,7 +4334,21 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                // [QLH-SPLIT] Context shift is a *partial* removal: it drops a hole in the middle
+                // and shifts the tail down by n_discard. A memory that cannot remove that range
+                // (hybrid recurrent without room to roll back, a chain that no longer agrees)
+                // would leave the hole in place while the prompt below is rewritten around it --
+                // positions and KV disagree from then on. So the shift is all-or-nothing: stop
+                // this request where it stands instead of serving the rest from a shifted prompt
+                // with an unshifted KV.
+                if (!slot.mem.seq_rm(slot.id, n_keep, n_keep + n_discard)) {
+                    SLT_ERR(slot, "context shift could not remove [%d, %d) from the KV; stopping "
+                                  "this request at %d generated tokens instead of continuing on a "
+                                  "prompt that no longer matches the memory\n",
+                            n_keep, n_keep + n_discard, (int) slot.stats.n_gen);
+                    slot.stop           = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                } else {
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
@@ -3841,6 +4368,7 @@ private:
                 }
 
                 slot.truncated = true;
+                }
             }
         });
 
@@ -3878,7 +4406,14 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = slot.skip_draft_once ? 0 : slot.get_n_draft_max();
+
+                if (slot.skip_draft_once) {
+                    // [QLH-SPLIT] v8: consume the flag set by a rolled-back verify frame. This
+                    // round decodes the rolled-back position plainly; the next one may draft
+                    // again (a new position, so a new chance of a grammar-legal argmax).
+                    slot.skip_draft_once = false;
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3894,13 +4429,27 @@ private:
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
+                        // [QLH-SPLIT] a new frame: the blobs of the previous one are stale, and
+                        // the whole-frame rollback reads "is spec_ckpt empty" as "was a target
+                        // checkpoint captured for this frame" (see frame_needs_target_ckpt).
+                        slot.spec_ckpt.clear();
+
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            // [QLH-SPLIT] This one cannot degrade like a stored checkpoint can:
+                            // the draft context is rolled back through this blob later, and
+                            // load_dft() reports success for an empty one while restoring
+                            // nothing, which would leave the draft KV holding tokens the sample
+                            // loop has already rejected. A failed capture is therefore a failed
+                            // rollback, and this path has no way to abort just the request.
+                            if (!slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                common_log_flush(common_log_main());
+                                GGML_ABORT("could not capture the draft checkpoint; the draft cannot be rewound\n");
+                            }
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3947,15 +4496,28 @@ private:
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                // [QLH-SPLIT] keep-KV chain (default on; QLH_CHAIN_DRAFT_KEEP_KV=0 opts out): the
+                // draft trims itself to its own pos0 at the start of every round, so the rows this
+                // round just wrote must survive. Trimming them here would leave the route with
+                // exactly the empty draft KV that the per-round clear left it with -- the route
+                // would be enabled and do nothing.
+                if (!common_speculative_keeps_draft_kv(spec.get())) {
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                        // [QLH-SPLIT] KNOWN FATAL SITE (see the three-condition note on use_ckpt_tgt
+                        // below). This one is the *draft* context, which is local even for a remote
+                        // chain, so a network glitch cannot reach it; it is listed here only because
+                        // it is the third abort in this block and the next reader should know it was
+                        // looked at and deliberately left fatal.
+                        GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    }
                 }
             }
 
             if (!draft.empty()) {
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                // [QLH-SPLIT] the capture condition has to cover the *larger* of the two
+                // rollbacks this frame may need, and one of them never fits the ubatch's own
+                // snapshots -- see frame_needs_target_ckpt().
+                const bool use_ckpt_tgt = frame_needs_target_ckpt(slot, draft.size());
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -3963,7 +4525,33 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    // [QLH-SPLIT] Same reasoning as the draft checkpoint above: the verify step
+                    // below rewinds the target's KV through this blob, and an empty blob reports
+                    // success while restoring nothing. Keep it fatal, but fatal with the reason.
+                    //
+                    // [QLH-SPLIT] KNOWN FATAL SITE, NOT FIXED YET -- this one can still take the
+                    // server down on a remote chain, and the next person should not have to
+                    // re-derive it. All three conditions are required:
+                    //   1. speculative decoding is on (ctx_dft != nullptr; --spec-type ... / MTP);
+                    //   2. ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL, which for a
+                    //      remote chain head means it was started WITHOUT --split-rs-seq (the
+                    //      startup probe then cannot do a partial rollback and degrades to FULL);
+                    //   3. a remote stage stops answering.
+                    // Then the capture runs over the wire (state_size + state_write), the stage's
+                    // 120 s timeout makes it return a short/empty blob, update_tgt() reports false,
+                    // and this line aborts the whole process -- the same "one network glitch kills
+                    // every slot" failure that common_context_seq_rm and the checkpoint restore
+                    // above no longer have. Fixing it is not a one-line change like those: without
+                    // the blob the verified tokens cannot be rewound, so the round has to be
+                    // abandoned and the batch/spec state unwound rather than continued. The safe
+                    // carrier exists already (llama_context_split_failed(ctx_tgt) is true by then,
+                    // because state_size/state_write refuse on a dead chain) -- what is missing is
+                    // the unwind.
+                    if (!ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        common_log_flush(common_log_main());
+                        GGML_ABORT("could not capture the speculative target checkpoint; the "
+                                   "verified tokens cannot be rewound\n");
+                    }
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3975,7 +4563,14 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    // [QLH-SPLIT] Same as the two above: the draft is rewound through this blob.
+                    // Also not reachable from a network glitch -- ctx_dft is the local draft
+                    // context, not a chain stage -- see the three-condition note on use_ckpt_tgt.
+                    if (!ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        common_log_flush(common_log_main());
+                        GGML_ABORT("could not capture the speculative draft checkpoint; the "
+                                   "verified drafts cannot be rewound\n");
+                    }
                 }
             }
         });
@@ -4034,6 +4629,22 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        // [QLH-SPLIT] The request boundary is *here*, not at DONE_PROMPT.
+                        //
+                        // The prompt's process() batches run before DONE_PROMPT is reached, and on
+                        // a local chain those batches are exactly when the tail's h rows for the
+                        // prompt exist -- the only moment the draft catch-up can replay them. With
+                        // begin() at DONE_PROMPT the draft KV was cleared *after* the prompt had
+                        // already gone by, so a prefill-only catch-up had no window at all (it
+                        // wrote rows and then watched begin() delete them). Moving it a few lines
+                        // earlier changes nothing else: begin() clears this sequence's draft KV
+                        // (what "a new request" means for the keep-KV route) and resets the draft
+                        // sampler, both of which are as true before the prefill as after it.
+                        if (spec && slot.can_speculate()) {
+                            common_speculative_begin(spec.get(), slot.id,
+                                    slot.task->tokens.get_text_tokens());
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4180,7 +4791,23 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
+                                            // [QLH-SPLIT] The shift is a partial removal and can
+                                            // be refused (hybrid recurrent, or a chain that no
+                                            // longer agrees). If it is, the KV no longer matches
+                                            // the prompt about to be rewritten: fail the request
+                                            // rather than leave the two describing different
+                                            // histories.
+                                            if (!slot.mem.seq_rm(slot.id, head_p, head_c)) {
+                                                SLT_ERR(slot, "failed to shift the cached KV at "
+                                                              "[%zu, %zu); failing the request\n",
+                                                        head_p, head_c);
+                                                send_error(slot, "failed to shift the cached KV "
+                                                                 "(seq_rm); the request cannot continue "
+                                                                 "on a consistent state");
+                                                slot.prompt_clear();
+                                                slot.release();
+                                                return;
+                                            }
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -4290,14 +4917,66 @@ private:
                                         const auto & cur = **it;
 
                                         // restore the context checkpoint
-                                        if (!cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
-                                            !cur.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                                            if (cur.id_task != -1) {
+                                        const bool ckpt_tgt_ok =
+                                            cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const bool ckpt_dft_ok = ckpt_tgt_ok && cur.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (!ckpt_tgt_ok || !ckpt_dft_ok) {
+                                            // [QLH-SPLIT] A remote chain whose checkpoint cannot
+                                            // be restored has to fail the request, not the
+                                            // server. Measured on a chain with a suspended stage:
+                                            // this exact abort is what took the head process down
+                                            // (the field report blamed seq_rm because its first
+                                            // failing request had no checkpoint to restore yet; a
+                                            // warm slot hits this one instead).
+                                            //
+                                            // Why continuing is sound: a failed restore of the
+                                            // *target* chain is recorded by the memory layer as
+                                            // "chain dead" (llama_memory_split::state_read), and
+                                            // decode_split then refuses every decode. The
+                                            // fallback below re-processes the prompt from 0, and
+                                            // its seq_rm/decode both fail with the reason -- so the
+                                            // request ends as a 500 with a diagnosis, never with a
+                                            // token computed from a half-restored chain.
+                                            //
+                                            // A local chain, or a failed *draft* restore, keeps the
+                                            // abort: there is no network to blame and nothing to
+                                            // rebuild in place.
+                                            if (!ckpt_tgt_ok && llama_context_split_failed(ctx_tgt)) {
+                                                common_log_flush(common_log_main());
+                                                SLT_ERR(slot, "could not restore the context checkpoint: %s\n",
+                                                        llama_context_split_failure(ctx_tgt));
+                                                do_reset = true;
+                                            } else if (!ckpt_tgt_ok && llama_context_split_state_stale(ctx_tgt)) {
+                                                // [QLH-SPLIT] v6: the remote stage no longer holds
+                                                // the snapshot this checkpoint names -- its bounded
+                                                // snapshot cache evicted it, or the stage is a
+                                                // different process than the one that minted the
+                                                // handle. That is not a chain failure: the stage
+                                                // refused before applying anything and the head is
+                                                // restored last, so every stage is where it was.
+                                                //
+                                                // The recovery is the one a server without
+                                                // checkpoints already takes: drop the checkpoints
+                                                // and re-process the prompt. The erase loop below
+                                                // does the dropping, because do_reset sets pos_next
+                                                // to 0 and every checkpoint then covers tokens the
+                                                // new prompt no longer has.
+                                                SLT_WRN(slot, "%s", "the remote stage no longer holds this context checkpoint "
+                                                        "(its snapshot cache evicted it); re-processing the prompt\n");
+                                                do_reset = true;
+                                            } else if (cur.id_task != -1) {
+                                                // [QLH-SPLIT] Same reason as the flush in
+                                                // common_context_seq_rm: the memory layer has
+                                                // already logged which stage refused the
+                                                // restore, and that line is still queued in the
+                                                // log worker when abort() runs.
+                                                common_log_flush(common_log_main());
                                                 GGML_ABORT("failed to restore context checkpoint\n");
+                                            } else {
+                                                // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
+                                                SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
+                                                do_reset = true;
                                             }
-                                            // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
-                                            SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
-                                            do_reset = true;
                                         }
                                     }
 
@@ -4377,7 +5056,54 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // [QLH-SPLIT] A cached prefix is only reusable if the KV can drop the tail the
+                    // cached prompt no longer covers. When it cannot (a hybrid memory that refuses
+                    // a partial removal, or a chain that no longer agrees), the alternative is not
+                    // "carry on with a KV the prompt does not describe" and not "fail the request"
+                    // either: it is the degradation PR #28007 chose -- throw the cache away and
+                    // re-process the prompt from position 0. It keeps the request (200, correct
+                    // output, only the prompt eval is paid again) and leaves nothing inconsistent
+                    // behind.
+                    //
+                    // Rebuilding prompt.tokens is what makes the fall-through real: clearing the
+                    // sequence drops the KV *and* the token list, and the next iteration of the
+                    // prompt loop starts from whatever prompt.tokens holds. Without the refill it
+                    // would start from an empty prompt, i.e. generate from nothing.
+                    // [QLH-SPLIT] NOTE: this branch has never been exercised end-to-end. It is
+                    // structurally identical to the speculative-accept trim below (which has
+                    // been), but no test constructs a cache-reuse shape that reaches a partial
+                    // seq_rm at p0 <= pos_max with p0 > 0. Treat it as code-review-verified, not
+                    // run: if you change the degradation contract, the rebuilt-prompt line is the
+                    // part that has no test behind it.
+                    if (!slot.mem.seq_rm(slot.id, p0, -1)) {
+                        if (llama_context_split_failed(slot.ctx_tgt)) {
+                            // [QLH-SPLIT] A dead split chain answers every seq_rm with false,
+                            // including the full clear inside prompt_clear(). Failing the request
+                            // *here* would be wrong: self-healing needs one decode that starts at
+                            // position 0 (llama_memory_split::try_rebuild reconnects and clears
+                            // every stage on exactly that), and ending the request before the
+                            // decode skips it -- the chain then stays dead for every following
+                            // request. So: report it loudly (no longer silent) and let the normal
+                            // path fail the request and release the slot; the next request starts
+                            // at position 0 and rebuilds the chain.
+                            SLT_ERR(slot, "cannot trim the KV to the cached prefix at pos %d: the "
+                                          "split chain is no longer trustworthy (%s); this request "
+                                          "will fail, the next one reconnects the chain\n",
+                                    (int) p0, llama_context_split_failure(slot.ctx_tgt));
+                        } else {
+                            // [QLH-SPLIT] NOTE: this branch has never been exercised end-to-end.
+                            // It is structurally identical to the speculative-accept trim below
+                            // (which has been), but no test constructs a cache-reuse shape that
+                            // reaches a partial seq_rm at p0 <= pos_max with p0 > 0. Treat it as
+                            // code-review-verified, not run: if you change the degradation
+                            // contract, the rebuilt-prompt line is the part with no test behind it.
+                            SLT_WRN(slot, "memory could not roll back to pos %d - clearing the "
+                                          "sequence and re-processing the full prompt\n", (int) p0);
+                            slot.prompt_clear();
+                            slot.prompt.tokens = server_tokens(slot.task->tokens.get_tokens(), slot.task->tokens.has_mtmd);
+                            return;   // this iteration does nothing; the next one processes from pos 0
+                        }
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4678,6 +5404,294 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // [QLH-SPLIT] v5: ask the remote tail for candidates for exactly the sub-batch that will be
+    // sampled from.
+    //
+    // The tail answers for one batch row -- the last one it was handed -- so this asks only when
+    // that row is the row the sampler will read (`slot.i_batch`). Asking on every decode would be
+    // harmless but would make a prefilling request pay the candidate round trip for batches
+    // nobody samples from; asking when the row does not match would hand the sampler an array
+    // that describes a different token. A context without remote stages ignores the call.
+    void request_remote_candidates(int32_t off) {
+        const int32_t last_row = off + (int32_t) batch.view.size() - 1;
+
+        server_slot * hit = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.remote_cand_ok || slot.i_batch != last_row) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_DONE_PROMPT && slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+            if (!slot.spec_draft.empty()) {
+                // The speculative tail goes through its own sampler per row; never mixed in.
+                continue;
+            }
+            hit = &slot;
+            break;
+        }
+
+        if (hit == nullptr) {
+            // Explicitly clear: a request that used the channel must not leave it armed for the
+            // next frame (decode_split() clears it as well; this keeps the "asked for" state
+            // visible from here too).
+            llama_split_request_candidates(ctx_tgt, nullptr, nullptr, 0, nullptr, 0);
+            return;
+        }
+
+        const common_sampler_candidates & p = hit->remote_cand;
+
+        qlh_split::cand_req req{};
+        req.top_k           = p.top_k;
+        req.top_n_sigma     = p.top_n_sigma;
+        req.penalty_last_n  = p.penalty_last_n;
+        req.penalty_repeat  = p.penalty_repeat;
+        req.penalty_freq    = p.penalty_freq;
+        req.penalty_present = p.penalty_present;
+        req.n_steps         = (uint8_t) p.n_steps;
+        for (uint32_t i = 0; i < p.n_steps && i < sizeof(req.steps); ++i) {
+            req.steps[i] = p.steps[i];
+        }
+
+        // The history window is read from the sampler itself, never tracked here: it is the same
+        // ring the penalties step would use, so the tail cannot end up penalizing a different set
+        // of tokens than the row path would.
+        std::vector<llama_token> hist;
+        common_sampler_candidates_history(hit->smpl.get(), hist);
+
+        llama_split_request_candidates(ctx_tgt, &req,
+                hit->remote_cand_bias.empty() ? nullptr : hit->remote_cand_bias.data(),
+                (uint32_t) hit->remote_cand_bias.size(),
+                hist.data(), (uint32_t) hist.size());
+    }
+
+    // [QLH-SPLIT] v7: arm the per-row verify channel for exactly the frame that will be decoded
+    // next, or for none.
+    //
+    // The condition is not "some slot has drafts": it is "this frame *is* one slot's verification
+    // batch, whole". That is stronger than it looks, and every part of it matters:
+    //  - `spec_i_batch.front() == off` and its last index is the frame's last row: the tail
+    //    answers one token per row of the frame, indexed by row, and the accept loop reads rows
+    //    spec_i_batch[i]. A frame that also carried rows from somewhere else would make the
+    //    channel answer for rows the sampler does not read, and -- worse -- would leave whatever
+    //    those rows were for without logits (get_logits_ith() answers null for a verify frame).
+    //  - `spec_i_batch.size() == batch.view.size()`: all rows of the frame are that batch's.
+    //  - the slot's plan said the channel is usable (remote_verify_ok) and its sampler samples
+    //    the argmax; otherwise can_speculate() is false and there are no drafts to begin with.
+    //
+    // A context without remote stages ignores the call, so a local chain is unaffected.
+    void request_remote_verify_rows(int32_t off) {
+        const int32_t n_view = (int32_t) batch.view.size();
+
+        server_slot * hit = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.remote_verify_ok || slot.spec_blocked) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate()) {
+                continue;
+            }
+            if (slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+                continue;
+            }
+            if (slot.spec_i_batch.size() != (size_t) n_view ||
+                slot.spec_i_batch.front() != off ||
+                slot.spec_i_batch.back() != off + n_view - 1) {
+                continue;
+            }
+            if (off != 0) {
+                // The answer is indexed by *row of the frame* (llama_split_verified_token), while
+                // the accept loop reads rows by *batch index* -- the two are the same only when
+                // the frame starts at row 0. For a remote chain that is always the case (one
+                // sequence, so a spec frame is the whole batch), and requiring it here is what
+                // keeps a future multi-slot batch from reading the wrong row's token: an
+                // off-by-offset answer would be a wrong token, not a slower one.
+                continue;
+            }
+            if (slot.spec_i_batch.size() > (size_t) qlh_split::MAX_VERIFY_ROWS) {
+                // Cannot happen while spec_draft_cap is enforced, and the check is cheap: a
+                // frame over the cap would be refused by the tail's own n_outputs_max.
+                continue;
+            }
+            hit = &slot;
+            break;
+        }
+
+        llama_split_request_verify_rows(ctx_tgt, hit != nullptr);
+    }
+
+    // [QLH-SPLIT] v8: arm the h_nextn rows for the frame that will be decoded next, or for none.
+    //
+    // The condition is weaker than the verify channel's on purpose. The row is needed for two
+    // things: the accepted row of a *verify* frame (the next draft round's input) and the last row
+    // of *any* frame (the first draft round's input, and every round after a plain decode). So the
+    // frame only has to end with a row some drafting slot will use -- it does not have to be the
+    // verify batch itself. Which rows come back follows from the frame: all of them when the verify
+    // channel is armed on it, the last one otherwise (tools/split-stage/main.cpp).
+    //
+    // Arming it for a chain whose tail cannot draft would make the stage answer without the rows,
+    // so the check for "this chain can draft at all" happens here, not there.
+    void request_remote_nextn_rows() {
+        if (!llama_context_split_mtp_ready(ctx_tgt)) {
+            llama_split_request_nextn_rows(ctx_tgt, false);
+            return;
+        }
+
+        bool want = false;
+        for (auto & slot : slots) {
+            // A prompt frame needs the row too: the first draft round starts from the last prompt
+            // token's h, and there is no other decode that could produce it.
+            if (slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_DONE_PROMPT) {
+                continue;
+            }
+            if (!slot.can_speculate()) {
+                continue;
+            }
+            want = true;
+            break;
+        }
+
+        llama_split_request_nextn_rows(ctx_tgt, want);
+    }
+
+    // [QLH-SPLIT] v8/v9: discard a verification frame that produced no usable token, and leave the
+    // slot ready to decode its first position through the row path.
+    //
+    // Called when the grammar or the reasoning budget rejected a row of the frame:
+    // common_sampler_sample() answered LLAMA_TOKEN_NULL for it, so the frame's rows cannot be
+    // turned into tokens -- but they *were* decoded, and the rows before the rejected one may
+    // already have been accepted into the sampler. Three things are therefore undone, exactly as
+    // the partial-acceptance path below does:
+    //
+    //  1. the KV: the whole frame (sampled + draft rows) is dropped, with the checkpoint when the
+    //     context cannot do a bounded partial seq_rm, otherwise with a seq_rm back to the frame's
+    //     first position;
+    //  2. the prompt tokens: truncated to that same position, so the next
+    //     handle_last_sampled_token() re-adds `sampled` where the frame started;
+    //  3. the sampler: rolled back from the pre-frame clone, which restores the grammar *and* the
+    //     reasoning budget -- without this the grammar would have consumed rows the request never
+    //     emitted, and the budget would have been charged for them (both silent: the next plain
+    //     decode would produce a different token, and a FORCING frame would force an end
+    //     sequence the request should not have).
+    //
+    // The next round drafts nothing (skip_draft_once): the position is the one the frame failed
+    // on, so a fresh draft would be verified at the same state and fail identically. The plain
+    // decode that follows samples it through common_sampler_sample()'s row path, which applies the
+    // reasoning budget and the grammar first and resamples -- the token this frame could not
+    // produce.
+    //
+    // common_sampler_copy() covers rbudget because llama_sampler_copy() falls back to clone() for
+    // a sampler without copy_state, and common_reasoning_budget_clone() deep-copies the whole ctx
+    // (state, remaining, force_pos, and both matchers' aho-corasick state). That is asserted
+    // indirectly on every rollback: a partial copy would show up as an off-by-one in the forced
+    // sequence, i.e. as a different token, never as a crash.
+    // [QLH-SPLIT] Returns false when the frame could not be rolled back -- the one case where the
+    // request cannot continue. prompt.tokens has already been rewound by then, so a KV that still
+    // holds the rejected rows would make the next token a function of state nobody owns; the
+    // caller must not sample from it. See the failure branch at the end.
+    // [QLH-SPLIT] Does this verification frame need the target checkpoint to be undone?
+    //
+    // Two different rollbacks can be needed, and only one of them fits in the snapshots the
+    // ubatch itself wrote:
+    //   - a partial acceptance removes at most n_draft rows. The ubatch of the frame wrote
+    //     n_draft + 1 rows, so the recurrent memory allows a rollback of n_seq_tokens - 1 =
+    //     n_draft rows (cell.rs_max) -- seq_rm can do this one, no checkpoint needed;
+    //   - a frame the grammar or the reasoning budget abandons removes n_draft + 1 rows: the
+    //     n_draft drafts *and* the row the frame was decoded for. That is one row more than
+    //     the same ubatch allows, so it can never be done with seq_rm -- it always needs the
+    //     checkpoint captured before the frame. This is the definition of "the frame is
+    //     abandoned", see common/sampling.h: not one row of the frame is usable.
+    //
+    // A draft longer than n_rs_seq rows leaves the memory with rs_max == 0 (it only guarantees
+    // the final state), so it needs the checkpoint for the partial case as well.
+    //
+    // Requests that cannot abandon a frame (no grammar, no reasoning budget -- i.e. no path in
+    // common_sampler_sample_* returns an empty result) keep the cheap path: no per-frame state
+    // capture, and the partial rollback goes straight through seq_rm.
+    bool frame_needs_target_ckpt(const server_slot & slot, size_t n_draft) const {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            return true;
+        }
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            return false;
+        }
+        const bool too_long = n_draft + 1 > (size_t) llama_n_rs_seq(ctx_tgt);
+        const bool may_abandon =
+            common_sampler_has_grammar(slot.smpl.get()) ||
+            common_sampler_has_reasoning_budget(slot.smpl.get());
+        return too_long || may_abandon;
+    }
+
+    bool rollback_verify_frame(server_slot & slot, common_sampler * smpl_save, size_t n_draft, bool use_ckpt_tgt) {
+        const int32_t pos_first = (int32_t) (slot.prompt.n_tokens() - (n_draft + 1));
+        bool rm_ok = true;
+
+        if (use_ckpt_tgt) {
+            const auto & ckpt = slot.spec_ckpt;
+
+            SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu) "
+                          "after a rejected verification frame\n",
+                    ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+            GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+
+            if (slot.ctx_dft) {
+                GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            }
+
+            rm_ok = slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+
+            slot.prompt.tokens.keep_first(ckpt.n_tokens);
+        } else {
+            // No checkpoint was captured for this frame: the context rolls back partial sequences
+            // itself, and use_ckpt_tgt was false when the draft was made because the frame's
+            // n_draft + 1 rows are inside the n_rs_seq bound (see the two call sites of
+            // use_ckpt_tgt above -- they are the same condition on purpose).
+            slot.prompt.tokens.keep_first(pos_first);
+            rm_ok = slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+        }
+
+        if (!rm_ok) {
+            // [QLH-SPLIT] The KV refused to drop the rejected frame (a hybrid memory whose
+            // recurrent half cannot roll back that far, or a split chain that no longer agrees).
+            // prompt.tokens is already rewound, so the next decode would attend to rows that no
+            // longer exist in the prompt: that is a wrong token with no way to detect it later.
+            // Fail this request instead of serving it, and release the slot's memory through the
+            // one operation every memory type supports (a full clear) so the next request starts
+            // whole. Note what is deliberately NOT done: no GGML_ABORT -- one refused trim must
+            // not take a server down that has other slots to serve.
+            SLT_ERR(slot, "the verification rollback could not remove the rejected frame from the "
+                          "KV (%zu row(s) from pos %d); failing the request instead of sampling "
+                          "from state that no longer matches the prompt\n",
+                    n_draft + 1, pos_first);
+            send_error(slot, "the verification rollback failed: the KV still holds the rejected "
+                             "frame, so this request cannot continue on a consistent state "
+                             "(retry, or turn speculative decoding off for this chain)");
+            slot.prompt_clear();
+            slot.release();
+            return false;
+        }
+
+        slot.spec_draft.clear();
+        slot.spec_draft_q.clear();
+        slot.spec_is_replay = false;
+        slot.skip_draft_once = true;
+
+        common_sampler_copy(smpl_save, slot.smpl.get());
+
+        // counted as a verification step that accepted nothing: "generated" already counted these
+        // drafts when they were made, so leaving this out would make the acceptance rate look up
+        slot.stats.n_draft_verif_steps += 1;
+
+        if (trace > 0) {
+            SLT_INF(slot, "accepted  0/%2zu draft tokens (row rejected by the grammar or the "
+                          "reasoning budget; rolled back %zu row(s) at pos %d)\n",
+                    n_draft, n_draft + 1, pos_first);
+        }
+        return true;
+    }
+
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -4712,6 +5726,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // [QLH-SPLIT] v5: arm the candidate channel for this frame before the decode that
+        // produces the row it describes. Outside the yield block on purpose: the request and the
+        // decode it belongs to must not be separated by another task.
+        request_remote_candidates(off);
+        // [QLH-SPLIT] v7: same for the per-row verify channel -- one argmax token per row instead
+        // of one row of logits, for the frame that verifies this slot's drafts.
+        request_remote_verify_rows(off);
+        // [QLH-SPLIT] v8: and the h_nextn rows the MTP draft starts from (see the function).
+        request_remote_nextn_rows();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
@@ -4736,6 +5759,19 @@ private:
                 if (ret < -1) {
                     // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
+
+                    // [QLH-SPLIT] Name the reason when the chain is the reason. A remote stage
+                    // that stopped answering is remembered by the memory layer, and every
+                    // decode refuses from then on; without this the client (and a deep health
+                    // probe) sees only "Compute error." and has to guess whether the model, the
+                    // request or the network is at fault. Read on this thread on purpose: the
+                    // reason string is written by the thread that drives the chain, which is
+                    // the one running this function.
+                    const char * why = llama_context_split_failure(ctx_tgt);
+                    if (why != nullptr && why[0] != '\0') {
+                        err += " the split chain is no longer trustworthy: ";
+                        err += why;
+                    }
                 }
 
                 // TODO: handle ret == 2 (abort) when we start aborting
@@ -4817,6 +5853,41 @@ private:
         return true;
     }
 
+    // [QLH-SPLIT] v5: sample the next token, from the candidate array when this request is on
+    // that path.
+    //
+    // The array is what the tail computed for the row the request is about to read; the sampler
+    // then runs its own remaining steps on it, which is the whole point of the split (see
+    // common/sampling.h). When there is no array -- a request that fell back, or a decode that
+    // did not ask -- this is the ordinary path, unchanged.
+    llama_token sample_next_token(server_slot & slot, int32_t idx) {
+        if (slot.remote_cand_ok) {
+            const llama_split_token_cand * cands = nullptr;
+            int32_t row = -1;
+            const uint32_t n = llama_split_take_candidates(slot.ctx_tgt, &cands, &row);
+            if (n > 0) {
+                if (row != idx) {
+                    // Asking for the last row and sampling another one is a defect, not a
+                    // fallback: the row path cannot be reconstructed here (no logits were
+                    // transferred), so fail the request instead of sampling from a token the
+                    // array does not describe.
+                    throw std::runtime_error(string_format(
+                            "[split] the tail answered candidates for batch row %d but the sampler "
+                            "asked for row %d", row, idx));
+                }
+                std::vector<llama_token> ids(n);
+                std::vector<float>       logits(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    ids[i]    = cands[i].id;
+                    logits[i] = cands[i].logit;
+                }
+                return common_sampler_sample_candidates(slot.smpl.get(), ids.data(), logits.data(), n);
+            }
+        }
+
+        return common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, idx);
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4879,9 +5950,9 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
-                }
+                // [QLH-SPLIT] begin() used to be called here; it moved to the SLOT_STATE_STARTED
+                // branch of batch_building (see the comment there) so that the prompt's own
+                // process() batches are inside the window it opens. Nothing is left to do here.
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -4896,7 +5967,7 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                id = sample_next_token(slot, tok_idx);
             }
 
             slot.i_batch = -1;
@@ -4963,6 +6034,23 @@ private:
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
+                // [QLH-SPLIT] A partial acceptance removes at most n_draft rows, which is the
+                // n_seq_tokens - 1 = n_draft bound of the ubatch that wrote them, so seq_rm can
+                // always do it; only a frame longer than n_rs_seq rows leaves the memory with
+                // rs_max == 0 and needs the checkpoint here.
+                const bool use_ckpt_tgt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > (size_t) llama_n_rs_seq(ctx_tgt));
+
+                // [QLH-SPLIT] The whole-frame rollback removes n_draft + 1 rows, one more than
+                // the same ubatch allows, so it can never go through seq_rm -- it needs the
+                // checkpoint captured before the frame, and "captured" is exactly "spec_ckpt is
+                // not empty" (see frame_needs_target_ckpt and the clear() at the start of a
+                // frame). Keying it on the same function again would risk the two evaluations
+                // disagreeing, and a rollback through the wrong path is a refused seq_rm (a 500
+                // on the request, "the verification rollback failed").
+                const bool frame_needs_ckpt = !slot.spec_ckpt.empty();
+
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
@@ -4977,14 +6065,31 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
 
+                // [QLH-SPLIT] v8/v9: an empty result means the grammar or the reasoning budget
+                // rejected a row of the frame (common_sampler_sample answered LLAMA_TOKEN_NULL
+                // for it), so not one token of the frame is usable -- not even the rows before
+                // it, see the contract in common/sampling.h. The frame itself is already
+                // decoded, so rewind it and let the next round sample that position with a plain
+                // decode.
+                if (accepted.empty()) {
+                    // The one path that can return nothing: a verified row the grammar or the
+                    // reasoning budget rejected. Every other path ends in a token (mismatch,
+                    // rejection sampling, replay and synthetic acceptance all push at least one),
+                    // so an empty result with neither sampler would mean a defect, not a fallback.
+                    GGML_ASSERT((common_sampler_has_grammar(slot.smpl.get()) ||
+                                 common_sampler_has_reasoning_budget(slot.smpl.get())) &&
+                            "only a grammar or a reasoning budget can abandon a verification frame");
+                    GGML_ASSERT(!frame_needs_ckpt || (!slot.spec_ckpt.empty() &&
+                            "a whole-frame rollback needs the checkpoint captured before the frame"));
+                    // false = the rollback itself failed and the request was already failed and
+                    // released inside; nothing else may touch this slot.
+                    (void) rollback_verify_frame(slot, smpl_save.get(), n_draft, frame_needs_ckpt);
+                    return;
+                }
+
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
-
-                // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -5007,7 +6112,27 @@ private:
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        // [QLH-SPLIT] This is mid-generation, so the degradation of the prompt
+                        // path (clear and re-process) would throw away tokens the client already
+                        // has. What is preserved instead is exactly that: the response ends here
+                        // with everything generated so far, and the slot's memory is cleared
+                        // (full removal, which every memory type supports) so the next request
+                        // starts from a consistent state. What is NOT done is the thing that
+                        // would be silently wrong -- carrying on from a KV that still holds the
+                        // rejected rows of a frame whose prompt has already been rewound.
+                        if (!slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1)) {
+                            SLT_ERR(slot, "the speculative partial-accept rollback could not remove "
+                                          "the rejected rows from the KV; ending the response at "
+                                          "%d generated tokens instead of continuing on state that "
+                                          "no longer matches the prompt\n", (int) slot.stats.n_gen);
+                            slot.has_next_token = false;
+                            slot.stop           = STOP_TYPE_LIMIT;
+                            slot.print_timings();
+                            send_final_response(slot);
+                            slot.prompt_clear();
+                            slot.release();
+                            return;
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -5054,7 +6179,17 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            // [QLH-SPLIT] Same rule one level down: mid-generation, the tokens of this frame are
+            // already accepted and are about to be handed to the client, so they are still sent --
+            // but the rows of the drafts that were *not* accepted must leave the KV before the
+            // next decode, or it will attend to tokens the prompt no longer has. When that removal
+            // is refused the response ends after these tokens (nothing generated is lost) and the
+            // memory is cleared rather than carried forward inconsistent.
+            const bool trim_ok = slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (!trim_ok) {
+                SLT_ERR(slot, "%s", "the speculative accept could not trim the rejected draft rows "
+                                    "from the KV; the response ends after the accepted tokens\n");
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -5077,6 +6212,19 @@ private:
 
                     return;
                 }
+            }
+
+            if (!trim_ok) {
+                // Everything accepted above is already in `slot.generated` (process_token sent it),
+                // so ending here loses nothing the client has seen; what it avoids is the next
+                // decode reading the un-accepted draft rows that the failed trim left behind.
+                slot.has_next_token = false;
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.print_timings();
+                send_final_response(slot);
+                slot.prompt_clear();
+                slot.release();
+                return;
             }
 
             slot.print_timings_tg();
@@ -5767,7 +6915,7 @@ void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
 
-    this->get_health = [this](const server_http_req &) {
+    this->get_health = [this](const server_http_req & req) {
         // error and loading states are handled by middleware
         auto res = create_response(true);
 
@@ -5776,8 +6924,145 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
-        res->ok({{"status", "ok"}});
-        return res;
+        // [QLH-SPLIT] `?deep=1` asks a different question from the one this endpoint answers by
+        // default. A bare /health reports that the process has a model loaded -- that is what an
+        // orchestrator polls, and it must not start flapping because a network stage had a bad
+        // second (measured: /health answered 200 for the whole 120 s in which a suspended remote
+        // stage was blocking a request). deep=1 instead drives one real token through the whole
+        // chain, so it can only answer 200 if a request would have worked as well.
+        if (req.get_param("deep") != "1") {
+            res->ok({{"status", "ok"}});
+            return res;
+        }
+
+        // The probe is a request, so it needs a model to run on. Asleep means the model was
+        // unloaded to save power; waking it up from a health check would defeat the point of
+        // sleeping, so say what is true instead. A router runs no model here at all (see
+        // server_role_detect() in server.cpp: a server with no model is a router, and routes.
+        // get_health is deliberately not proxied there).
+        //
+        // Both checks deliberately avoid the llama_context: it is owned by the main loop and the
+        // shadowing `ctx_server` bool above is there to keep this handler from touching it. The
+        // queue's sleep flag is mutex-protected and the model path is startup configuration, so
+        // nothing here can race a decode or a sleep transition.
+        if (queue_tasks.is_sleeping()) {
+            res->error(format_error_response(
+                    "the server is sleeping; a deep probe needs the model loaded (use /health without deep=1 for liveness)",
+                    ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        if (params.model.empty()) {
+            res->error(format_error_response(
+                    "no model is loaded on this server (router mode); a deep probe has nothing to drive",
+                    ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        // [QLH-SPLIT] The probe is an ordinary completion task, on purpose. It runs on the
+        // thread that owns the context, through the slot machinery, so it cannot race a decode
+        // and cannot leave a slot's KV bookkeeping describing tokens that its cache no longer
+        // holds -- the two things a hand-rolled llama_decode() from an HTTP thread would do.
+        // `cli = true` makes the main thread tokenize it, so this thread never touches the
+        // vocab. One token, one generated token: enough for every stage of the chain to run.
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.id         = res->rd.get_new_id();
+        task.cli        = true;
+        task.cli_prompt = "a";
+        task.params.n_predict    = 1;
+        // Decoding the probe token is the entire point: with the prompt cache on, the server may
+        // find this 1-token prompt in the slot's cache and answer from logits it already has,
+        // verifying nothing. cache_prompt = false forces a full re-processing of that token (and
+        // a clear of the slot's KV) so every stage really runs.
+        task.params.cache_prompt = false;
+        // A streamed task signals "a slot took it" with a first progress result. That is what
+        // separates "the probe is running" from "every slot is busy", which look identical from
+        // outside until the 120 s stage timeout fires.
+        task.params.stream           = true;
+        task.params.sse_ping_interval = -1;
+        task.params.res_type         = TASK_RESPONSE_TYPE_NONE;
+        res->rd.post_task(std::move(task), true); // high-priority: a health probe should not queue behind traffic
+
+        // 125 s: the stage connection gives up after 120 s (src/llama-split-remote.cpp), so a
+        // probe that touched a dead stage answers well before this; the extra 5 s is for the
+        // error to travel through the slot. Deliberately NOT shorter: a suspended stage has to
+        // be allowed to reach its own timeout, otherwise a hung chain would be reported as
+        // "busy" instead of as broken.
+        const int64_t t0 = ggml_time_ms();
+        bool started = false;
+        while (true) {
+            server_task_result_ptr result = res->rd.next([&] {
+                return req.should_stop() || ggml_time_ms() - t0 > 125000;
+            });
+            if (result == nullptr) {
+                if (started) {
+                    res->error(json {
+                        { "code",    503 },
+                        { "type",    "unavailable_error" },
+                        { "message", "the deep probe did not finish within 125 s: the chain stopped "
+                                     "answering without failing. Run /health (shallow) to tell the "
+                                     "server itself apart from the stage." },
+                    });
+                } else {
+                    // No slot picked the probe up. That is not a chain failure -- a server busy
+                    // with real work would fail its own requests only if the chain were broken,
+                    // and those requests would have failed visibly. Report it as "not verified"
+                    // rather than as a failed chain so a deep probe does not take a healthy busy
+                    // machine out of rotation.
+                    res->ok(json {
+                        { "status", "ok" },
+                        { "deep",   "busy" },
+                        { "detail", "no slot was free for the probe within 125 s; the chain was not "
+                                    "exercised. /health (shallow) still answers this server as alive" },
+                    });
+                }
+                return res;
+            }
+
+            if (result->is_error()) {
+                const std::string why = json_value(result->to_json(), "message", std::string("unknown error"));
+                json body {
+                    { "code",    503 },
+                    { "type",    "unavailable_error" },
+                    { "message", "the deep probe failed: " + why },
+                };
+                // Name the chain that failed: the endpoints are the operator's own
+                // --split-remote arguments and the only name a stage has on this side.
+                if (!params.split_remote.empty()) {
+                    body["chain"] = params.split_remote;
+                }
+                res->error(body);
+                return res;
+            }
+
+            if (result->is_stop()) {
+                // A final result with no prompt tokens means the probe never decoded anything
+                // (an empty tokenization is released as an empty completion), which must not be
+                // reported as "the chain works".
+                const auto * cmpl = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
+                const int32_t n_prompt = cmpl != nullptr ? cmpl->n_prompt_tokens : 0;
+                if (n_prompt <= 0) {
+                    res->error(json {
+                        { "code",    503 },
+                        { "type",    "unavailable_error" },
+                        { "message", "the deep probe produced no prompt token to decode; nothing was "
+                                     "verified (this is a probe bug, not a chain failure)" },
+                    });
+                    return res;
+                }
+                res->ok(json {
+                    { "status",         "ok" },
+                    { "deep",           "probed" },
+                    { "n_prompt_tokens", n_prompt },
+                    { "n_decoded",       cmpl->n_decoded },
+                    { "detail", "one token was decoded through every stage of the chain" },
+                });
+                return res;
+            }
+
+            // a partial result: the slot took the task, from here on a timeout means "hung",
+            // not "busy"
+            started = true;
+        }
     };
 
     this->get_metrics = [this](const server_http_req & req) {

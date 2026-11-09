@@ -437,7 +437,26 @@ llama_model_dflash::graph<true>::graph(const llm_graph_params & params) : llm_gr
 // target features of an injection batch: host embd rows, or rows of the target's layer input device buffer
 static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp) {
     if (g.ubatch.embd_row) {
+        // The batch says "read rows of ctx_other's layer input device buffer", and the graph resolves
+        // layer_inp_src from the same predicate the batch builder asked (llama_context::supports_embd_row).
+        // If it does not hold, the two disagreed about this frame -- a logic error, so the assert below
+        // stays. This line only says which of the two facts failed: no buffer at all, or one whose width
+        // is not the decoder's whole encoder input (a split chain fills only the layers it computes).
+        if (g.layer_inp_src == nullptr || g.layer_inp_src->ne[0] != n_embd_inp) {
+            // Direct stderr, not LLAMA_LOG_ERROR, on purpose: common's logger is asynchronous (it queues
+            // to a writer thread) and drops the last line when the process aborts right after -- measured:
+            // the same text via LLAMA_LOG_ERROR never reached the server log, this fprintf + fflush did.
+            fprintf(stderr, "%s: embd-row batch but the layer input device buffer %s (%d cols, decoder expects %d)\n",
+                    __func__,
+                    g.layer_inp_src ? "is too narrow" : "is missing",
+                    g.layer_inp_src ? (int) g.layer_inp_src->ne[0] : -1,
+                    (int) n_embd_inp);
+            fflush(stderr);
+        }
         GGML_ASSERT(g.layer_inp_src != nullptr && g.layer_inp_src->ne[0] == n_embd_inp);
+        // This is the assert that the v9 device-buffer bug reports quote: dflash.cpp:440 before the
+        // diagnostic above was added, dflash.cpp:456 in this tree. The number moves with the block
+        // above; it always means *this* assert (embd-row batch vs layer input device buffer width).
 
         inp.embd_rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, g.n_tokens);
         ggml_set_input(inp.embd_rows);

@@ -1,5 +1,8 @@
 #include "sampling.h"
 
+#include "../src/llama-ext.h"        // [QLH-SPLIT] v7: llama_split_verified_token (per-row verify channel)
+#include "../src/llama-split-proto.h" // [QLH-SPLIT] v5: the candidate step numbers (static_assert only)
+
 #include "common.h"
 #include "fit.h"
 #include "log.h"
@@ -125,6 +128,34 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // [QLH-SPLIT] v5: remote candidate channel (see sampling.h for the whole story).
+    //
+    // merged_bias is the exact list the chain's logit_bias step applies. common_sampler_init
+    // builds it locally today; keeping it here is what lets the tail apply the same list without
+    // common/ or the params.
+    std::vector<llama_logit_bias> merged_bias;
+
+    // The analysis of the chain's split point, computed once in common_sampler_init:
+    //   cand_first > 0  -- index of the first step to run on candidates (top_k + 1)
+    //   cand_full       -- the parameters the tail needs for the steps before it
+    //   cand_why        -- why the split is not usable, for the log line
+    // A -1 cand_first means "never use the candidate channel with this chain".
+    int32_t                   cand_first = -1;
+    common_sampler_candidates cand_full;
+    std::string               cand_why;
+
+    // [QLH-SPLIT] v7: is this chain "the argmax of the row"?
+    //
+    // The per-row verify channel answers a token id per row and nothing else, so the caller can
+    // only use it when sampling a row *is* taking its argmax: every step before the final greedy
+    // selection must leave the maximum where it is (top_k/top_p/min_p/top_n_sigma prune the tail
+    // of the distribution, temperature > 0 is monotone, a no-op penalty/DRY step does nothing),
+    // and no step may move it (logit_bias, an enabled penalties or DRY step, XTC's random
+    // exclusion of the top choice, typical/mirostat/adaptive sampling). Computed once, next to
+    // the candidate analysis, so the log line and the decision cannot drift.
+    bool        verify_ok = false;
+    std::string verify_why;
+
     void reset() {
         prev.clear();
 
@@ -172,8 +203,217 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
-std::string common_params_sampling::print() const {
-    char result[1024];
+// [QLH-SPLIT] v5: is a penalties step a no-op? Mirrors llama_sampler_penalties::is_disabled()
+// exactly, because the decision here is "does the tail have to run it", and a disagreement with
+// the library would either drop a real penalty or send parameters nobody uses.
+static bool cand_penalties_enabled(const common_params_sampling & p) {
+    return p.penalty_last_n != 0 &&
+           !(p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f);
+}
+
+// Same for DRY (llama_sampler_dry_apply's early-out).
+static bool cand_dry_enabled(const common_params_sampling & p) {
+    return p.dry_multiplier != 0.0f && p.dry_base >= 1.0f && p.dry_penalty_last_n != 0;
+}
+
+// [QLH-SPLIT] v5: where can this chain be cut?
+//
+// The cut is after top_k, and it is exact only if:
+//  - there is a top_k step at all, with k > 0 (otherwise nothing truncates the vocabulary and the
+//    k candidates are a lossy sample of it -- measured: T=0.8 / top_p=0.95 needs 763 tokens, and
+//    at k=64 the tail of the distribution carries 0.185);
+//  - every step before it can be reproduced by a stage that only has llama.h (logit_bias is
+//    handled outside this list, penalties and top_n_sigma are the two candidates, DRY is only
+//    allowed when it is a no-op);
+//  - every step after it is fine by construction: they all read cur_p, which holds exactly the k
+//    candidates.
+//
+// Anything else keeps the whole-row path. The alternative -- approximating -- would be a sampling
+// bug that no output ever shows.
+static bool cand_plan_chain(
+        const std::vector<common_sampler_type> & types,
+        const common_params_sampling & params,
+        int32_t n_vocab,
+        int32_t & first,
+        common_sampler_candidates & out,
+        std::string & why) {
+    int32_t ik = -1;
+    for (size_t i = 0; i < types.size(); ++i) {
+        if (types[i] == COMMON_SAMPLER_TYPE_TOP_K) {
+            ik = (int32_t) i;
+            break;
+        }
+    }
+    if (ik < 0) {
+        why = "the sampler chain has no top_k step (mirostat, or a custom --samplers list without "
+              "top-k), so nothing truncates the vocabulary";
+        return false;
+    }
+    if (params.top_k <= 0) {
+        why = "top_k <= 0: the chain does not truncate the vocabulary";
+        return false;
+    }
+    if (params.top_k >= n_vocab) {
+        // k candidates would be n_vocab * 8 bytes, i.e. twice the row they replace. Still exact,
+        // but the whole point is the bytes, so take the row.
+        why = "top_k (" + std::to_string(params.top_k) + ") covers the whole vocabulary (" +
+              std::to_string(n_vocab) + "): the candidate array would be larger than the row";
+        return false;
+    }
+    if (params.backend_sampling) {
+        // The chain lives on the backend as well and already produces candidates there; driving
+        // this channel too would have two sources of truth for the same array.
+        why = "backend sampling is enabled for this context";
+        return false;
+    }
+
+    out = common_sampler_candidates{};
+    out.n_steps = 0;
+
+    // The wire frame has room for 3 steps (cand_req::steps), and top_k is always the last one, so
+    // at most two steps may precede it. A custom --samplers list with more (say penalties twice
+    // plus top_n_sigma) is not described by this frame; refuse rather than truncate it, because a
+    // truncated chain would produce candidates the row path never would.
+    const auto add_step = [&](uint8_t step) {
+        if (out.n_steps + 2 > (uint32_t) sizeof(out.steps)) {
+            return false;
+        }
+        out.steps[out.n_steps++] = step;
+        return true;
+    };
+
+    for (int32_t i = 0; i < ik; ++i) {
+        switch (types[i]) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (cand_penalties_enabled(params) && !add_step(COMMON_CAND_STEP_PENALTIES)) {
+                    why = "the chain has more steps before top_k than a stage frame can describe";
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (cand_dry_enabled(params)) {
+                    // DRY needs the vocabulary's token pieces and the configured sequence
+                    // breakers; a stage has the model but not the driving side's parameters, and
+                    // shipping them per frame would be a second, drifting copy of the sampler.
+                    why = "the DRY repetition penalty is enabled and runs before top_k";
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    out.top_n_sigma = params.top_n_sigma;
+                    if (!add_step(COMMON_CAND_STEP_TOP_N_SIGMA)) {
+                        why = "the chain has more steps before top_k than a stage frame can describe";
+                        return false;
+                    }
+                }
+                break;
+            default:
+                why = std::string("the chain has a step before top_k that a split-stage cannot run: ") +
+                      common_sampler_type_to_str(types[i]);
+                return false;
+        }
+    }
+
+    out.steps[out.n_steps++] = COMMON_CAND_STEP_TOP_K;
+    out.top_k           = params.top_k;
+    out.penalty_last_n  = params.penalty_last_n;
+    out.penalty_repeat  = params.penalty_repeat;
+    out.penalty_freq    = params.penalty_freq;
+    out.penalty_present = params.penalty_present;
+
+    first = ik + 1;
+    return true;
+}
+
+// [QLH-SPLIT] v7: is this chain "the argmax of the row"?
+//
+// The per-row verify channel sends one token id per batch row and nothing else, so it is only
+// exact when the token a row produces *is* its argmax. That is a property of the whole chain, not
+// of the temperature alone:
+//
+//  - the final selection must be the greedy sampler. common_sampler_init picks it exactly when
+//    n_probs == 0 (probs need a distribution) and the chain ends in temp 0 with no dynatemp, or
+//    in top_k == 1 -- and not when the adaptive-p alternative was selected, which replaces
+//    greedy/dist at the end of the chain and does not take the argmax either. Anything else --
+//    dist, mirostat, adaptive_p -- draws, so the token is not a function of the row's maximum.
+//  - every step before that must leave the maximum where it is. top_k / top_p / min_p /
+//    top_n_sigma only remove the low-probability tail, and a positive temperature is a monotone
+//    rescaling, so the argmax survives all of them. A no-op penalties or DRY step changes
+//    nothing. This is deliberately a list of *proven* steps: XTC can drop the top choice on
+//    purpose, typical inherits a different ranking, and mirostat/adaptive_p replace the sampling
+//    rule, so a chain containing them keeps the whole-row path.
+//  - no logit_bias step. It is always the first step and its entries are -INFINITY (model
+//    suppress tokens) or a user bias; either can move the maximum away from the raw row's.
+//
+// The check is one function because the fallback is the highest-risk part of the feature: a
+// caller with its own copy of these conditions would silently sample from a channel it cannot
+// undo. `why` is written to be logged once per request (common/sampling.h).
+static bool verify_plan_chain(
+        const std::vector<common_sampler_type> & types,
+        const common_params_sampling & params,
+        bool greedy,
+        bool has_bias,
+        std::string & why) {
+    if (!greedy) {
+        why = "the sampler chain does not end in the greedy step (temp 0 with no dynatemp, or "
+              "top_k = 1, and no probability request), so a row's token is not its argmax";
+        return false;
+    }
+    if (has_bias) {
+        why = "the chain applies a logit_bias step (user biases or the model's suppress tokens), "
+              "which can move the argmax away from the raw row's";
+        return false;
+    }
+    for (const auto type : types) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!cand_penalties_enabled(params)) {
+                    break; // a no-op step: same logits in, same logits out
+                }
+                why = "the repetition penalties are enabled, and they run before the argmax";
+                return false;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (!cand_dry_enabled(params)) {
+                    break; // no-op as well
+                }
+                why = "the DRY repetition penalty is enabled, and it runs before the argmax";
+                return false;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                // Prune the tail, or rescale monotonically; the maximum stays the maximum.
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                // llama_sampler_typical_apply returns immediately at p >= 1, which is the default.
+                // Below that it keeps the tokens whose log-probability is close to the entropy --
+                // a ranking that can leave the maximum out, so it must not be used here.
+                if (params.typ_p >= 1.0f) {
+                    break;
+                }
+                why = "typical sampling is enabled (typ_p < 1), and it can drop the argmax";
+                return false;
+            case COMMON_SAMPLER_TYPE_XTC:
+                // llama_sample_xtc_apply is a no-op at probability <= 0 (the default) and at
+                // threshold > 0.5. Above that it removes the top choices on purpose, which is
+                // exactly the token this channel assumes survives.
+                if (params.xtc_probability <= 0.0f || params.xtc_threshold > 0.5f) {
+                    break;
+                }
+                why = "XTC is enabled, and it removes the top choices on purpose";
+                return false;
+            default:
+                why = std::string("the chain has a step that can move the argmax: ") +
+                      common_sampler_type_to_str(type);
+                return false;
+        }
+    }
+    return true;
+}
+
+std::string common_params_sampling::print() const {    char result[1024];
 
     snprintf(result, sizeof(result),
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
@@ -212,6 +452,24 @@ struct common_sampler * common_sampler_init(
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
+
+    // [QLH-SPLIT] v7: how the chain ends, hoisted out of the branch below because the per-row
+    // verify analysis needs exactly what the chain was built from.
+    //
+    // `greedy` is the condition common_sampler_init uses to pick llama_sampler_init_greedy(), and
+    // `adaptive_p` says the chain ends in the adaptive-p sampler instead *even when greedy is
+    // true* (the two are alternatives in the same if/else, and adaptive-p is registered after the
+    // user's sampler list, so it does not appear in s_types at all). Both are needed: a chain
+    // ending in adaptive-p does not take the argmax, no matter what `greedy` says.
+    bool greedy         = false;
+    bool use_adaptive_p = false;
+
+    // [QLH-SPLIT] v5: the type of every entry pushed into `samplers`, parallel to it. The chain
+    // itself cannot be asked for this: it exposes lambdas, not names, and a name string is not
+    // something a fallback decision should be parsed out of. logit_bias is not in here because it
+    // is always first and has no type in this enum; see has_bias below.
+    std::vector<common_sampler_type> s_types;
+    bool has_bias = false;
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
@@ -327,25 +585,38 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    //
+    // [QLH-SPLIT] v5: `merged_bias` is kept (rather than staying local) because the tail has to
+    // apply the very same list before its top_k step. These entries are all -INFINITY, and their
+    // position before top_k is what makes them matter: applied later, a suppressed token would
+    // already have taken a candidate slot the column path would have given to a usable token.
+    std::vector<llama_logit_bias> merged_bias = params.logit_bias;
     {
-        std::vector<llama_logit_bias> merged = params.logit_bias;
-
         int32_t n_suppress = 0;
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
         for (int32_t i = 0; i < n_suppress; ++i) {
-            merged.push_back({ suppress[i], -INFINITY });
+            merged_bias.push_back({ suppress[i], -INFINITY });
         }
 
-        if (!merged.empty()) {
-            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+        if (!merged_bias.empty()) {
+            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged_bias.size(), merged_bias.data()));
+            has_bias = true;
         }
     }
 
     if (params.mirostat == 0) {
 
-        bool use_adaptive_p = false; // see below
+        // [QLH-SPLIT] v7: hoisted out of the branch below because the per-row verify analysis
+        // needs it too, and it must be the same boolean the chain itself was built from.
+        greedy = params.n_probs == 0 && !params.samplers.empty() &&
+            ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+             (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
 
         for (const auto & cnstr : params.samplers) {
+            // [QLH-SPLIT] v5: record which step each push is, so the candidate split can be
+            // analysed without parsing sampler names. Every case below adds at most one sampler.
+            const size_t n_before = samplers.size();
+
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
                     {
@@ -394,15 +665,16 @@ struct common_sampler * common_sampler_init(
                 default:
                     GGML_ASSERT(false && "unknown sampler type");
             }
+
+            for (size_t i = n_before; i < samplers.size(); ++i) {
+                s_types.push_back(cnstr);
+            }
         }
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // Keep distribution sampling when callers request probabilities.
-            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
-                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
-                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
             samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
@@ -417,6 +689,35 @@ struct common_sampler * common_sampler_init(
 
     for (auto * smpl : samplers) {
         llama_sampler_chain_add(chain, smpl);
+    }
+
+    // [QLH-SPLIT] v5: analyse the split point once. A chain that cannot be split keeps the
+    // whole-row path for its whole life; the reason is remembered rather than rebuilt per request
+    // so the log line and the decision cannot drift.
+    int32_t cand_first = -1;
+    common_sampler_candidates cand_full;
+    std::string cand_why;
+    if (cand_plan_chain(s_types, params, llama_vocab_n_tokens(vocab), cand_first, cand_full, cand_why)) {
+        // s_types covers only the samplers built by the loop above; the logit_bias step, when
+        // present, sits at the very front of the chain and is not in it.
+        cand_first += has_bias ? 1 : 0;
+    } else {
+        cand_first = -1;
+    }
+
+    // [QLH-SPLIT] v7: the same analysis for the per-row verify channel. Independent of the
+    // candidate split on purpose: the two answer different questions, and a chain can be usable
+    // for one and not the other (temp 0 has no top_k requirement here, and top_k > 0 with a
+    // non-greedy tail is usable there and not here).
+    std::string verify_why;
+    bool        verify_ok = verify_plan_chain(s_types, params, greedy && !use_adaptive_p,
+                                               has_bias, verify_why);
+    if (verify_ok && params.backend_sampling) {
+        // The backend sampler would produce the token itself, on a context whose rows this side
+        // does not have; and the channel's whole contract is that the value read per row is the
+        // argmax of that row.
+        verify_ok  = false;
+        verify_why = "backend sampling is enabled for this request";
     }
 
     if (grmr && params.backend_sampling) {
@@ -441,6 +742,12 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .merged_bias = */ std::move(merged_bias),
+        /* .cand_first  = */ cand_first,
+        /* .cand_full   = */ cand_full,
+        /* .cand_why    = */ std::move(cand_why),
+        /* .verify_ok   = */ verify_ok,
+        /* .verify_why  = */ std::move(verify_why),
     };
 
     return result;
@@ -471,6 +778,66 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+// [QLH-SPLIT] v8: does this sampler's grammar reject `token` from its *current* state?
+//
+// The single-token form of the rejection check that common_sampler_sample() does on the row path
+// (mask a one-element array, look for -INFINITY), factored out because three places now ask the
+// same question of the same state: the verified-row path (per row, below), the row path itself,
+// and the server's draft pre-filter.
+//
+// Two properties make this safe to call at any time, and both matter:
+//  - it never advances the grammar. llama_grammar_apply_impl() only writes -INFINITY into the
+//    candidate array, so the state is untouched -- unlike accept, which throws on a token the
+//    grammar cannot advance (llama_grammar_accept_token, src/llama-grammar.cpp).
+//  - a lazy grammar whose trigger has not fired yet masks nothing, so every token "passes". That
+//    is exactly what the row path concludes too: until the trigger fires the grammar is not
+//    constraining anything, and the trigger can only fire on a token that was accepted.
+bool common_sampler_grammar_rejects(struct common_sampler * gsmpl, llama_token token) {
+    if (gsmpl == nullptr || !grammar_should_apply(gsmpl)) {
+        return false;
+    }
+
+    llama_token_data       single_token_data       = { token, 1.0f, 0.0f };
+    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+    llama_sampler_apply(gsmpl->grmr, &single_token_data_array);
+
+    return single_token_data_array.data[0].logit == -INFINITY;
+}
+
+bool common_sampler_has_grammar(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->grmr != nullptr;
+}
+
+// [QLH-SPLIT] v9: the same one-token question for the reasoning-budget sampler.
+//
+// The row path applies this sampler to the whole row before the chain
+// (llama_sampler_apply(gsmpl->rbudget, &cur_p) in common_sampler_sample), so the question "would
+// the row path have been able to select this token" has exactly one honest form: does the mask of
+// the *current* state drop it. common_reasoning_budget_rejects answers that without touching the
+// state machine.
+//
+// Why not apply() on a one-element array, as the grammar check does: apply() is a pure mask today,
+// so both would answer the same, but rbudget's state machine lives in accept() (remaining--,
+// FORCING -> DONE, the UTF-8 wait) and the check would silently depend on apply() never growing a
+// side effect. The explicit predicate cannot drift that way.
+//
+// Note what this function deliberately does *not* do: it does not spend budget and does not move
+// force_pos. A row that passes is accepted by common_sampler_sample_and_accept_n(), and that call
+// is the only place the state machine advances -- so a rolled-back frame costs nothing and a frame
+// that is fully accepted is charged exactly once per row.
+bool common_sampler_rbudget_rejects(struct common_sampler * gsmpl, llama_token token) {
+    if (gsmpl == nullptr || gsmpl->rbudget == nullptr) {
+        return false;
+    }
+
+    return common_reasoning_budget_rejects(gsmpl->rbudget, token);
+}
+
+bool common_sampler_has_reasoning_budget(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->rbudget != nullptr;
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -525,6 +892,12 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .merged_bias = */ gsmpl->merged_bias,
+        /* .cand_first  = */ gsmpl->cand_first,
+        /* .cand_full   = */ gsmpl->cand_full,
+        /* .cand_why    = */ gsmpl->cand_why,
+        /* .verify_ok   = */ gsmpl->verify_ok,
+        /* .verify_why  = */ gsmpl->verify_why,
     };
 }
 
@@ -547,6 +920,21 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+
+    // [QLH-SPLIT] v5: the candidate plan. The biases pointer mirrors merged_bias, so it is never
+    // copied -- it is re-pointed below, or a checkpoint restore would hand the caller the other
+    // sampler's list.
+    dst->merged_bias = src->merged_bias;
+    dst->cand_first  = src->cand_first;
+    dst->cand_full   = src->cand_full;
+    dst->cand_why    = src->cand_why;
+    dst->cand_full.biases = nullptr;
+
+    // [QLH-SPLIT] v7: the verify analysis is a pure function of the chain's construction, so a
+    // copy agrees with the source by definition; copying it keeps a restored sampler's plan
+    // identical to the one the request started with.
+    dst->verify_ok  = src->verify_ok;
+    dst->verify_why = src->verify_why;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -603,6 +991,177 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// [QLH-SPLIT] v5: the step numbers are a wire format (qlh_split::cand_step). Keeping the
+// assertion here, next to the code that fills the frame, is what makes a renumbering on one side
+// a build error instead of a stage that runs the wrong sampler.
+static_assert(COMMON_CAND_STEP_PENALTIES   == qlh_split::CAND_STEP_PENALTIES,   "cand step drift");
+static_assert(COMMON_CAND_STEP_TOP_N_SIGMA == qlh_split::CAND_STEP_TOP_N_SIGMA, "cand step drift");
+static_assert(COMMON_CAND_STEP_TOP_K       == qlh_split::CAND_STEP_TOP_K,       "cand step drift");
+
+bool common_sampler_candidates_check(
+        const struct common_sampler * gsmpl,
+        bool remote_chain,
+        bool pre_sampling_logprobs,
+        bool speculative,
+        common_sampler_candidates & out,
+        std::string & why) {
+    why.clear();
+    if (gsmpl == nullptr) {
+        why = "no sampler";
+        return false;
+    }
+    if (!remote_chain) {
+        // Not a fallback in the slow sense: a local chain and a whole model have the row in
+        // memory, so the candidate channel would only add a hop through the wire.
+        why = "not a remote chain";
+        return false;
+    }
+    if (gsmpl->grmr != nullptr) {
+        why = "grammar is set: GBNF can legalize tokens outside the top-k set";
+        return false;
+    }
+    if (gsmpl->rbudget != nullptr) {
+        why = "the reasoning-budget sampler masks the whole vocabulary outside the chain";
+        return false;
+    }
+    if (pre_sampling_logprobs) {
+        why = "pre-sampling logprobs were requested: they are a softmax over the whole row";
+        return false;
+    }
+    if (speculative) {
+        why = "speculative decoding samples several batch rows per step";
+        return false;
+    }
+    if (cand_penalties_enabled(gsmpl->params) &&
+        gsmpl->params.penalty_last_n > gsmpl->params.n_prev) {
+        // The window the tail replays comes from this sampler's own last-token ring, which holds
+        // n_prev tokens. A shorter window would penalize fewer tokens than the row path does.
+        why = "penalty_last_n (" + std::to_string(gsmpl->params.penalty_last_n) +
+              ") exceeds n_prev (" + std::to_string(gsmpl->params.n_prev) +
+              "): the history window would be truncated";
+        return false;
+    }
+    if (gsmpl->cand_first <= 0) {
+        why = gsmpl->cand_why.empty() ? "this sampler chain cannot be split at top_k" : gsmpl->cand_why;
+        return false;
+    }
+
+    out = gsmpl->cand_full;
+    out.biases = &gsmpl->merged_bias;
+    return true;
+}
+
+bool common_sampler_verify_rows_check(
+        const struct common_sampler * gsmpl,
+        bool remote_chain,
+        bool want_probs,
+        std::string & why) {
+    why.clear();
+    if (gsmpl == nullptr) {
+        why = "no sampler";
+        return false;
+    }
+    if (!remote_chain) {
+        // Nothing to save: the rows are already in this process's memory.
+        why = "not a remote chain";
+        return false;
+    }
+    if (want_probs) {
+        // Both kinds of probability output read the row: pre-sampling logprobs are a softmax over
+        // the whole vocabulary, post-sampling ones are the sampler's own cur_p, which the
+        // token-id path does not build (there is no array to build it from). Either way the
+        // request cannot be answered from one argmax per row.
+        why = "probabilities were requested: they need the whole row (pre-sampling) or the "
+              "sampler's candidate array (post-sampling)";
+        return false;
+    }
+    // [QLH-SPLIT] v8: a grammar no longer blocks this channel, and it is worth stating why the
+    // argument that used to be here no longer holds. A grammar can reject the argmax and, on the
+    // row path, resample from the row -- which a verified row cannot do. But it does not have to:
+    // the verified path asks the grammar about the one token it was handed
+    // (common_sampler_grammar_rejects) and answers "this row cannot be used" when the grammar says
+    // no (LLAMA_TOKEN_NULL from common_sampler_sample). The caller then restores its checkpoint
+    // and decodes that position through the ordinary row path, which is the same resampling --
+    // late, and one round more expensive, but never a different token. A lazy grammar needs no
+    // special case either: until its trigger fires it masks nothing, and a draft that fires the
+    // trigger is accepted and then constrains the next row exactly as on the row path.
+    //
+    // [QLH-SPLIT] v9: the reasoning-budget sampler does not block it either, for the same reason
+    // and with one extra fact that had to be established first: its mask is a pure function of
+    // (state, force_pos) and only accept() advances the state machine, so a check can ask it per
+    // row without consuming budget (common_reasoning_budget_rejects, common/reasoning-budget.cpp).
+    // Both filters are therefore asked about the row's token by common_sampler_sample(), in the
+    // order the row path applies them (reasoning budget first, then the grammar), and a row either
+    // one rejects makes the frame unusable. See common_sampler_rbudget_rejects for the read-only
+    // argument; the budget itself is only spent by common_sampler_accept(), which the accept loop
+    // calls per accepted row and the rollback path undoes through common_sampler_copy().
+    if (!gsmpl->verify_ok) {
+        why = gsmpl->verify_why.empty()
+                ? "this sampler chain can move the argmax, so a row's token is not a function of it"
+                : gsmpl->verify_why;
+        return false;
+    }
+    return true;
+}
+
+uint32_t common_sampler_candidates_history(
+        const struct common_sampler * gsmpl,
+        std::vector<llama_token> & out) {    out.clear();
+    if (gsmpl == nullptr) {
+        return 0;
+    }
+    const int32_t want = std::max(0, gsmpl->params.penalty_last_n);
+    const int32_t have = (int32_t) gsmpl->prev.size();
+    const int32_t n    = std::min(want, have);
+
+    out.reserve((size_t) n);
+    // prev.rat(0) is the newest token; the tail replays oldest-first, exactly like a sequence of
+    // llama_sampler_accept() calls would have arrived.
+    for (int32_t i = n - 1; i >= 0; --i) {
+        out.push_back(gsmpl->prev.rat((size_t) i));
+    }
+    return (uint32_t) out.size();
+}
+
+llama_token common_sampler_sample_candidates(
+        struct common_sampler * gsmpl,
+        const llama_token * ids,
+        const float * logits,
+        uint32_t n) {
+    GGML_ASSERT(gsmpl != nullptr);
+    GGML_ASSERT(gsmpl->cand_first > 0 && "candidates require common_sampler_candidates_check()");
+    GGML_ASSERT(ids != nullptr && logits != nullptr && n > 0);
+
+    const auto tm = gsmpl->tm();
+
+    // The candidate array becomes cur_p exactly as the tail built it: descending logit, original
+    // f32 values, p unset. The row path leaves the same thing behind its top_k step, which is why
+    // the remaining steps below cannot tell the two apart.
+    auto & cur = gsmpl->cur;
+    cur.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        cur[i] = llama_token_data{ids[i], logits[i], 0.0f};
+    }
+    gsmpl->cur_p = { cur.data(), cur.size(), -1, true };
+
+    // Every step from the one after top_k onwards, applied to the candidate array. The samplers
+    // this skips are the ones the tail already ran: penalties, top_n_sigma, top_k itself. Running
+    // penalties again here would apply the same history twice -- the single most likely way to
+    // make the two paths disagree, which is why the split point is computed from the chain rather
+    // than assumed to be "penalties first".
+    auto & chain = gsmpl->chain;
+    const int32_t n_chain = llama_sampler_chain_n(chain);
+    for (int32_t i = gsmpl->cand_first; i < n_chain; ++i) {
+        struct llama_sampler * s = llama_sampler_chain_get(chain, i);
+        GGML_ASSERT(s != nullptr);
+        llama_sampler_apply(s, &gsmpl->cur_p);
+    }
+
+    GGML_ASSERT(gsmpl->cur_p.selected >= 0 && gsmpl->cur_p.selected < (int32_t) gsmpl->cur_p.size);
+
+    return gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -610,6 +1169,62 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
+
+    // [QLH-SPLIT] v7: the per-row verify channel.
+    //
+    // When the frame was answered with one argmax token per row instead of logits, there is
+    // nothing to sample *from*: for a chain that samples the argmax (verify_ok, proven at init and
+    // gated per request by common_sampler_verify_rows_check) the tail already produced exactly
+    // the token this call would have returned. Taking it here and not in
+    // common_sampler_sample_and_accept_n is what makes every caller of a verified frame correct
+    // by construction: the speculative accept loop, the replay path and the synthetic path all
+    // reach the sampler through this one function, and none of them needs to know the channel
+    // exists.
+    //
+    // What is *not* done here is deliberate: no set_logits (there is no row), no chain apply (a
+    // greedy chain's apply is the argmax the tail already took), and no accept (the caller owns
+    // that, exactly as for the row path). cur_p keeps the previous call's contents; every reader
+    // of it -- post-sampling probs, rejection sampling -- is excluded by the same check that
+    // armed this channel.
+    {
+        const llama_token verified = llama_split_verified_token(ctx, idx);
+        if (verified != LLAMA_TOKEN_NULL) {
+            GGML_ASSERT(gsmpl->verify_ok &&
+                    "a per-row verified token is only valid for a chain that samples the argmax");
+
+            // [QLH-SPLIT] v8: the grammar is the last filter before a token becomes output, and
+            // the row path below applies it after sampling: a token the grammar rejects is not
+            // returned, it is resampled from the row with the grammar applied first. This path
+            // has no row, so the same question has a different answer -- "this row cannot be
+            // used" -- and LLAMA_TOKEN_NULL is how this function says so. It is NOT a token:
+            // the caller must not accept it (llama_grammar_accept_token throws on a token the
+            // grammar cannot advance) and must not resample from a row it does not have.
+            //
+            // [QLH-SPLIT] v9: the reasoning-budget sampler is asked first, because that is the
+            // order the row path applies them (rbudget, then the grammar) and the question is the
+            // same shape: the row path masks the row with rbudget before the chain runs, so a
+            // masked token can never be selected. Asking it here does not consume budget or move
+            // the forcing position -- common_reasoning_budget_rejects is a pure read -- and when
+            // this sampler is FORCING the grammar is not applied at all (grammar_should_apply),
+            // so grammar_rejects answers false here exactly as the row path would.
+            //
+            // The state the question is asked in is the frame's: rows are accepted in order by
+            // common_sampler_sample_and_accept_n(), so row i is checked with the grammar and the
+            // reasoning budget already advanced by rows 0..i-1. That is also why a rejected row
+            // ends the whole round instead of shortening it -- see the comment in
+            // sample_and_accept_n. And that is why the caller's rollback must restore rbudget
+            // too: the rows accepted before the rejection spent budget and moved force_pos.
+            if (common_sampler_rbudget_rejects(gsmpl, verified)) {
+                return LLAMA_TOKEN_NULL;
+            }
+
+            if (common_sampler_grammar_rejects(gsmpl, verified)) {
+                return LLAMA_TOKEN_NULL;
+            }
+
+            return verified;
+        }
+    }
 
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;
@@ -656,16 +1271,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    {
-        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-
-        llama_sampler_apply(grmr, &single_token_data_array);
-
-        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
-        if (is_valid) {
-            return id;
-        }
+    if (!common_sampler_grammar_rejects(gsmpl, id)) {
+        return id;
     }
 
     // resampling:
@@ -699,6 +1306,26 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        if (id == LLAMA_TOKEN_NULL) {
+            // [QLH-SPLIT] v8/v9: the grammar or the reasoning budget rejected this row's argmax,
+            // and a verified row has no row to resample from. The frame is abandoned whole rather
+            // than shortened, and nothing is accepted for it:
+            //  - accepting the row's token would make llama_grammar_accept_token throw, and would
+            //    charge the reasoning budget for a token the request never emitted;
+            //  - returning the rows that did match would hand the caller a replay frame whose
+            //    last row is this same rejected position, so every retry would reject it again
+            //    (a spin that never emits a token) -- the round has to end *before* this
+            //    position, which only the caller can arrange (restore its checkpoint, then
+            //    decode the position plainly so the row path's own grammar resampling runs).
+            // An empty result is the signal for that: "no token of this frame is usable".
+            //
+            // The rows already accepted above advanced the grammar and spent budget; the caller's
+            // rollback restores both (common_sampler_copy), so the state after this frame is the
+            // state before it -- the frame is as if it had never been generated.
+            result.clear();
+            return result;
+        }
+
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
@@ -712,6 +1339,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        if (id == LLAMA_TOKEN_NULL) {
+            // same rejection, on the bonus row: it is the one row of the frame that is not a
+            // draft, and it is still a verified row with no logits behind it.
+            result.clear();
+            return result;
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -751,6 +1385,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     for (; i < draft.size(); i++) {
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        if (id_tgt == LLAMA_TOKEN_NULL) {
+            // [QLH-SPLIT] v8/v9: same "this frame is unusable" signal as the plain version above.
+            // Not reachable today (a request whose grammar or reasoning budget could reject a
+            // verified row is greedy, and the rejection path needs temp > 0 — and the server
+            // blocks exactly this combination in plan_remote_verify_rows), but the return value is
+            // a contract and quietly accepting an unverified draft token here is the one mistake
+            // that ends in a throw or in a budget charged twice instead of a wrong token.
+            result.clear();
+            return result;
+        }
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
         const auto & q     = draft_q[i];
@@ -830,6 +1475,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        if (id == LLAMA_TOKEN_NULL) {
+            result.clear();
+            return result;
+        }
 
         common_sampler_accept(gsmpl, id, true);
 

@@ -1291,6 +1291,70 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // [QLH-SPLIT] A layer range that stops short of the model's last trunk layer and has nothing
+    // following it is a truncated model, and it is the one split misconfiguration that used to
+    // start cleanly and serve wrong tokens: llama-server returns 200 because needs_output() is
+    // false for a range without the output head, so the logits are simply never computed, and no
+    // attach check ever ran because no attach was requested. Refuse it here, after the layer
+    // count is known (it is not available at argument-parse time) and before a context is built
+    // for it.
+    //
+    // The range has to *end* at the last trunk layer to be servable on its own, not start there:
+    // a tail segment ([20, 24) of 24) is a legitimate configuration -- it produces logits from
+    // hidden input, and llama-server creates exactly that shape of context when it loads a
+    // --split-tail-range. Only a range that ends early is unservable.
+    //
+    // The range is read back from the model, not from `params`. It has two entry points:
+    // --split-layer-range and LLAMA_LAYER_RANGE (the loader's fallback for one-process-per-stage
+    // runs), and `params` only ever holds the first one. A params-based test therefore judged a
+    // range that was never loaded: with the env var at "0:24" (the whole model, exactly what the
+    // loader's comment keeps the env var for) split_layer_hi stayed -1, the range "did not end at
+    // the last layer", and the refusal printed "-1:-1" as the range it had measured.
+    {
+        int32_t range_lo = -1;
+        int32_t range_hi = -1;
+        const int32_t n_layer_src = llama_model_n_layer_src(model);
+        const bool    ranged      = llama_model_layer_range(model, &range_lo, &range_hi);
+        if (ranged && n_layer_src > 0 && params.split_tail_lo < 0 && params.split_remote.empty() &&
+                range_hi != n_layer_src) {
+            COM_ERR("layer range %d:%d loads layers [%d, %d) of the model's %d, which does "
+                    "not include its output head, and no stage continues them. A split chain needs "
+                    "either --split-tail-range (a local tail) or --split-remote (a remote stage); "
+                    "serving this would answer with a model that is missing layers %d..%d, silently.\n",
+                    range_lo, range_hi, range_lo, range_hi, n_layer_src,
+                    range_hi, n_layer_src - 1);
+            return;
+        }
+
+        // [QLH-SPLIT] The range also has to *start* at layer 0 if it is served on its own.
+        // [20, 24) of a 24-layer model ends at the last layer, so the check above lets it
+        // through: it does load the output head, needs_output() is true, and llama-server answers
+        // 200 -- but the first 20 layers are never computed, so the tokens are plausible and
+        // wrong. Nothing downstream can notice, because there is no attach to verify.
+        //
+        // A range that starts above 0 is legitimate in exactly one place: it is a stage of a
+        // chain that something else in this process builds around it. llama-server says so by
+        // setting split_range_is_stage on the params it hands to the tail load; a user typing
+        // `--split-layer-range 20:24` gets the same fields with the flag cleared, and that is the
+        // configuration this rejects. Ordered after the check above so the existing "ends early"
+        // message (which names the layers that follow) stays the one shown for `0:20`; this one
+        // only fires for configurations that check cannot see.
+        if (ranged && n_layer_src > 0 && params.split_tail_lo < 0 && params.split_remote.empty() &&
+                range_lo != 0 && !params.split_range_is_stage) {
+            COM_ERR("layer range %d:%d starts at layer %d instead of layer 0, and no stage "
+                    "precedes it. On its own it is a model missing layers 0..%d: the first %d "
+                    "layers are never computed, yet it still loads the output head and will answer "
+                    "with plausible, wrong tokens, silently. A range that does not start at layer 0 "
+                    "is only valid as a stage of a chain, and this process is not assembling one. "
+                    "Load the head here and continue it locally with --split-layer-range 0:%d "
+                    "--split-tail-range %d:%d, or keep the head here and drive remote stages with "
+                    "--split-remote host:port.\n",
+                    range_lo, range_hi, range_lo, range_lo - 1, range_lo,
+                    range_lo, range_lo, range_hi);
+            return;
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // these decision models return a score for each token via the embeddings output
@@ -1423,7 +1487,15 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 
 // only for warmup and probe decodes, fill zeros as dummy input
 static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
-    zeros.assign(llama_model_n_embd_out(model), 0.0f);
+    // [QLH DFLASH-01] DFlash/EAGLE3 draft graphs consume *encoder* rows of width
+    // target_layers * n_embd (8 x 2048 = 16384). Sizing this state by n_embd_out (2048)
+    // made the warmup empty run read past the buffer and take an access violation
+    // (reproducible crash right after "warming up the model with an empty run").
+    // Prefer the encoder width when the model declares one; all other archs keep the
+    // previous behaviour byte for byte.
+    const int32_t n_embd_enc = llama_model_n_embd_inp_enc(model);
+    const int32_t width      = n_embd_enc > 0 ? n_embd_enc : llama_model_n_embd_out(model);
+    zeros.assign((size_t) width, 0.0f);
     for (int32_t i = 0; i < batch.size(); ++i) {
         batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
     }
@@ -1522,7 +1594,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(0);
         }
 
-        if (llama_model_has_encoder(model)) {
+        // [QLH DFLASH-01] Draft encoder graphs (DFlash / EAGLE3) consume *embedding* rows of
+        // width n_embd_inp_enc and never create a token input tensor, so feeding them a token
+        // batch here dereferences a null tensor and takes an access violation inside
+        // llm_graph_input_embd::set_input(). Only run the token-based encode for models whose
+        // encoder actually accepts tokens (n_embd_inp_enc == n_embd_inp).
+        const bool enc_takes_tokens =
+            llama_model_n_embd_inp_enc(model) == llama_model_n_embd_inp(model);
+        if (llama_model_has_encoder(model) && enc_takes_tokens) {
             common_batch batch = common_batch_get_one(lctx, tmp);
             llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
@@ -1536,7 +1615,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
-            common_batch_set_zero_state(batch, model, zeros);
+            // [QLH DFLASH-01] draft 类模型（DFlash/EAGLE3）不吃 embd_state：它们的前向
+            // 完全由 token 或 16384 宽的 layer_inp 行驱动，塞零状态反而让 warmup 的
+            // graph_reserve 读到不匹配的宽度并 AV（n_tokens=128 那次必崩，--no-warmup 则
+            // 完全正常）。所以只给真正声明了 embd_state 的模型设它。
+            if (llama_model_n_embd_inp_enc(model) <= 0) {
+                common_batch_set_zero_state(batch, model, zeros);
+            }
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
         llama_memory_clear(llama_get_memory(lctx), true);
@@ -1587,6 +1672,13 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
+    // [QLH-SPLIT] This reads the *effective* value, and only that one: the llama_context
+    // constructor clamps n_rs_seq to 0 for architectures without recurrent rollback (it WARNs
+    // while doing so), so 0 here means "this context has no bounded partial removal", never
+    // "removal is not needed" -- the probe below is what answers the second question. The
+    // other three sites (common_context_params_to_llama's max() with --split-rs-seq,
+    // split-stage's --rs-seq check, and the server's RS/FULL branches) also read
+    // llama_n_rs_seq(), i.e. the same post-clamp number.
     if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
@@ -1622,17 +1714,110 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     }
 
 done:
+    // [QLH-SPLIT] This clear is load-bearing for a remote chain, not cleanup. The probe above may
+    // have just failed the partial removal because a *remote stage* refused it (a stage started
+    // with --rs-seq 0 cannot roll back), and llama_memory_split::seq_rm records that as "this
+    // chain is no longer trustworthy". Every stage answering clear() is the one consistent state
+    // the chain can rebuild on its own, so clear() drops the flag again -- which is why a caller
+    // that asks llama_context_split_failed() right after load sees 0 even when the trace log above
+    // shows a refused seq_rm. It is not a race and the flag is not flapping: without this clear the
+    // chain would (correctly) stay dead, because the probe left the head trimmed and the stage not.
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
 
     return res;
 }
 
-static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+static bool common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
-    if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+
+    // [QLH-SPLIT] Fault injection for the "a trim was refused" path, which is otherwise reachable
+    // only on a memory type that happens to refuse one (hybrid recurrent without room to roll
+    // back) or a chain that no longer agrees. Off unless set, and it only refuses *partial*
+    // removals -- a full clear is what every degraded path uses to recover, so faking a failure
+    // there would test nothing but the clear itself.
+    //   QLH_FORCE_SEQ_RM_FAIL=1  -> every partial seq_rm answers false without touching the memory
+    {
+        // Value: "1" -> every sequence, "0"/unset -> off, any other number -> only that seq_id.
+        // The per-sequence form is what makes "one slot degrades, the other is untouched"
+        // testable on a server with shared-prompt slots.
+        static const int force_fail_seq = []() -> int {
+            const char * e = getenv("QLH_FORCE_SEQ_RM_FAIL");
+            if (e == nullptr || e[0] == '\0' || e[0] == '0' || e[0] == 'n' || e[0] == 'N') {
+                return -1;
+            }
+            if (e[0] == '1' && e[1] == '\0') {
+                return -2;
+            }
+            const int seq = atoi(e);
+            return seq >= 0 ? seq : -1;
+        }();
+        // Only refuse when there is actually something to remove: a trim past the end
+        // (p0 > pos_max) is a no-op that must still succeed, otherwise a degraded
+        // caller that re-processes from position 0 would loop on the same refusal.
+        if ((force_fail_seq == -2 || force_fail_seq == (int) seq_id) && !(p0 <= 0 && p1 < 0) &&
+                p0 <= (llama_pos) llama_memory_seq_pos_max(mem, seq_id)) {
+            COM_ERR("%s", "QLH_FORCE_SEQ_RM_FAIL: refusing a partial sequence removal on purpose\n");
+            return false;
+        }
     }
+
+    if (llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+        return true;
+    }
+
+    // [QLH-SPLIT] The reason this failed (which stage, which range, which endpoint) is logged
+    // just before the false comes back, and the server writes its log from a worker thread: an
+    // abort() drops whatever is still queued. Measured on a remote chain with a dead stage --
+    // the error line was sometimes there, sometimes not. Flushing first is what makes the
+    // failure diagnosable, in both branches below.
+    common_log_flush(common_log_main());
+
+    // [QLH-SPLIT] A chain with remote stages does not take the process down with it.
+    //
+    // The abort below was never wrong about the consequence: after this, one stage's KV no
+    // longer agrees with the others, so every following token would be computed from state that
+    // some stage does not have. It was wrong about the carrier. Measured on a cross-host chain
+    // (head here, tail on another machine), suspending the tail stage for one request ended with
+    // the whole head process dead -- this abort -- every slot with it, while /health answered
+    // 200 for the full 120 s and then the port stopped listening. One network glitch turned into
+    // "the machine is gone".
+    //
+    // Why returning is still safe, which is the only thing that matters here: the memory layer
+    // marks the chain dead before returning false (llama_memory_split::seq_rm), and
+    // decode_split checks that flag before computing anything and answers -3. So no token is
+    // ever produced from the diverged KV: this request fails, and so does every request after it
+    // until the chain is rebuilt. What changes is only who pays -- the request, not the server.
+    //
+    // "Until the chain is rebuilt" is no longer an operator step: a later request whose prompt
+    // starts at position 0 reconnects the stages and clears the whole chain
+    // (llama_memory_split::try_rebuild), so a stage that comes back is picked up without a
+    // restart. The line below has to say that, because the obvious reaction to "restart the
+    // server" is to restart a server that would have healed by itself.
+    if (llama_context_split_failed(ctx)) {
+        COM_ERR("the split chain is no longer trustworthy: %s\n", llama_context_split_failure(ctx));
+        COM_ERR("%s\n", "it cannot be repaired in place from this request: later requests fail with "
+                        "this reason until a rebuild succeeds. A rebuild happens on its own once "
+                        "every stage answers again -- the next request whose prompt starts at "
+                        "position 0 reconnects the stages and clears the whole chain -- and "
+                        "restarting the server does the same by re-attaching them. No manual step "
+                        "is needed while the stages are still gone");
+        return false;
+    }
+
+    // [QLH-SPLIT] A local failure is reported, not fatal -- the same rule as the remote case
+    // above, for the same reason: the consequence is already contained if the caller listens.
+    //
+    // This used to GGML_ABORT. That was right about the consequence (after a failed trim the KV
+    // still holds rows prompt.tokens no longer has, so the next token is computed from state
+    // nobody owns) and wrong about the carrier: server callers do listen to the return value
+    // now (context shift, cache reuse, verification rollback), and each of them degrades to a
+    // state it can trust -- discard the cache and re-process, stop the request, or fail it --
+    // instead of taking the process down. A memory type that refuses a trim is not a bug by
+    // itself: llama_memory_hybrid refuses one whenever the recurrent half cannot roll back, and
+    // that is exactly the case the caller has to hear about.
+    COM_ERR("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+    return false;
 }
 
 static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -1650,11 +1835,12 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
     this->ctx_dft = ctx_dft;
 }
 
-void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+bool common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    bool ok = common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        ok = common_context_seq_rm(ctx_dft, seq_id, p0, p1) && ok;
     }
+    return ok;
 }
 
 void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
@@ -1691,6 +1877,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
+    mparams.split_layer_lo  = params.split_layer_lo;
+    mparams.split_layer_hi  = params.split_layer_hi;
+    (void) params.split_tail_lo;  // tail 段用它自己的 common_params 走同一条转换
+    (void) params.split_tail_hi;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
@@ -1741,6 +1931,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    if (params.split_rs_seq > 0) {
+        // [QLH-SPLIT] Explicit snapshots for every stage of a chain. 0 stays the supported value
+        // for a local chain: llama-server then restores a context checkpoint instead of
+        // truncating the KV, and a chain's checkpoint covers every stage. Only a remote stage
+        // process needs > 0 (its seq_rm arrives over the wire, with no checkpoint out there);
+        // split-stage enforces that on its own side, so nothing here has to.
+        //
+        // Take the max, do not overwrite: the value the speculative type needs is a *lower*
+        // bound (an MTP round rolls back up to n_max + 1 positions at once: the verified batch is
+        // n_max + 1 rows and a frame a grammar rejects is abandoned whole, see need_n_rs_seq()),
+        // and an explicit --split-rs-seq smaller than that would silently push the server onto a
+        // full checkpoint per round. Larger explicit values are still honoured.
+        cparams.n_rs_seq = std::max<uint32_t>(cparams.n_rs_seq, params.split_rs_seq);
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
@@ -1749,6 +1953,66 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
     cparams.embeddings        = params.embedding;
+
+    // [QLH-SPLIT] A chain of stages exchanges hidden states, so every stage must expose them,
+    // and the pre-norm one -- taking the normed vector makes the next stage normalize twice.
+    // These are context-construction fields (they change the graph's output shape), so they
+    // cannot be flipped later by llama_set_embeddings_*.
+    //
+    // This has to live *after* the assignments above: they are unconditional and would
+    // silently undo it. Measured: setting these earlier left embeddings=0 and
+    // n_outputs_max_per_seq=1 at decode time, i.e. embd.data stayed null and the head stage
+    // had no hidden to hand over.
+    // [QLH-SPLIT] The two ends of a chain need very different output-row caps, and the tail's
+    // must not come out as n_batch.
+    //
+    // What the cap actually limits, because it is easy to attribute to the wrong function:
+    //  - `output_reserve(n_outputs)` sizes the logits buffer as n_vocab * max(n_outputs,
+    //    n_seq_max()), and `n_outputs` is its *argument* -- at decode time the number of rows the
+    //    batch actually marks as output (1 for a plain decode), not cparams.n_outputs_max.
+    //    cparams.n_outputs_max appears only in that function's closing assert, so a smaller cap
+    //    does not by itself make this buffer smaller.
+    //  - What the cap limits is the graph the reserve pass allocates: sched_reserve() reserves
+    //    the pp graph with n_outputs = min(n_tokens, cparams.n_outputs_max) (src/llama-context.cpp,
+    //    "n_outputs_pp"), and that graph's logits output node is [n_vocab, n_outputs] f32 --
+    //    with this model at -b 2048 that is 248320 x 2048 x 4 B, ~1.9 GiB of compute buffer,
+    //    held for the life of the context. *That* is what the tail must not pay.
+    //
+    // The head (first branch) does need the full n_tokens: it exports pre-norm hidden for *every*
+    // token of the batch (an embeddings context marks all tokens as output whatever the batch's
+    // own flags say), so it keeps n_batch rows. The 0 below is the sentinel for that; it is not a
+    // new mechanism, llama_context's ctor has always read 0 as cparams.n_batch:
+    // "cparams.n_outputs_max = params.n_outputs_max == 0 ? cparams.n_batch : params.n_outputs_max"
+    // (src/llama-context.cpp).
+    //
+    // The tail (second branch) owes logits only for the rows the caller samples: one per
+    // sequence for a plain decode, and 1 + n_max per sequence for a speculative verify block
+    // (server-context.cpp marks the sampled token plus every draft with output = true). So it
+    // gets that count explicitly, n_seq_max * (1 + n_max) rows -- *not* the 0 sentinel, which
+    // would mean n_batch all over again. Both values are floored at n_seq_max because
+    // output_reserve() raises its own bound to n_seq_max() and then asserts that it fits in
+    // cparams.n_outputs_max (GGML_ASSERT at the end of output_reserve): a smaller value aborts
+    // the process instead of failing one request.
+    if (params.split_tail_lo >= 0 || !params.split_remote.empty()) {
+        cparams.n_outputs_max         = 0;
+        cparams.n_outputs_max_per_seq = 0;
+    } else if (params.split_layer_lo >= 0) {
+        const int32_t rows_per_seq = std::max<int32_t>(1, common_speculative_n_max(&params.speculative) + 1);
+        const int32_t wanted       = params.n_outputs_max > 0
+                ? params.n_outputs_max
+                : (int32_t) cparams.n_seq_max * rows_per_seq;
+        cparams.n_outputs_max         = std::max<int32_t>(wanted, (int32_t) cparams.n_seq_max);
+        cparams.n_outputs_max_per_seq = rows_per_seq;
+    }
+
+    // The head is the only stage that hands hidden states downstream, so it is the only one that
+    // needs the relay output. That is true whether the stage after it is a local context or a
+    // split-stage process: a remote chain whose head does not export pre-norm hidden hands over
+    // an empty carrier, which decode_split turns into "head stage produced no hidden state".
+    if (params.split_tail_lo >= 0 || !params.split_remote.empty()) {
+        cparams.embeddings          = true;
+        cparams.embeddings_pre_norm = true;
+    }
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;
     cparams.rope_freq_scale   = params.rope_freq_scale;
@@ -2441,40 +2705,67 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
-void common_prompt_checkpoint::update_tgt(
+// [QLH-SPLIT] A checkpoint is either captured whole or not captured. This used to abort the
+// whole process when the byte count did not match the size that was queried first
+// (llama_state_seq_get_size_ext), because that mismatch was treated as a broken chain. It is not:
+// for a chain with remote stages the size and the data are two round trips, and a stage that
+// changed between them (or a dropped frame) gives a shorter or longer blob, which is a reason to
+// skip *this* checkpoint, not to kill a server that is otherwise serving. Retried once, because
+// a single transient window is the common case and the retry re-queries the size; if the second
+// attempt disagrees as well the chain is genuinely inconsistent, and the caller is told so.
+static bool common_checkpoint_capture(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        common_state_data & dst) {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+        // 0 is not "an empty state": the getter answers 0 when the state cannot be exported at all
+        // (a remote chain asked for a flavour the stage protocol does not carry) or when it
+        // failed. A checkpoint with no bytes reports success on load and restores nothing, so
+        // treat it as "not captured" here rather than storing a lie.
+        if (ckpt_size == 0) {
+            COM_ERR("%s", "failed to size a context checkpoint (0 bytes); not capturing it\n");
+            dst.clear();
+            return false;
+        }
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        dst.resize(ckpt_size);
+
+        const size_t n = llama_state_seq_get_data_ext(ctx, dst.data(), ckpt_size, seq_id, flags);
+        if (n == ckpt_size) {
+            return true;
+        }
+
+        // The reason (which stage of the chain could not export its state) is logged from the
+        // memory layer, and the server writes its log from a worker thread: flush before
+        // giving up, or the explanation is still queued when the response goes out.
+        COM_ERR("failed to capture a context checkpoint: expected %zu bytes, got %zu "
+                "(attempt %d/2)%s\n", ckpt_size, n, attempt + 1, attempt == 0 ? ", retrying" : "");
+        common_log_flush(common_log_main());
     }
+
+    dst.clear();
+    return false;
 }
 
-void common_prompt_checkpoint::update_dft(
+bool common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
-    if (ctx == nullptr) {
-        return;
-    }
+    return common_checkpoint_capture(ctx, seq_id, flags, data_tgt);
+}
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
+bool common_prompt_checkpoint::update_dft(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    return common_checkpoint_capture(ctx, seq_id, flags, data_dft);
 }
 
 bool common_prompt_checkpoint::load_tgt(

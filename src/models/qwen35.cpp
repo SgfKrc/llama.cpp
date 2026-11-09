@@ -204,6 +204,11 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     }
     cur = inpL;
 
+    // [C-scheme] a relay segment must forward the PRE-norm hidden: the next segment's
+    // first layer expects the raw output of this one, and norming twice would diverge.
+    if (cparams.embeddings_pre_norm) {
+        res->t_embd = cur;
+    }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
@@ -214,7 +219,9 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     }
 
     cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    if (!cparams.embeddings_pre_norm) {
+        res->t_embd = cur;
+    }
 
     if (model.cls_out) {
         ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
@@ -227,10 +234,14 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     }
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // [C-scheme] a relay segment has no use for logits; leaving t_logits null keeps the
+    // output projection (and its ~515 MB of weights) out of the graph entirely.
+    if (!cparams.embeddings_pre_norm) {
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(

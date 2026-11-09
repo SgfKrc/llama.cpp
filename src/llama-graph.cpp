@@ -2760,8 +2760,15 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-        ggml_build_forward_order(gf, embd0);
+        // [QLH-SPLIT] A relay segment has no token embedding: the loader does not read
+        // `tok_embd` when the layer range does not start at 0 (needs_tok_embd()), so this
+        // tensor is null there. The GET_ROWS below is forced into the graph by
+        // ggml_build_forward_order regardless of which branch `idx` later selects, so it
+        // cannot stay unconditional. Such a segment only ever arrives as raw hidden.
+        if (tok_embd != nullptr) {
+            embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+            ggml_build_forward_order(gf, embd0);
+        }
 
         embd1 = inp->embd;
 
@@ -2814,38 +2821,43 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
     std::array<ggml_tensor *, 3> inps = {};
 
-    // token embeddings path (ubatch.token != nullptr)
-    inps[0] = build_tok(embd0, inp->tokens);
+    ggml_tensor * cur = nullptr;
 
-    // vector embeddings path (ubatch.embd != nullptr)
-    inps[1] = embd1;
+    if (embd0 == nullptr) {
+        // [QLH-SPLIT] No token path exists (relay segment): the hidden input is the only
+        // one, so there is nothing to select between.
+        GGML_ASSERT(!ubatch.token && "a context with no token embedding received tokens");
+        cur = embd1;
+    } else {
+        // token embeddings path (ubatch.token != nullptr)
+        inps[0] = build_tok(embd0, inp->tokens);
 
-    assert(ggml_are_same_shape (inps[0], inps[1]));
-    assert(ggml_are_same_stride(inps[0], inps[1]));
+        // vector embeddings path (ubatch.embd != nullptr)
+        inps[1] = embd1;
 
-    if (has_mixed) {
-        inp->mixed_slots = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tok_rows);
-        cb(inp->mixed_slots, "inp_mixed_slots", -1);
-        ggml_set_input(inp->mixed_slots);
+        assert(ggml_are_same_shape (inps[0], inps[1]));
+        assert(ggml_are_same_stride(inps[0], inps[1]));
 
-        inp->mixed_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-        cb(inp->mixed_embd, "inp_mixed_embd", -1);
-        ggml_set_input(inp->mixed_embd);
+        if (has_mixed) {
+            inp->mixed_slots = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tok_rows);
+            cb(inp->mixed_slots, "inp_mixed_slots", -1);
+            ggml_set_input(inp->mixed_slots);
 
-        // note: set_rows writes into its destination, so it gets a copy of the input
-        ggml_tensor * embd_mixed = build_tok(embd2, inp->mixed_tokens);
-        inps[2] = ggml_set_rows(ctx0, ggml_dup(ctx0, inp->mixed_embd), embd_mixed, inp->mixed_slots);
+            inp->mixed_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+            cb(inp->mixed_embd, "inp_mixed_embd", -1);
+            ggml_set_input(inp->mixed_embd);
 
-        assert(ggml_are_same_shape (inps[0], inps[2]));
-        assert(ggml_are_same_stride(inps[0], inps[2]));
-    }
+            // note: set_rows writes into its destination, so it gets a copy of the input
+            ggml_tensor * embd_mixed = build_tok(embd2, inp->mixed_tokens);
+            inps[2] = ggml_set_rows(ctx0, ggml_dup(ctx0, inp->mixed_embd), embd_mixed, inp->mixed_slots);
 
-    const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;
+            assert(ggml_are_same_shape (inps[0], inps[2]));
+            assert(ggml_are_same_stride(inps[0], inps[2]));
+        }
 
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), has_mixed ? 3 : 2, idx);
+        const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;
 
-    if (n_embd_inp != n_embd) {
-        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        cur = ggml_build_forward_select(gf, inps.data(), has_mixed ? 3 : 2, idx);
     }
 
     res->t_inp_embd = cur;

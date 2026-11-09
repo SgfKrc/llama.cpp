@@ -28,6 +28,9 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
     llama-memory.cpp
+    llama-memory-split.cpp
+    llama-split-net.cpp
+    llama-split-remote.cpp
     llama-moe-cache.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
@@ -44,9 +47,22 @@ set(LLAMA_CORE_SOURCES
     unicode.cpp
 )
 
+# [QLH] SLIM-ARC prefetch layer (upstream: patches/llama-upstream/slim-arc-integration.patch).
+# Compiled outside the unity batches: the port carries platform macros (WIN32_LEAN_AND_MEAN)
+# and POSIX names that must not leak into neighbouring translation units.
+set(LLAMA_SLIMARC_SOURCES
+    slim-arc-prefetch.cpp
+    slim-arc-page-range.cpp
+    slim-arc-expert-reclaim.cpp
+    slim-arc-expert-residency.cpp
+    slim-arc-expert-transition.cpp
+)
+set_source_files_properties(${LLAMA_SLIMARC_SOURCES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+
 add_library(llama
             ../include/llama.h
             ${LLAMA_CORE_SOURCES}
+            ${LLAMA_SLIMARC_SOURCES}
             unicode.h
             ${LLAMA_MODELS_SOURCES}
             )
