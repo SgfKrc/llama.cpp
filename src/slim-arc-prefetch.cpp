@@ -128,43 +128,37 @@ void append_unique_nonnegative(std::vector<int> & ids, int id) {
     }
 }
 
-int parse_popularity_k(const char * raw) noexcept {
-    if (raw == nullptr) return 0;
-    const std::string_view value{raw};
-    if (value.empty()) return 0;
-    int parsed{0};
-    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 0 || parsed > 64) {
-        std::fprintf(stderr, "SLIM-ARC: invalid SLIM_ARC_EXPERT_POP; expected an integer in [0,64]\n");
-        return 0;
-    }
-    return parsed;
+// [QLH] The SLIM_ARC_* switches, parsed in one place.
+//
+// Six call sites used to spell out the same steps (getenv, from_chars with a full-string check, a
+// range check, an fprintf, a default), and two of them had already drifted in what they did with an
+// empty value. Both helpers keep the behaviour every site had: an unset variable is silent and
+// returns the default, a malformed one is reported on stderr and returns the default.
+//
+// env_bool only treats "1" as true. The switches have always been exact-match, so "true" / "yes"
+// stay off; that is deliberate, not an oversight to be fixed by making this smarter.
+//
+// An empty value is malformed and reports one stderr line, like every other malformed value here.
+// That is a visible difference for exactly one switch: SLIM_ARC_EXPERT_POP used to return 0
+// silently and now logs before returning 0. The value is unchanged; the extra line is this
+// consolidation showing through, not a new fault.
+bool env_bool(const char * name, bool def) noexcept {
+    const char * const raw = std::getenv(name);
+    if (raw == nullptr) return def;
+    return std::strcmp(raw, "1") == 0;
 }
 
-size_t parse_expert_hot_budget_bytes(const char * raw) noexcept {
-    if (raw == nullptr) return 0;
+int64_t env_int(const char * name, int64_t def, int64_t lo, int64_t hi) noexcept {
+    const char * const raw = std::getenv(name);
+    if (raw == nullptr) return def;
     const std::string_view value{raw};
-    uint64_t parsed{0};
+    int64_t parsed{0};
     const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
     if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
-        parsed == 0 || parsed > 1024) {
-        std::fprintf(stderr, "SLIM-ARC: invalid SLIM_ARC_EXPERT_HOT_MB; expected an integer in [1,1024]\n");
-        return 0;
-    }
-    return static_cast<size_t>(parsed) * (1ULL << 20);
-}
-
-uint32_t parse_expert_hot_admission_threshold(const char * raw) noexcept {
-    if (raw == nullptr) return 1;
-    const std::string_view value{raw};
-    uint32_t parsed{0};
-    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
-        parsed < 1 || parsed > 64) {
-        std::fprintf(
-            stderr,
-            "SLIM-ARC: invalid SLIM_ARC_EXPERT_HOT_ADMIT_HITS; expected an integer in [1,64]\n");
-        return 1;
+        parsed < lo || parsed > hi) {
+        std::fprintf(stderr, "SLIM-ARC: invalid %s; expected an integer in [%lld,%lld]\n", name,
+                     static_cast<long long>(lo), static_cast<long long>(hi));
+        return def;
     }
     return parsed;
 }
@@ -303,15 +297,12 @@ size_t available_physical_bytes() noexcept {
 //     bounds the traffic.
 // SLIM_ARC_BUDGET_MB overrides all of it for experiments.
 size_t default_prefetch_budget_bytes() noexcept {
-    if (const char * raw = std::getenv("SLIM_ARC_BUDGET_MB")) {
-        const std::string_view value{raw};
-        uint64_t parsed{0};
-        const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-        if (!value.empty() && result.ec == std::errc{} &&
-            result.ptr == value.data() + value.size() && parsed <= 65536) {
-            return static_cast<size_t>(parsed) * (1ULL << 20);
-        }
-        std::fprintf(stderr, "SLIM-ARC: invalid SLIM_ARC_BUDGET_MB; expected an integer in [0,65536]\n");
+    // -1 is "not set, or not usable": an unset variable is silent, a malformed one is reported by
+    // env_int(), and both fall through to the derived budget. 0 is a valid value (it disables the
+    // read-ahead) and is not confused with the sentinel.
+    const int64_t mb = env_int("SLIM_ARC_BUDGET_MB", -1, 0, 65536);
+    if (mb >= 0) {
+        return static_cast<size_t>(mb) * (1ULL << 20);
     }
     const size_t available = available_physical_bytes();
     if (available == 0) {
@@ -323,31 +314,17 @@ size_t default_prefetch_budget_bytes() noexcept {
     return std::min(std::max(share, budget_min), budget_max);
 }
 
-bool env_exact_one(const char * name) noexcept {
-    const char * const value = std::getenv(name);
-    return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
 int parse_cross_layer_transition_topk() noexcept {
-    if (!env_exact_one("SLIM_ARC_CROSS_LAYER_TRANSITION")) return 0;
-    const char * const raw = std::getenv("SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK");
-    if (raw == nullptr) {
+    if (!env_bool("SLIM_ARC_CROSS_LAYER_TRANSITION", false)) return 0;
+    // Two variables, so the "required" check has to stay separate: env_int() answers the default
+    // for an unset variable, which would hide the one case this switch is supposed to report.
+    if (std::getenv("SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK") == nullptr) {
         std::fprintf(
             stderr,
             "SLIM-ARC: SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK is required when transition is enabled\n");
         return 0;
     }
-    const std::string_view value{raw};
-    int parsed{0};
-    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
-        parsed < 1 || parsed > 64) {
-        std::fprintf(
-            stderr,
-            "SLIM-ARC: invalid SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK; expected an integer in [1,64]\n");
-        return 0;
-    }
-    return parsed;
+    return static_cast<int>(env_int("SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK", 0, 1, 64));
 }
 
 void update_atomic_peak(std::atomic<uint64_t> & peak, uint64_t candidate) noexcept {
@@ -565,20 +542,21 @@ prefetch_scheduler::prefetch_scheduler(
     advice_fn advice,
     page_size_query_fn page_size_query,
     file_advice_fn file_advice)
-    : slow_storage_enabled_(env_exact_one("SLIM_ARC_SLOW_STORAGE"))
-    , router_prefetch_enabled_(env_exact_one("SLIM_ARC_ROUTER_PREFETCH"))
-    , router_mlock_enabled_(env_exact_one("SLIM_ARC_ROUTER_MLOCK"))
-    , shared_mlock_enabled_(env_exact_one("SLIM_ARC_SHARED_MLOCK"))
-    , small_mlock_enabled_(env_exact_one("SLIM_ARC_SMALL_MLOCK"))
-    , expert_hot_budget_bytes_(parse_expert_hot_budget_bytes(std::getenv("SLIM_ARC_EXPERT_HOT_MB")))
-    , expert_hot_lru_enabled_(env_exact_one("SLIM_ARC_EXPERT_HOT_LRU"))
-    , expert_hot_lfru_enabled_(expert_hot_lru_enabled_ && env_exact_one("SLIM_ARC_EXPERT_HOT_LFRU"))
+    : slow_storage_enabled_(env_bool("SLIM_ARC_SLOW_STORAGE", false))
+    , router_prefetch_enabled_(env_bool("SLIM_ARC_ROUTER_PREFETCH", false))
+    , router_mlock_enabled_(env_bool("SLIM_ARC_ROUTER_MLOCK", false))
+    , shared_mlock_enabled_(env_bool("SLIM_ARC_SHARED_MLOCK", false))
+    , small_mlock_enabled_(env_bool("SLIM_ARC_SMALL_MLOCK", false))
+    , expert_hot_budget_bytes_(
+          static_cast<size_t>(env_int("SLIM_ARC_EXPERT_HOT_MB", 0, 1, 1024)) << 20)
+    , expert_hot_lru_enabled_(env_bool("SLIM_ARC_EXPERT_HOT_LRU", false))
+    , expert_hot_lfru_enabled_(expert_hot_lru_enabled_ && env_bool("SLIM_ARC_EXPERT_HOT_LFRU", false))
     , expert_hot_admission_threshold_(
-          parse_expert_hot_admission_threshold(std::getenv("SLIM_ARC_EXPERT_HOT_ADMIT_HITS")))
-    , expert_prefetch_disabled_(env_exact_one("SLIM_ARC_NO_EXPERT_PREFETCH"))
-    , expert_file_advice_enabled_(env_exact_one("SLIM_ARC_EXPERT_FADVISE"))
-    , expert_random_madv_enabled_(env_exact_one("SLIM_ARC_EXPERT_MADV_RANDOM"))
-    , expert_normal_madv_enabled_(env_exact_one("SLIM_ARC_EXPERT_MADV_NORMAL"))
+          static_cast<uint32_t>(env_int("SLIM_ARC_EXPERT_HOT_ADMIT_HITS", 1, 1, 64)))
+    , expert_prefetch_disabled_(env_bool("SLIM_ARC_NO_EXPERT_PREFETCH", false))
+    , expert_file_advice_enabled_(env_bool("SLIM_ARC_EXPERT_FADVISE", false))
+    , expert_random_madv_enabled_(env_bool("SLIM_ARC_EXPERT_MADV_RANDOM", false))
+    , expert_normal_madv_enabled_(env_bool("SLIM_ARC_EXPERT_MADV_NORMAL", false))
     , cross_layer_transition_topk_(parse_cross_layer_transition_topk())
     , cross_layer_transition_enabled_(cross_layer_transition_topk_ > 0)
     , n_threads_(slow_storage_enabled_ ? 1 : std::max(1, n_threads))
@@ -587,17 +565,10 @@ prefetch_scheduler::prefetch_scheduler(
     , advice_(advice ? std::move(advice) : advice_fn{system_advice})
     , page_size_query_(page_size_query ? std::move(page_size_query) : page_size_query_fn{system_page_size})
     , file_advice_(file_advice ? std::move(file_advice) : file_advice_fn{system_file_advice})
-    , reclaim_waste_enabled_([] {
-        const char * const value = std::getenv("SLIM_ARC_EXPERT_RECLAIM_WASTE");
-        return value != nullptr && std::strcmp(value, "1") == 0;
-    }())
-    , expert_residency_enabled_([] {
-        const char * const value = std::getenv("SLIM_ARC_EXPERT_RESIDENCY");
-        return value != nullptr && std::strcmp(value, "1") == 0;
-    }()) {
-    const char * confidence = std::getenv("SLIM_ARC_EXPERT_CONF");
-    conf_gating_ = confidence != nullptr && std::strcmp(confidence, "1") == 0;
-    pop_k_ = parse_popularity_k(std::getenv("SLIM_ARC_EXPERT_POP"));
+    , reclaim_waste_enabled_(env_bool("SLIM_ARC_EXPERT_RECLAIM_WASTE", false))
+    , expert_residency_enabled_(env_bool("SLIM_ARC_EXPERT_RESIDENCY", false)) {
+    conf_gating_ = env_bool("SLIM_ARC_EXPERT_CONF", false);
+    pop_k_ = static_cast<int>(env_int("SLIM_ARC_EXPERT_POP", 0, 0, 64));
     // [QLH] See default_prefetch_budget_bytes(): the budget used to stay 0 because the module
     // that called set_memory_budget() (unified_io_scheduler) was never ported.
     memory_budget_.store(default_prefetch_budget_bytes());

@@ -1107,9 +1107,9 @@ enum llama_pooling_type llama_context::pooling_type() const {
 
 float * llama_context::get_logits() {
     // [QLH-SPLIT] llama.h defines this as get_logits_ith(-1), and in split mode the logits live
-    // in another context (or in split_remote_logits), so the plain buffer here is not the answer.
+    // in another context (or in split_answer.logits), so the plain buffer here is not the answer.
     // Forward for the same reason get_logits_ith() does.
-    if (!split_stages.empty() || !split_remotes.empty()) {
+    if (split_active()) {
         return get_logits_ith(-1);
     }
 
@@ -1150,7 +1150,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 float * llama_context::get_logits_ith(int32_t i) {
     // [QLH-SPLIT] The chain's logits live in the last stage. Forwarding instead of copying
     // keeps the buffer owned by the context that actually produced it.
-    if (!split_remotes.empty()) {
+    if (split_has_remote()) {
         // A remote tail returns exactly one row of logits: the last token of the batch it was
         // handed (tools/split-stage/main.cpp, OP_DECODE). The caller indexes logits by batch
         // position, and llama-server samples from the last prompt token -- so remember which
@@ -1161,13 +1161,13 @@ float * llama_context::get_logits_ith(int32_t i) {
         // [QLH-SPLIT] v7: a per-row verify frame transfers no logits at all, so every index --
         // including the last one -- answers null here. The rows of such a frame are read through
         // llama_split_verified_token() instead; the sampler picks the path (common_sampler_sample).
-        if (split_remote_logits.empty() || split_remote_n_vocab == 0) {
+        if (split_answer.logits.empty() || split_answer.n_vocab == 0) {
             return nullptr;
         }
-        if (i >= 0 && i != split_remote_logits_row) {
+        if (i >= 0 && i != split_answer.logits_row) {
             return nullptr;
         }
-        return split_remote_logits.data();
+        return split_answer.logits.data();
     }
     if (!split_stages.empty()) {
         return split_stages.back()->get_logits_ith(i);
@@ -1456,7 +1456,7 @@ void llama_context::set_embeddings(bool value) {
     // embedding buffer. Only the last stage of a chain is allowed to turn it off, and a
     // remote chain needs the same protection as a local one: the head is what fills the
     // carrier that gets sent over the wire.
-    if ((!split_stages.empty() || !split_remotes.empty()) && !value) {
+    if (split_active() && !value) {
         // [QLH-SPLIT] Not silent: the caller asked for something this context cannot do, and the
         // price of ignoring it (an embedding-sized output buffer for the whole batch) is worth one
         // line per process. call_once because llama-server toggles this from its slot loop, once
@@ -2254,7 +2254,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // Both kinds of stage mean "this context drives a chain": a remote-only chain has an empty
     // split_stages, and checking just that sent the whole request down the plain path with the
     // remote stages never contacted.
-    if (!split_stages.empty() || !split_remotes.empty()) {
+    if (split_active()) {
         return decode_split(batch_inp);
     }
     return decode_plain(batch_inp);
@@ -2273,6 +2273,84 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // first, not relaxing this check.
 static bool split_arch_exports_pre_norm(llm_arch arch) {
     return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+}
+
+// [QLH-SPLIT] The head half of the chain check: every property of the head that both attach paths
+// have to refuse on, in one place, plus the identity every stage is then checked against.
+//
+// It used to be two hand-copied blocks, and they had drifted: the local one never compared
+// n_vocab, so a stage loaded from a different vocabulary was accepted and answered token ids that
+// meant something else, while the remote one did compare it on the wire (identity_mismatch in
+// llama-split-remote.cpp). Both callers now go through this, and both check every stage against
+// the head_expect it returns.
+//
+// What a head can be checked for, and why each check is here rather than at the stage:
+//  - it must export pre-norm hidden (split_arch_exports_pre_norm) and must be *asked* for it:
+//    embeddings + embeddings_pre_norm are context-construction flags, read once, so a head built
+//    without them hands over an empty carrier and the first decode fails with -3 seconds after
+//    startup said the chain was attached. This is about the head itself and cannot be delegated to
+//    the wire: the identity handshake reports what a stage loaded, not which tensor its graph
+//    writes at the end.
+//  - it must be a proper prefix of the source model: start at layer 0, end before the last layer.
+//    A head loaded with --split-layer-range 8:20 plus a tail 20:24 tiles 8..24 -- contiguous, ends
+//    at the last layer, passes every other check -- and then decodes a model whose first 8 layers
+//    were never computed (it never even loaded the token embedding, because needs_tok_embd() is
+//    false for a range that does not start at 0). Measured: it started, answered 200 and produced
+//    garbage. A head that already covers the whole model is the same failure from the other end:
+//    it decodes every layer and hands pre-norm hidden to stages expecting a later layer's input.
+//  - one hop width: n_embd_out == n_embd_inp. The carrier and the wire both carry one number, and
+//    a model where they differ would memcpy the wrong float count and then be refused by the
+//    consumer -- or, worse, silently read past the row.
+//
+// n_ctx / n_seq_max / n_rs_seq are deliberately not here: stage_id (src/llama-split-proto.h) has
+// no such fields, so they cannot be compared across the wire without a protocol change.
+//
+// `expect` is an out-parameter: on both attach paths it can only be derived from the head, so
+// filling it and checking the head against it happen here together and the caller never builds an
+// identity it would only be echoing (see the declaration in llama-context.h for the full reason).
+std::string llama_context::split_check_head(const llama_context & head, head_expect & expect) {
+    const auto & hp = head.model.hparams;
+
+    if (!split_arch_exports_pre_norm(head.model.arch)) {
+        return std::string("this architecture (") + llm_arch_name(head.model.arch) +
+               ") has no pre-output-norm exit; a chain head must hand the next stage the raw "
+               "hidden state, and only qwen35 / qwen35moe build that output";
+    }
+
+    if (!head.cparams.embeddings || !head.cparams.embeddings_pre_norm) {
+        return "this head was created without embeddings + embeddings_pre_norm; a chain head must "
+               "export its pre-norm hidden (llama_context_params::embeddings and "
+               "embeddings_pre_norm are context-construction flags and cannot be set later)";
+    }
+
+    if (hp.layer_hi < 0 || hp.n_layer_src <= 0) {
+        return "this context loaded the whole model; a chain head must load the first layer range "
+               "of the source model (--split-layer-range 0:N)";
+    }
+
+    if (hp.layer_lo != 0) {
+        return "a chain head must start at layer 0, but this context covers [" +
+               std::to_string(hp.layer_lo) + ", " + std::to_string(hp.layer_hi) + ") of " +
+               std::to_string(hp.n_layer_src) + "; load it from the first layer "
+               "(--split-layer-range 0:" + std::to_string(hp.layer_hi) + ") and continue with the "
+               "stages that follow it";
+    }
+
+    if (hp.layer_hi >= hp.n_layer_src) {
+        return "the head covers layers [0, " + std::to_string(hp.layer_hi) + ") of " +
+               std::to_string(hp.n_layer_src) + "; there is nothing left for the stages to do";
+    }
+
+    if (hp.n_embd_out() != hp.n_embd_inp()) {
+        return "this head exports " + std::to_string(hp.n_embd_out()) + "-wide hidden but "
+               "consumes " + std::to_string(hp.n_embd_inp()) + "-wide input; a chain hop carries "
+               "one width";
+    }
+
+    expect.n_layer_src = hp.n_layer_src;
+    expect.n_vocab     = head.model.vocab.n_tokens();
+    expect.n_embd      = hp.n_embd_out();
+    return {};
 }
 
 // [QLH-SPLIT] Attach remote stages by endpoint. Returns the number attached, or -1 when the
@@ -2323,56 +2401,14 @@ int llama_context::split_attach_remote(const std::vector<std::string> & endpoint
     // to the v4 identity handshake: that reports what a stage loaded (range, width, depth), not
     // which tensor its graph writes at the end. Refusing here is what turns "wrong chain, no
     // error" into a startup failure for the whole class of models the fork cannot relay.
-    if (!split_arch_exports_pre_norm(model.arch)) {
-        err = std::string("this architecture (") + llm_arch_name(model.arch) +
-              ") has no pre-output-norm exit; a remote split chain needs one, because the head "
-              "must hand the next stage the raw hidden (src/models/qwen35.cpp)";
-        return -1;
-    }
-
-    // [QLH-SPLIT] And the architecture is only half of it: the graph has to be *asked* for that
-    // output, through the two llama_context_params fields that select it. split_attach() refuses
-    // a local chain whose contexts were built without them (they are read once, at construction,
-    // so this is a startup property); the remote head is checkable the same way and for the same
-    // reason -- without them the head hands over an empty carrier and the first decode fails
-    // with -3, several seconds after startup said the chain was attached.
-    if (!cparams.embeddings || !cparams.embeddings_pre_norm) {
-        err = "this head was created without embeddings + embeddings_pre_norm; a remote chain "
-              "head must export its pre-norm hidden (llama_context_params::embeddings and "
-              "embeddings_pre_norm are context-construction flags and cannot be set later)";
-        return -1;
-    }
-
-    // The head must be a proper prefix of the source model, for the same reason split_attach()
-    // checks it for local stages: nothing on the other side of a socket can be verified, so the
-    // only part of the chain that can be checked is the one that runs here. A head that already
-    // covers the whole model would decode every layer and then hand pre-norm hidden to stages
-    // that expect layer 8's input -- wrong logits with no error anywhere.
-    const auto & hp = model.hparams;
-    if (hp.layer_hi < 0 || hp.n_layer_src <= 0) {
-        err = "this context loaded the whole model; a remote chain head must load the first "
-              "layer range of the source model (--split-layer-range 0:N)";
-        return -1;
-    }
-    if (hp.layer_lo != 0) {
-        err = "a remote chain head must start at layer 0 (it covers [" +
-              std::to_string(hp.layer_lo) + ", " + std::to_string(hp.layer_hi) + "))";
-        return -1;
-    }
-    if (hp.layer_hi >= hp.n_layer_src) {
-        err = "the head already covers layers [0, " + std::to_string(hp.layer_hi) + ") of " +
-              std::to_string(hp.n_layer_src) + "; there is nothing left for the remote stages";
-        return -1;
-    }
-
-    // [QLH-SPLIT] The hop width, same check as split_attach: the head exports n_embd_out and the
-    // stage on the other end consumes n_embd_inp, but the wire carries one width (the reply's
-    // n_embd and the next OP_DECODE request's n_embd must match a single number). Only the head
-    // can be checked from here; split-stage refuses to start when its own three widths disagree,
-    // which is the other half.
-    if (hp.n_embd_out() != hp.n_embd_inp()) {
-        err = "this head exports " + std::to_string(hp.n_embd_out()) + "-wide hidden but consumes " +
-              std::to_string(hp.n_embd_inp()) + "-wide input; a chain hop carries one width";
+    // [QLH-SPLIT] The head half of the check, shared with split_attach(): pre-norm exit, the
+    // context flags that select it, a proper prefix of the source model, one hop width. What the
+    // stages are checked against comes out of it as `expect` -- the head's own n_layer_src, its
+    // vocabulary and the single hop width. See split_check_head() for why each check is here and
+    // not on the wire.
+    head_expect expect;
+    err = split_check_head(*this, expect);
+    if (!err.empty()) {
         return -1;
     }
 
@@ -2396,10 +2432,10 @@ int llama_context::split_attach_remote(const std::vector<std::string> & endpoint
     // -- it is whatever the next stage starts at. So it is pinned to ID_ANY_I32 and the next
     // iteration pins the next stage's layer_lo to the layer_hi that stage just reported. The
     // result is the same tiling check split_attach() performs for local stages, over the wire.
-    const int32_t  n_layer_src = hp.n_layer_src;
-    const uint32_t n_embd_hop  = (uint32_t) hp.n_embd_out();
-    const uint32_t n_vocab     = (uint32_t) model.vocab.n_tokens();
-    int32_t        prev_hi     = hp.layer_hi;
+    const int32_t  n_layer_src = expect.n_layer_src;
+    const uint32_t n_embd_hop  = expect.n_embd;
+    const uint32_t n_vocab     = expect.n_vocab;
+    int32_t        prev_hi     = model.hparams.layer_hi;
 
     for (size_t i = 0; i < endpoints.size(); ++i) {
         auto r = std::make_unique<llama_split_remote>();
@@ -2464,7 +2500,7 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
     // Without this, attaching local stages after remote ones leaves both containers populated,
     // decode_split takes the remote branch, and split_memory hands llama_get_memory() a KV chain
     // that this decode never writes.
-    if (n > 0 && !split_remotes.empty()) {
+    if (n > 0 && split_has_remote()) {
         LLAMA_LOG_ERROR("%s: cannot mix remote and local stages in one chain\n", __func__);
         return -1;
     }
@@ -2502,56 +2538,14 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
     if (n > 0) {
         const auto & hp = model.hparams;
 
-        // The head always exports pre-norm hidden, so it must be an architecture with that exit.
-        // Checked before the range checks because it is the more fundamental blocker: a non-
-        // qwen35 model cannot head a chain whatever range it was loaded with, while a whole-model
-        // qwen35 head only needs --split-layer-range. See split_arch_exports_pre_norm() for why
-        // silently using the post-norm tensor is worse than refusing to start.
-        if (!split_arch_exports_pre_norm(model.arch)) {
-            LLAMA_LOG_ERROR("%s: this architecture (%s) has no pre-output-norm exit; a split "
-                    "chain head must hand the next stage the raw hidden state, and only qwen35 / "
-                    "qwen35moe build that output\n",
-                    __func__, llm_arch_name(model.arch));
-            return -1;
-        }
-
-        // A whole-model load has no source range: there is no boundary for the first stage to
-        // continue from, and treating it as "the head covers everything" would accept a chain
-        // that replays layers already computed here.
-        if (hp.layer_hi < 0 || hp.n_layer_src <= 0) {
-            LLAMA_LOG_ERROR("%s: this context loaded the whole model; a chain head must load "
-                    "the first layer range of the source model\n", __func__);
-            return -1;
-        }
-
-        // [QLH-SPLIT] The head is the only stage with nothing before it, so its range has to
-        // begin at the source model's layer 0. split_attach_remote() has always refused this for
-        // a remote head; without the same check here, a local head loaded with
-        // --split-layer-range 8:20 plus a --split-tail-range 20:24 tiles 8..24: contiguous, ends
-        // at the last layer, passes every other check -- and then decodes a model whose first 8
-        // layers were never computed (it never even loaded the token embedding, because
-        // needs_tok_embd() is false for a range that does not start at 0). Measured: it started,
-        // answered 200 and produced garbage. Nothing on this side of the attach could see that,
-        // which is the same reason the two range checks above exist.
-        //
-        // Placed next to them on purpose: together they define "the head is a prefix of the
-        // source model" -- starts at 0, ends before the last layer -- and the stage loop below
-        // only has to prove that the rest tiles from there to n_layer_src.
-        if (hp.layer_lo != 0) {
-            LLAMA_LOG_ERROR("%s: a local chain head must start at layer 0, but this context "
-                    "covers [%d, %d) of %d; layers 0..%d would never be computed, and the head "
-                    "would decode from hidden states that were never produced. Load it from the "
-                    "first layer (--split-layer-range 0:%d) and continue with the stages that "
-                    "follow it, or put a [0, %d) stage in front and make this range a relay\n",
-                    __func__, hp.layer_lo, hp.layer_hi, hp.n_layer_src, hp.layer_lo - 1,
-                    hp.layer_hi, hp.layer_lo);
-            return -1;
-        }
-
-        if (hp.layer_hi >= hp.n_layer_src) {
-            LLAMA_LOG_ERROR("%s: head covers layers [%d, %d) of %d, so there is nothing left to "
-                    "attach; the head cannot already be the tail\n",
-                    __func__, hp.layer_lo, hp.layer_hi, hp.n_layer_src);
+        // [QLH-SPLIT] The head half of the check, shared with split_attach_remote(): pre-norm
+        // exit, the context flags that select it, a proper prefix of the source model, one hop
+        // width. The identity the stages are then checked against -- n_layer_src, n_vocab, the hop
+        // width -- comes out of it as `expect`, so the two paths cannot drift again.
+        head_expect expect;
+        const std::string head_why = split_check_head(*this, expect);
+        if (!head_why.empty()) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, head_why.c_str());
             return -1;
         }
 
@@ -2571,9 +2565,22 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
                         __func__, i + 1);
                 return -1;
             }
-            if (shp.n_layer_src != hp.n_layer_src) {
+            if (shp.n_layer_src != expect.n_layer_src) {
                 LLAMA_LOG_ERROR("%s: stage %d comes from a source model with %d layers, the "
-                        "head from one with %d\n", __func__, i + 1, shp.n_layer_src, hp.n_layer_src);
+                        "head from one with %d\n", __func__, i + 1, shp.n_layer_src,
+                        expect.n_layer_src);
+                return -1;
+            }
+            // [QLH-SPLIT] The vocabulary is part of a stage's identity for the same reason the
+            // depth is: every stage loads the same file, so a different token count means a
+            // different file. A chain that mixed them would answer token ids that mean something
+            // else -- and the last stage is exactly the one that produces them. The remote path
+            // has always compared this over the wire (identity_mismatch); this is the local half
+            // of the same check, which was missing.
+            if (stages[i]->model.vocab.n_tokens() != expect.n_vocab) {
+                LLAMA_LOG_ERROR("%s: stage %d has a %u-token vocabulary, the head one of %u; every "
+                        "stage must load the same model file\n", __func__, i + 1,
+                        stages[i]->model.vocab.n_tokens(), expect.n_vocab);
                 return -1;
             }
             if (shp.layer_lo != prev_hi) {
@@ -2593,9 +2600,9 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
             }
             prev_hi = shp.layer_hi;
         }
-        if (prev_hi != hp.n_layer_src) {
+        if (prev_hi != expect.n_layer_src) {
             LLAMA_LOG_ERROR("%s: the chain ends at layer %d but the source model has %d layers; "
-                    "a tail stage is missing or too short\n", __func__, prev_hi, hp.n_layer_src);
+                    "a tail stage is missing or too short\n", __func__, prev_hi, expect.n_layer_src);
             return -1;
         }
 
@@ -2603,19 +2610,14 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
         // names it with three accessors: the exporter writes n_embd_out (output_reserve sizes
         // t_embd that way), the consumer validates the batch row against n_embd_inp
         // (llama_batch_ext::set_token_embd), and the carrier buffer is a single width for every
-        // hop between them. They happen to be equal for both qwen35 models this fork is used
-        // with, but a model where they differ would copy the wrong number of floats (gather()
-        // memcpy) and then be refused by the consumer -- or, worse, silently read past the row.
-        // Refuse the chain at attach time instead of building on that coincidence.
+        // hop between them. The head's own width is checked by split_check_head() above; the
+        // stages are checked here, and they happen to be equal for both qwen35 models this fork is
+        // used with -- but a model where they differ would copy the wrong number of floats
+        // (gather() memcpy) and then be refused by the consumer, or, worse, silently read past the
+        // row. Refuse the chain at attach time instead of building on that coincidence.
         const auto widths_ok = [](const llama_context * c) {
             return c->model.hparams.n_embd_out() == c->model.hparams.n_embd_inp();
         };
-        if (!widths_ok(this)) {
-            LLAMA_LOG_ERROR("%s: this head exports %u-wide hidden but consumes %u-wide input; a "
-                    "chain hop carries one width, so a chain cannot be built from it\n", __func__,
-                    this->model.hparams.n_embd_out(), this->model.hparams.n_embd_inp());
-            return -1;
-        }
         for (int32_t i = 0; i < n; ++i) {
             if (!widths_ok(stages[i])) {
                 LLAMA_LOG_ERROR("%s: stage %d exports %u-wide hidden but consumes %u-wide input; "
@@ -2641,6 +2643,8 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
         // It used to be a WARN, which made this the worst kind of check: the chain started, the
         // first decode could not read the hidden and returned -3, and the only explanation was a
         // line from startup saying the flags were missing. Refuse, like the architecture check.
+        // The head's own flags are already checked by split_check_head(); this loop covers the
+        // relay stages.
         const auto relays = [](const llama_context * c) {
             if (c->cparams.embeddings && c->cparams.embeddings_pre_norm) {
                 return true;
@@ -2651,9 +2655,6 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
                     (int) c->cparams.embeddings, (int) c->cparams.embeddings_pre_norm);
             return false;
         };
-        if (!relays(this)) {
-            return -1;
-        }
         for (int32_t i = 0; i + 1 < n; ++i) { // the last stage owes logits, not hidden
             if (!relays(stages[i])) {
                 LLAMA_LOG_ERROR("%s: stage %d is a relay (it feeds stage %d)\n", __func__, i + 1, i + 2);
@@ -3027,7 +3028,7 @@ int llama_context::split_admit_batch(const llama_batch_ext & batch_inp) {
     // and both the head and the stages run the ordinary multi-sequence paths.
     //
     // The remote branch is the exception; see split_batch_mixes_seqs().
-    if (!split_remotes.empty() && split_batch_mixes_seqs(batch_inp)) {
+    if (split_has_remote() && split_batch_mixes_seqs(batch_inp)) {
         LLAMA_LOG_ERROR("%s: a remote chain carries one sequence per batch (the stage protocol "
                 "has one seq_id per OP_DECODE), and this batch mixes %d tokens of several "
                 "sequences; the remote head is built with n_seq_max > 1\n",
@@ -3085,38 +3086,39 @@ static std::vector<int32_t> split_remote_positions(const llama_batch_ext & batch
     return positions;
 }
 
-// [QLH-SPLIT] The five split_remote_* answer slots are written only through these three
-// functions, and both stores start by resetting: "clear before fill" is therefore a property of
-// writing at all, not a step the caller has to remember. split_remote_reset() on its own is the
-// frame-start clear -- the one that must happen before anything can fail, so a chain that ends up
-// returning hidden (or a stage that errors out) answers null from get_logits_ith() instead of
-// silently handing back logits from an earlier request.
-void llama_context::split_remote_reset() {
-    split_remote_logits.clear();
-    split_remote_n_vocab    = 0;
-    split_remote_logits_row = -1;
-    split_remote_cands.clear();
-    split_remote_cands_row  = -1;
-    split_remote_verify.clear();
-    split_remote_nextn.clear();
-    split_remote_nextn_embd = 0;
-    split_remote_nextn_row0 = -1;
-    split_remote_tap.clear();
-    split_remote_tap_embd = 0;
-    split_remote_tap_rows = 0;
+// [QLH-SPLIT] The frame's answer: one clear, then any number of stores. See split_frame_answer in
+// llama-context.h for the contract, including where the old store-order dependency went.
+//
+// begin_frame() is the frame-start clear -- the one that must happen before anything can fail, so
+// a chain that ends up returning hidden (or a stage that errors out) answers null from
+// get_logits_ith() instead of silently handing back logits from an earlier request. It is also the
+// only place that clears: the stores below write their own slot and leave the others alone, which
+// is why the h_nextn rows and the tap blocks can now be stored in any order relative to the
+// logits/candidates stores.
+void llama_context::split_frame_answer::begin_frame() {
+    logits.clear();
+    n_vocab    = 0;
+    logits_row = -1;
+    cands.clear();
+    cands_row  = -1;
+    verify.clear();
+    nextn.clear();
+    nextn_embd = 0;
+    nextn_row0 = -1;
+    tap.clear();
+    tap_embd   = 0;
+    tap_rows   = 0;
 }
 
-void llama_context::split_remote_store_cands(std::vector<qlh_split::token_cand> && cands, int32_t row) {
-    split_remote_reset();
-    split_remote_cands     = std::move(cands);
-    split_remote_cands_row = row;
+void llama_context::split_frame_answer::store_cands(std::vector<qlh_split::token_cand> && c, int32_t row) {
+    cands     = std::move(c);
+    cands_row = row;
 }
 
-void llama_context::split_remote_store_logits(std::vector<float> && logits, uint32_t n_vocab, int32_t row) {
-    split_remote_reset();
-    split_remote_logits     = std::move(logits);
-    split_remote_n_vocab    = n_vocab;
-    split_remote_logits_row = row;
+void llama_context::split_frame_answer::store_logits(std::vector<float> && l, uint32_t vocab, int32_t row) {
+    logits     = std::move(l);
+    n_vocab    = vocab;
+    logits_row = row;
 }
 
 // A middle remote stage must answer with hidden; a tail in the middle of the chain answers with
@@ -3167,7 +3169,7 @@ static void split_note_diverged(llama_memory_split * mem, size_t stage_no, int r
 // adopt the last stage's answer.
 int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
                                       int32_t n_tok, int32_t n_embd) {
-    split_remote_reset();
+    split_answer.begin_frame();
 
     const uint32_t             n_pos     = model.hparams.n_pos_per_embd();
     const std::vector<int32_t> positions = split_remote_positions(batch_inp, n_tok, n_pos);
@@ -3201,8 +3203,9 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
     tap_req.n_embd = (uint32_t) model.hparams.n_embd;
     llama_split_tap_out out_tap;
 
-    // [QLH-SPLIT] v9: the taps accumulate across stages here and are stored last, for the same reason
-    // the h_nextn rows are (see store_nextn below): the answer stores reset every per-frame slot.
+    // [QLH-SPLIT] v9: the taps accumulate across stages here and are stored last, in the order the
+    // answer arrives (the stores no longer clear each other, so that order is no longer a rule --
+    // see split_frame_answer).
     std::vector<split_tap_block> tap_blocks;
     uint32_t                     tap_embd = 0;
     uint32_t                     tap_rows = 0;
@@ -3211,12 +3214,10 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
     // by construction), and only when the driving side asked for this frame. Taken and
     // cleared here -- before any of the failure exits below -- so a failed frame cannot leave
     // the next one asking for something the sampler did not plan for.
-    const bool want_cands  = split_cand_wanted;
-    const bool want_verify = split_verify_wanted;
-    const bool want_nextn  = split_nextn_wanted;
-    split_cand_wanted   = false;
-    split_verify_wanted = false;
-    split_nextn_wanted  = false;
+    const bool want_cands  = (split_answer.armed & split_frame_answer::ARMED_CANDS)  != 0;
+    const bool want_verify = (split_answer.armed & split_frame_answer::ARMED_VERIFY) != 0;
+    const bool want_nextn  = (split_answer.armed & split_frame_answer::ARMED_NEXTN)  != 0;
+    split_answer.armed = 0;
 
     // [QLH-SPLIT] v7: a verify frame has to fit in the tail's output-row cap, and MAX_VERIFY_ROWS
     // is the number both ends agree on (llama-split-proto.h). A frame over it falls back to the
@@ -3226,8 +3227,9 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
     // count comes from the batch, before anything is sent, so the fallback is never discovered
     // after the tail already answered.
     bool verify_rows = want_verify && n_tok <= (int32_t) qlh_split::MAX_VERIFY_ROWS;
-    if (want_verify && !verify_rows && !split_verify_row_warned) {
-        split_verify_row_warned = true;
+    if (want_verify && !verify_rows &&
+            (split_answer.warned & split_frame_answer::WARNED_VERIFY_ROWS) == 0) {
+        split_answer.warned |= split_frame_answer::WARNED_VERIFY_ROWS;
         LLAMA_LOG_WARN("%s: a verify frame with %d rows does not fit MAX_VERIFY_ROWS (%u); this "
                 "decode takes the whole-row path (the draft block is capped to %u rows by the "
                 "server, so this means the batch was assembled elsewhere)\n",
@@ -3281,10 +3283,11 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
 
     // [QLH-SPLIT] v8: the h_nextn rows, when they were asked for and the stage answered them.
     //
-    // Stored *after* the answer slots below, not before: those stores start by resetting every
-    // per-frame slot (that is what makes "clear before fill" a property of writing at all), and
-    // they reset this one too. Doing the rows first silently dropped them -- measured: the stage
-    // answered 2048 floats and the draft was told there were none.
+    // The order these are stored in no longer matters: the answer stores used to start by
+    // resetting every per-frame slot, so storing the rows first silently dropped them -- measured:
+    // the stage answered 2048 floats and the draft was told there were none. Now only
+    // begin_frame() clears (called once at the top of this function), and store_*() write their
+    // own slot; see split_frame_answer in llama-context.h.
     //
     // A stage that has no NextN block leaves them empty, and that is not an error: the draft
     // driver reads "no rows" as "do not draft", while the frame's own answer still stands.
@@ -3293,29 +3296,29 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
             return;
         }
         if (!out_nextn.empty() && out_nextn_embd == (uint32_t) n_embd) {
-            split_remote_nextn      = std::move(out_nextn);
-            split_remote_nextn_embd = out_nextn_embd;
+            split_answer.nextn      = std::move(out_nextn);
+            split_answer.nextn_embd = out_nextn_embd;
             // A verify frame answers every row of the frame, a plain decode only its last row.
-            const uint32_t n_rows = (uint32_t) (split_remote_nextn.size() / out_nextn_embd);
-            split_remote_nextn_row0 = (int32_t) (n_tok - (int32_t) n_rows);
-        } else if (!split_nextn_warned && out_nextn_embd == 0 && split_mtp_ready()) {
+            const uint32_t n_rows = (uint32_t) (split_answer.nextn.size() / out_nextn_embd);
+            split_answer.nextn_row0 = (int32_t) (n_tok - (int32_t) n_rows);
+        } else if ((split_answer.warned & split_frame_answer::WARNED_NEXTN) == 0 &&
+                   out_nextn_embd == 0 && split_mtp_ready()) {
             // Only worth one line per process: a chain whose tail cannot answer them would log
             // this for every frame, and a log line per token is not a diagnosis.
-            split_nextn_warned = true;
+            split_answer.warned |= split_frame_answer::WARNED_NEXTN;
             LLAMA_LOG_WARN("%s: the remote tail answered no h_nextn rows; MTP drafting is "
                            "unavailable on this chain (the stage reported a draft context but "
                            "sends no rows)\n", __func__);
         }
     };
 
-    // [QLH-SPLIT] v9: the layer-input taps the stages answered. Stored after the answer slots for the
-    // same reason as the h_nextn rows above (the two stores below reset every per-frame slot), and
-    // empty when the stages owned none of the asked layers -- which only the draft driver can judge,
-    // so it is carried as an empty answer rather than as a failure of the frame.
+    // [QLH-SPLIT] v9: the layer-input taps the stages answered. Empty when the stages owned none of
+    // the asked layers -- which only the draft driver can judge, so it is carried as an empty
+    // answer rather than as a failure of the frame. Same order rule as the rows above: none.
     const auto store_tap = [&]() {
-        split_remote_tap      = std::move(tap_blocks);
-        split_remote_tap_embd = tap_embd;
-        split_remote_tap_rows = tap_rows;
+        split_answer.tap      = std::move(tap_blocks);
+        split_answer.tap_embd = tap_embd;
+        split_answer.tap_rows = tap_rows;
     };
 
     // The request was for this frame only; it was consumed at the top of this block.
@@ -3323,7 +3326,7 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
         // [QLH-SPLIT] v7: one token id per row. No row of logits crossed the wire, so
         // get_logits_ith() answers null here by construction -- the caller was told to read
         // tokens (llama_split_verified_token) and common_sampler_sample does exactly that.
-        split_remote_verify = std::move(out_verify);
+        split_answer.verify = std::move(out_verify);
         store_nextn();
         store_tap();
         return 0;
@@ -3331,13 +3334,13 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
     if (!out_cands.empty()) {
         // Candidate answer: there is no whole row, and get_logits_ith() must say so instead
         // of serving an empty buffer. The sampler plans around this (common_sampling.h).
-        split_remote_store_cands(std::move(out_cands), n_tok - 1);
+        split_answer.store_cands(std::move(out_cands), n_tok - 1);
         store_nextn();
         store_tap();
         return 0;
     }
     if (!out_logits.empty() && out_n_vocab > 0) {
-        split_remote_store_logits(std::move(out_logits), out_n_vocab, n_tok - 1);
+        split_answer.store_logits(std::move(out_logits), out_n_vocab, n_tok - 1);
         store_nextn();
         store_tap();
         return 0;
@@ -3419,7 +3422,7 @@ int llama_context::decode_split(const llama_batch_ext & batch_inp) {
         return -3;
     }
 
-    if (!split_remotes.empty()) {
+    if (split_has_remote()) {
         return split_drive_remote(batch_inp, carrier, n_tok, n_embd);
     }
     return split_drive_local(batch_inp, carrier, n_tok, n_embd);
@@ -5170,7 +5173,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
         // A remote chain cannot be measured by writing it to a dummy io: state_write() would
         // have to fetch every stage's snapshot just to count the bytes. The split memory asks
         // the stages for their sizes instead, and the local part is still measured by counting.
-        if (split_memory && !split_remotes.empty()) {
+        if (split_active() && split_has_remote()) {
             return io.n_bytes() + split_memory->state_size(seq_id, flags);
         }
 
@@ -6546,10 +6549,10 @@ bool llama_context_split_has_remote(const llama_context * ctx) {
 void llama_context::split_request_candidates(const qlh_split::cand_req * req,
                                              const llama_logit_bias * biases, uint32_t n_bias,
                                              const llama_token * hist, uint32_t n_hist) {
-    if (req == nullptr || split_remotes.empty()) {
+    if (req == nullptr || !split_has_remote()) {
         // Not an error: a local chain and a whole model both keep answering with the row, so a
         // caller that does not distinguish the chain kinds can call this unconditionally.
-        split_cand_wanted = false;
+        split_answer.armed &= ~split_frame_answer::ARMED_CANDS;
         return;
     }
 
@@ -6569,7 +6572,7 @@ void llama_context::split_request_candidates(const qlh_split::cand_req * req,
         split_cand_hist.assign(hist, hist + n_hist);
     }
 
-    split_cand_wanted = true;
+    split_answer.armed |= split_frame_answer::ARMED_CANDS;
 }
 
 uint32_t llama_context::split_take_candidates(const llama_split_token_cand ** cands, int32_t * row) const {
@@ -6579,7 +6582,7 @@ uint32_t llama_context::split_take_candidates(const llama_split_token_cand ** ca
     if (row != nullptr) {
         *row = -1;
     }
-    if (split_remote_cands.empty()) {
+    if (split_answer.cands.empty()) {
         return 0;
     }
     // The wire structure and the exported one are the same two fields in the same order; the
@@ -6592,12 +6595,12 @@ uint32_t llama_context::split_take_candidates(const llama_split_token_cand ** ca
                   "llama_split_token_cand must match the wire layout of qlh_split::token_cand");
 
     if (cands != nullptr) {
-        *cands = reinterpret_cast<const llama_split_token_cand *>(split_remote_cands.data());
+        *cands = reinterpret_cast<const llama_split_token_cand *>(split_answer.cands.data());
     }
     if (row != nullptr) {
-        *row = split_remote_cands_row;
+        *row = split_answer.cands_row;
     }
-    return (uint32_t) split_remote_cands.size();
+    return (uint32_t) split_answer.cands.size();
 }
 
 void llama_split_request_candidates(
@@ -6632,14 +6635,18 @@ uint32_t llama_split_take_candidates(
 void llama_context::split_request_verify_rows(bool on) {
     // Not an error for a local chain or a whole model: both keep answering with the row, and a
     // caller that does not distinguish the chain kinds must be able to call this unconditionally.
-    split_verify_wanted = on && !split_remotes.empty();
+    if (on && split_has_remote()) {
+        split_answer.armed |= split_frame_answer::ARMED_VERIFY;
+    } else {
+        split_answer.armed &= ~split_frame_answer::ARMED_VERIFY;
+    }
 }
 
 llama_token llama_context::split_verified_token(int32_t idx) const {
-    if (split_remote_verify.empty() || idx < 0 || (size_t) idx >= split_remote_verify.size()) {
+    if (split_answer.verify.empty() || idx < 0 || (size_t) idx >= split_answer.verify.size()) {
         return LLAMA_TOKEN_NULL;
     }
-    const int32_t id = split_remote_verify[(size_t) idx];
+    const int32_t id = split_answer.verify[(size_t) idx];
     // A negative id cannot be an argmax over a vocabulary, so it means the slot was never written
     // -- return it as "no answer" instead of letting the caller index a token table with -1.
     return id < 0 ? LLAMA_TOKEN_NULL : (llama_token) id;
@@ -6671,7 +6678,7 @@ llama_token llama_split_verified_token(const llama_context * ctx, int32_t idx) {
 //    the chain dead: a draft is an optimization, and the answer without it is what the same request
 //    would have produced without speculation at all.
 bool llama_context::split_mtp_ready() const {
-    if (split_remotes.empty()) {
+    if (!split_has_remote()) {
         return false;
     }
     // One seq per batch on a remote chain, so the draft always belongs to the last stage; there is
@@ -6682,7 +6689,11 @@ bool llama_context::split_mtp_ready() const {
 void llama_context::split_request_nextn_rows(bool on) {
     // A local chain reads h_nextn rows in this process and a whole model has no tail to ask; both
     // ignore this the way they ignore the two channels above.
-    split_nextn_wanted = on && !split_remotes.empty();
+    if (on && split_has_remote()) {
+        split_answer.armed |= split_frame_answer::ARMED_NEXTN;
+    } else {
+        split_answer.armed &= ~split_frame_answer::ARMED_NEXTN;
+    }
 }
 
 uint32_t llama_context::split_take_nextn(const float ** rows, int32_t * row0, uint32_t * n_embd) const {
@@ -6695,19 +6706,19 @@ uint32_t llama_context::split_take_nextn(const float ** rows, int32_t * row0, ui
     if (n_embd != nullptr) {
         *n_embd = 0;
     }
-    if (split_remote_nextn.empty() || split_remote_nextn_embd == 0) {
+    if (split_answer.nextn.empty() || split_answer.nextn_embd == 0) {
         return 0;
     }
     if (rows != nullptr) {
-        *rows = split_remote_nextn.data();
+        *rows = split_answer.nextn.data();
     }
     if (row0 != nullptr) {
-        *row0 = split_remote_nextn_row0;
+        *row0 = split_answer.nextn_row0;
     }
     if (n_embd != nullptr) {
-        *n_embd = split_remote_nextn_embd;
+        *n_embd = split_answer.nextn_embd;
     }
-    return (uint32_t) (split_remote_nextn.size() / split_remote_nextn_embd);
+    return (uint32_t) (split_answer.nextn.size() / split_answer.nextn_embd);
 }
 
 // [QLH-SPLIT] v9: the layer-input tap channel, driving side.
@@ -6718,8 +6729,8 @@ uint32_t llama_context::split_take_nextn(const float ** rows, int32_t * row0, ui
 // layers, which is what the head-side tap accessor in common/speculative.cpp is for.
 void llama_context::split_set_layer_inp(const uint32_t * ids, uint32_t n) {
     split_tap_ids.clear();
-    split_tap_warned = false;
-    if (split_remotes.empty() || ids == nullptr || n == 0) {
+    split_answer.warned &= ~split_frame_answer::WARNED_TAP;
+    if (!split_has_remote() || ids == nullptr || n == 0) {
         return;
     }
     if (n > qlh_split::MAX_LAYER_INP_TAPS) {
@@ -6747,18 +6758,18 @@ const float * llama_context::split_take_layer_inp(uint32_t i, uint32_t * id, uin
     if (n_embd != nullptr) {
         *n_embd = 0;
     }
-    if (i >= split_remote_tap.size() || split_remote_tap_embd == 0 || split_remote_tap_rows == 0) {
+    if (i >= split_answer.tap.size() || split_answer.tap_embd == 0 || split_answer.tap_rows == 0) {
         return nullptr;
     }
-    const split_tap_block & block = split_remote_tap[i];
+    const split_tap_block & block = split_answer.tap[i];
     if (id != nullptr) {
         *id = block.id;
     }
     if (n_rows != nullptr) {
-        *n_rows = split_remote_tap_rows;
+        *n_rows = split_answer.tap_rows;
     }
     if (n_embd != nullptr) {
-        *n_embd = split_remote_tap_embd;
+        *n_embd = split_answer.tap_embd;
     }
     return block.rows.data();
 }
@@ -6768,10 +6779,10 @@ int llama_context::split_mtp_draft(const float * h, int32_t token, int32_t pos, 
     if (n_out != nullptr) {
         *n_out = 0;
     }
-    if (split_remotes.empty() || h == nullptr || out == nullptr) {
+    if (!split_has_remote() || h == nullptr || out == nullptr) {
         return 0;
     }
-    const uint32_t n_embd = split_remote_nextn_embd != 0 ? split_remote_nextn_embd
+    const uint32_t n_embd = split_answer.nextn_embd != 0 ? split_answer.nextn_embd
                                                         : (uint32_t) model.hparams.n_embd_out();
     std::vector<float> row(h, h + n_embd);
     std::vector<int32_t> ids;

@@ -15,6 +15,7 @@
 
 #include <array>
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -372,7 +373,7 @@ public:
     // The taps the last remote decode answered: `n` blocks, each `n_rows` rows of `n_embd` floats and
     // the source-layer id it belongs to. Only the ids some remote stage owned are here, so a caller
     // must look its layers up by id rather than by position.
-    uint32_t split_take_layer_inp_n() const { return (uint32_t) split_remote_tap.size(); }
+    uint32_t split_take_layer_inp_n() const { return (uint32_t) split_answer.tap.size(); }
     const float * split_take_layer_inp(uint32_t i, uint32_t * id, uint32_t * n_rows, uint32_t * n_embd) const;
 
 private:
@@ -387,14 +388,114 @@ private:
     int  split_drive_local(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
                            int32_t n_tok, int32_t n_embd);
 
-    // [QLH-SPLIT] The split_remote_* answer slots are written only through these three, and both
-    // stores start by resetting them: "clear before fill" is a property of writing at all, not a
-    // step a caller has to remember. reset() on its own is the frame-start clear -- the one that
-    // must happen before anything can fail, so a failed frame answers null from get_logits_ith()
-    // instead of handing back the previous frame's logits.
-    void split_remote_reset();
-    void split_remote_store_cands(std::vector<qlh_split::token_cand> && cands, int32_t row);
-    void split_remote_store_logits(std::vector<float> && logits, uint32_t n_vocab, int32_t row);
+    // [QLH-SPLIT] Is this context driving a chain? Spelled out once, because three spellings of
+    // it (split_stages, split_remotes, split_memory) had grown apart, and the third one is the
+    // authoritative one: split_memory is what get_memory() answers with, so a context whose view
+    // is gone is a whole-model context however the two lists read.
+    //
+    // The two attach paths install the view last and detach drops it first, so outside a
+    // construction this is exactly "a stage is attached". Inside one they differ for a moment:
+    // split_attach() assigns split_stages before it builds the view, and split_attach_remote()
+    // grows split_remotes before it builds one. In those two windows split_active() answers false
+    // while the list-based spelling (!stages.empty() || !remotes.empty()) answers true. No reader
+    // runs there (neither path calls back into decode()/get_logits() while it is assembling a
+    // chain), so from outside the two spellings are equivalent -- but this is the one place where
+    // "the lists are non-empty" and "the view exists" are not the same statement. Use
+    // split_has_remote() for the narrower question.
+    bool split_active() const { return split_memory != nullptr; }
+
+    // [QLH-SPLIT] What the head fixes for every stage in a chain: the source depth, the
+    // vocabulary, and the one width a hop carries.
+    struct head_expect {
+        int32_t  n_layer_src = 0;
+        uint32_t n_vocab     = 0;
+        uint32_t n_embd      = 0;
+    };
+
+    // [QLH-SPLIT] The head half of the chain check, shared by split_attach() and
+    // split_attach_remote(): a pre-norm exit, the two context flags that select it, a proper
+    // prefix of the source model, one hop width. Fills `expect` on success and returns ""; on
+    // failure returns the reason (one line, no trailing newline) and leaves `expect` unusable.
+    // The two callers only differ in where that line goes (the log vs the `err` out-parameter).
+    //
+    // `expect` is an out-parameter on purpose: on both attach paths it can only be derived from the
+    // head itself, so filling it and checking the head against it belong in the same place, and the
+    // caller does not have to build an identity it would only be echoing. Splitting this into
+    // split_head_expect(head) + split_check_head(head, expect) would leave the comparison inside
+    // checking a value that was just copied from the same head -- true by construction, worth
+    // nothing. If the identity ever gets an external source (a config file, a supervisor), this
+    // becomes the seam: take `expect` as input and drop the filling.
+    static std::string split_check_head(const llama_context & head, head_expect & expect);
+
+    // [QLH-SPLIT] One frame's answer from the remote chain: the five slots and the scalars that
+    // describe them, plus the two bit sets that record which channels were asked for and which
+    // "the tail cannot answer this" lines have been logged.
+    //
+    // The contract is "one frame, one answer":
+    //   - begin_frame() clears every slot. The remote path of decode_split() calls it once, before
+    //     anything can fail, so a frame that ends up returning hidden (or a stage that errors out)
+    //     answers null from get_logits_ith() instead of handing back the previous frame's logits.
+    //   - store_*() write their own slot and touch nothing else.
+    //
+    // The old stores called the reset first, which made the order they were called in matter: a
+    // store of the h_nextn rows or of the tap blocks before the logits/candidates store had them
+    // wiped -- measured, the stage answered 2048 floats and the draft was told there were none.
+    // That dependency is gone because clearing is no longer part of storing: the only rule left is
+    // "begin_frame() before any store_*()", which the frame-start call already guarantees, so the
+    // stores can be written in any order (they still are, in the order the answer arrives).
+    struct split_tap_block {
+        uint32_t           id = 0;
+        std::vector<float> rows;
+    };
+
+    struct split_frame_answer {
+        // the whole-row answer
+        std::vector<float> logits;
+        uint32_t           n_vocab    = 0;
+        int32_t            logits_row = -1;
+
+        // the candidate answer (sorted by descending logit); empty when the tail answered a row
+        std::vector<qlh_split::token_cand> cands;
+        int32_t                            cands_row = -1;
+
+        // the per-row verify answer: one token id per row of the frame
+        std::vector<int32_t> verify;
+
+        // the h_nextn rows: [n_rows][nextn_embd], the first one belonging to batch row nextn_row0
+        std::vector<float> nextn;
+        uint32_t           nextn_embd = 0;
+        int32_t            nextn_row0 = -1;
+
+        // the layer-input taps: one block per answered source-layer id
+        std::vector<split_tap_block> tap;
+        uint32_t                     tap_embd = 0;
+        uint32_t                     tap_rows = 0;
+
+        // Channels armed for exactly one frame. The request calls set a bit; decode_split() reads
+        // and clears them before it can fail, so a failed frame cannot leave the next one asking
+        // for something the sampler did not plan for.
+        enum : uint32_t {
+            ARMED_CANDS  = 1u << 0,
+            ARMED_VERIFY = 1u << 1,
+            ARMED_NEXTN  = 1u << 2,
+        };
+        uint32_t armed = 0;
+
+        // Channels whose "the tail cannot answer this" line has already been logged, so an
+        // operator can tell "the channel is off" from "this batch was too big" without a line per
+        // token. WARNED_TAP is cleared when the tap set is set: it names a property of the chain,
+        // not of the frame.
+        enum : uint32_t {
+            WARNED_VERIFY_ROWS = 1u << 0,
+            WARNED_NEXTN       = 1u << 1,
+            WARNED_TAP         = 1u << 2,
+        };
+        uint32_t warned = 0;
+
+        void begin_frame();
+        void store_cands(std::vector<qlh_split::token_cand> && c, int32_t row);
+        void store_logits(std::vector<float> && l, uint32_t vocab, int32_t row);
+    };
 
     llm_graph_result * get_gf_res_prev();
 
@@ -475,80 +576,29 @@ private:
     // worse than either.
     std::vector<std::unique_ptr<llama_split_remote>> split_remotes;
 
-    // Logits produced by the last remote stage. There is no local context holding them, so the
-    // chain keeps them here and get_logits_ith() answers from this buffer. A remote tail sends
-    // exactly one row (its last token), so the batch index that row belongs to is kept next to
-    // it instead of being assumed to be 0.
-    std::vector<float> split_remote_logits;
-    uint32_t           split_remote_n_vocab = 0;
-    int32_t            split_remote_logits_row = -1;
+    // [QLH-SPLIT] One frame's answer from the remote chain, plus the per-frame request bits that
+    // go with it; see split_frame_answer above for the contract. A remote tail answers exactly
+    // one row (its last token), so the batch index that row belongs to is kept next to it instead
+    // of being assumed to be 0 -- that is what `logits_row` and `cands_row` are for.
+    split_frame_answer split_answer;
 
-    // [QLH-SPLIT] v5: the candidate channel. The driving side asks for candidates one decode at
-    // a time (llama_split_request_candidates in llama-ext.h), because whether the k candidates
-    // are enough is a property of *this* request's sampler chain -- grammar, pre-sampling
-    // logprobs, top_k <= 0 all change it -- and the tail can only answer what it was asked.
-    //
-    // Kept here rather than in llama_split_remote because the decision is per request and the
-    // connection outlives it: a request that falls back must not leave the flag set for the next
-    // one, and decode_split() clears it after every frame it used.
-    bool                          split_cand_wanted = false;
+    // [QLH-SPLIT] v5: the candidate channel request. The driving side asks for candidates one
+    // decode at a time (llama_split_request_candidates in llama-ext.h), because whether the k
+    // candidates are enough is a property of *this* request's sampler chain -- grammar,
+    // pre-sampling logprobs, top_k <= 0 all change it -- and the tail can only answer what it was
+    // asked. Kept here rather than in llama_split_remote because the decision is per request and
+    // the connection outlives it.
     qlh_split::cand_req           split_cand_req{};
     std::vector<llama_logit_bias> split_cand_bias;
     std::vector<llama_token>      split_cand_hist;
 
-    // Candidates of the last remote decode (sorted by descending logit), and the batch row they
-    // belong to. Empty when the tail answered with the whole row instead.
-    std::vector<qlh_split::token_cand> split_remote_cands;
-    int32_t                            split_remote_cands_row = -1;
-
-    // [QLH-SPLIT] v7: the per-row verify channel. `split_verify_wanted` is armed by the caller
-    // for exactly one decode (llama_split_request_verify_rows in llama-ext.h), the same way the
-    // candidate channel is; `split_remote_verify` holds the token id the tail chose for every row
-    // of the frame it answered, in row order. Empty means "the last decode did not use this
-    // channel", which is also what makes get_logits_ith() answer null for a verify frame: no row
-    // of logits crossed the wire.
-    bool                 split_verify_wanted = false;
-    std::vector<int32_t> split_remote_verify;
-
-    // [QLH-SPLIT] v7: how many times a verify request had to fall back to the whole-row path
-    // because the frame had more rows than MAX_VERIFY_ROWS. Reported once, so an operator can
-    // tell "the channel is off" from "this batch was too big" without a log line per token.
-    bool split_verify_row_warned = false;
-
-    // [QLH-SPLIT] v8: the h_nextn rows of the last remote decode. The head cannot compute them --
-    // t_h_nextn is RMSNorm(last trunk layer output) and that layer lives in the tail -- so the tail
-    // sends them back on the decode that needs them and they are kept here until the next decode
-    // overwrites them (split_remote_reset).
-    //
-    // `split_nextn_wanted` is armed for exactly one decode by the speculative driver, the same way
-    // the two channels above are; `embd` is stored next to the rows because a stage that answered a
-    // different width must be caught by the caller, not silently reinterpreted.
-    bool               split_nextn_wanted     = false;
-    std::vector<float> split_remote_nextn;
-    uint32_t           split_remote_nextn_embd = 0;
-    int32_t            split_remote_nextn_row0 = -1;
-    // One line per process when a frame asked for those rows and the tail answered none.
-    bool               split_nextn_warned      = false;
-
-    // [QLH-SPLIT] v9: the layer-input tap channel. `split_tap_ids` is the set of *source-model* layer
-    // ids every remote decode asks for (empty for a whole model and for a local chain, where nothing
-    // has to cross a wire). Each stage answers the ids inside its own range, so one set covers a chain
-    // of any length; `split_remote_tap` holds what the last decode actually answered, one block per id,
-    // each block [n_rows][n_embd] -- rows are per *frame* row, because a draft injects every position of
-    // the batch, not one anchor row.
+    // [QLH-SPLIT] v9: the layer-input tap channel. `split_tap_ids` is the set of *source-model*
+    // layer ids every remote decode asks for (empty for a whole model and for a local chain, where
+    // nothing has to cross a wire). It is a property of the chain, not of the frame, so it lives
+    // outside split_answer and survives begin_frame(); each stage answers the ids inside its own
+    // range, so one set covers a chain of any length. The answered blocks (and the row/width they
+    // were answered at) are per frame, so they are in split_answer.tap.
     std::vector<uint32_t> split_tap_ids;
-
-    struct split_tap_block {
-        uint32_t           id = 0;
-        std::vector<float> rows;
-    };
-
-    std::vector<split_tap_block> split_remote_tap;
-    uint32_t                     split_remote_tap_embd = 0;
-    uint32_t                     split_remote_tap_rows = 0;
-    // One line per process, so a chain whose stages do not own the head's tap layers says so once
-    // instead of once per token.
-    bool                         split_tap_warned      = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
