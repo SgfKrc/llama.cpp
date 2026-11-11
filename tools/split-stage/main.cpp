@@ -1994,6 +1994,185 @@ struct batch_guard {
     llama_batch & get() { return b; }
 };
 
+// [QLH-SPLIT] A1+A3: one reply is assembled here, and only here.
+//
+// Before this, four answer paths (relay / verify / cand / plain) each built the same header by hand:
+// a flags expression, an n_taps expression, and an n_bytes sum that named every section of the body.
+// Those sums were the answering half of the layout that src/llama-split-remote.cpp implemented again
+// as subtractions, so a new section had to be added to seven sums and one subtraction. Both halves
+// now come from layout_of() (llama-split-proto.h): a builder says *which* sections it carries and
+// *where* they are, never how many bytes they add up to.
+//
+// Two row counts are deliberately separate:
+//  - n_tokens is the reply header's row count: the frame's rows for a relay/verify answer, 1 for a
+//    candidate or a plain answer (the caller samples from one row).
+//  - n_rows is the frame's own row count, which sizes the per-row sections of the body -- the tap
+//    rows cover every position of the batch even when the header answers a single row. See
+//    body_layout in llama-split-proto.h.
+struct reply_body {
+    uint32_t     n_tokens = 0; // header: rows this reply answers
+    uint32_t     n_rows   = 0; // frame rows: stride of the tap section
+    uint32_t     n_embd   = 0; // header: row width (also the h_nextn/tap stride)
+    uint32_t     n_vocab  = 0; // header: logits width, 0 when no logits row follows
+    uint8_t      flags    = 0; // header: RSP_FLAG_*
+    uint8_t      n_taps   = 0; // header: tap ids answered
+    uint32_t     n_cand   = 0; // candidate pairs in the body (RSP_FLAG_CANDIDATES only)
+    const void * p[3]     = { nullptr, nullptr, nullptr };
+    size_t       n[3]     = { 0, 0, 0 };
+};
+
+// The tap section, when this stage owns at least one of the named layers. Grouped because it is the
+// one section two different builders carry, and six loose arguments per builder is how the two got
+// out of step in the first place.
+struct tap_parts {
+    uint8_t      flag   = 0; // RSP_FLAG_LAYER_INP, or 0 when this reply carries no tap
+    uint8_t      n      = 0; // ids answered
+    uint32_t     embd   = 0; // row width; the header's n_embd on a tail answer
+    const void * ids_p  = nullptr;
+    size_t       ids_n  = 0;
+    const void * rows_p = nullptr;
+    size_t       rows_n = 0;
+};
+
+// The h_nextn section (v8), same reasoning as tap_parts.
+struct nextn_parts {
+    uint8_t      flag = 0;
+    uint32_t     embd = 0;
+    const void * p    = nullptr;
+    size_t       n    = 0;
+};
+
+// Send one reply. The header's three derived fields (flags, n_taps, n_bytes) and the body's section
+// widths all come from the same table, and the check below is the answering half of the self-check:
+// the pieces handed in have to add up to what the table says the body is. A builder that passed a
+// wrong length would otherwise send a body the head reads at the wrong offset -- the next frame's
+// header parsed out of hidden rows.
+//
+// The check is an if and not an assert on purpose: this tool is built Release (/DNDEBUG), so an
+// assert would be compiled out of exactly the binary that serves the chain. It cannot fire on a
+// correct builder, so the served path is unchanged.
+static bool answer(conn & c, status st, const reply_body & b) {
+    const body_layout lay = layout_of(b.flags, b.n_rows, b.n_embd, b.n_vocab, b.n_taps)
+                                    .with_cand(b.n_cand);
+
+    const size_t pieces = b.n[0] + b.n[1] + b.n[2];
+    if (lay.total != pieces) {
+        fprintf(stderr, "[split-stage] reply body does not match its layout: the table says %u "
+                        "bytes, the sections add up to %zu (flags 0x%02x, rows %u, embd %u, "
+                        "vocab %u, taps %u)\n",
+                lay.total, pieces, (unsigned) b.flags, b.n_rows, b.n_embd, b.n_vocab,
+                (unsigned) b.n_taps);
+        return reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
+    }
+
+    return reply_parts(c.peer, st, b.n_tokens, b.n_embd, b.n_vocab, -1,
+                       lay.total, b.flags, b.n_taps,
+                       b.p[0], b.n[0], b.p[1], b.n[1], b.p[2], b.n[2]);
+}
+
+// [QLH-SPLIT] A3: the four answer paths, one builder each. They differ in which sections they carry
+// and in what order (see RSP_FLAG_LAYER_INP for the order), and in nothing else.
+//
+// relay: hidden rows, then the tap section. n_vocab is 0 -- a relay never answers logits.
+static bool answer_relay(conn & c, const stage & s, uint32_t n_tok, const tap_parts & tap) {
+    reply_body b;
+    b.n_tokens = n_tok;
+    b.n_rows   = n_tok;
+    b.n_embd   = s.n_embd;
+    b.flags    = tap.flag;
+    b.n_taps   = tap.n;
+    b.p[0] = s.relay_out.data();
+    b.n[0] = s.relay_out.size() * sizeof(float);
+    b.p[1] = tap.ids_p;
+    b.n[1] = tap.ids_n;
+    b.p[2] = tap.rows_p;
+    b.n[2] = tap.rows_n;
+    return answer(c, ST_OK, b);
+}
+
+// verify: the per-row ids, then either the tap section or the h_nextn rows. Never both -- one reply
+// states one n_embd, and the two sections are read at different widths.
+static bool answer_verify(conn & c, const stage & s, uint32_t n_tok,
+                          const tap_parts & tap, const nextn_parts & nextn) {
+    reply_body b;
+    b.n_tokens = n_tok;
+    b.n_rows   = n_tok;
+    b.n_embd   = tap.flag ? tap.embd : nextn.embd;
+    b.flags    = (uint8_t) (RSP_FLAG_VERIFY_ROWS | (tap.flag ? tap.flag : nextn.flag));
+    b.n_taps   = tap.flag ? tap.n : (uint8_t) 0;
+    b.p[0] = s.verify_out.data();
+    b.n[0] = s.verify_out.size() * sizeof(int32_t);
+    if (tap.flag) {
+        b.p[1] = tap.ids_p;
+        b.n[1] = tap.ids_n;
+        b.p[2] = tap.rows_p;
+        b.n[2] = tap.rows_n;
+    } else {
+        b.p[1] = nextn.p;
+        b.n[1] = nextn.n;
+    }
+    return answer(c, ST_OK, b);
+}
+
+// cand: one row's candidates, plus either the tap section or one h_nextn row. The body order is the
+// protocol's (ids, h rows, candidates, taps), so the h row comes *before* the pairs.
+static bool answer_cand(conn & c, const stage & s, uint32_t n_tok,
+                        const tap_parts & tap, const nextn_parts & nextn) {
+    reply_body b;
+    b.n_tokens = 1;
+    b.n_rows   = n_tok;
+    b.n_embd   = tap.flag ? tap.embd : nextn.embd;
+    b.flags    = (uint8_t) (RSP_FLAG_CANDIDATES | (tap.flag ? tap.flag : nextn.flag));
+    b.n_taps   = tap.flag ? tap.n : (uint8_t) 0;
+    b.n_cand   = (uint32_t) s.cand_out.size();
+    if (tap.flag) {
+        b.p[0] = s.cand_out.data();
+        b.n[0] = s.cand_out.size() * sizeof(token_cand);
+        b.p[1] = tap.ids_p;
+        b.n[1] = tap.ids_n;
+        b.p[2] = tap.rows_p;
+        b.n[2] = tap.rows_n;
+    } else {
+        b.p[0] = nextn.p;
+        b.n[0] = nextn.n;
+        b.p[1] = s.cand_out.data();
+        b.n[1] = s.cand_out.size() * sizeof(token_cand);
+    }
+    return answer(c, ST_OK, b);
+}
+
+// plain: the logits row, plus either the tap section or one h_nextn row. The logits row is ~1 MB, so
+// it is passed as a piece and never copied to glue another section onto it -- reply_parts sends the
+// pieces separately.
+static bool answer_plain(conn & c, const stage & s, uint32_t n_tok,
+                         const tap_parts & tap, const nextn_parts & nextn,
+                         const void * logits, size_t logits_n) {
+    reply_body b;
+    b.n_tokens = 1;
+    b.n_rows   = n_tok;
+    b.n_embd   = tap.flag ? tap.embd : nextn.embd;
+    b.n_vocab  = s.n_vocab;
+    b.flags    = tap.flag ? tap.flag : nextn.flag;
+    b.n_taps   = tap.flag ? tap.n : (uint8_t) 0;
+    if (tap.flag) {
+        b.p[0] = logits;
+        b.n[0] = logits_n;
+        b.p[1] = tap.ids_p;
+        b.n[1] = tap.ids_n;
+        b.p[2] = tap.rows_p;
+        b.n[2] = tap.rows_n;
+    } else if (nextn.flag) {
+        b.p[0] = nextn.p;
+        b.n[0] = nextn.n;
+        b.p[1] = logits;
+        b.n[1] = logits_n;
+    } else {
+        b.p[0] = logits;
+        b.n[0] = logits_n;
+    }
+    return answer(c, ST_OK, b);
+}
+
 // Build the batch for a frame that has already been read, decode it, and answer. Returns true
 // when the connection can keep serving.
 static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_tok,
@@ -2118,14 +2297,14 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     // and is exactly where a DFlash tap lands on a three-stage chain, so unlike the h_nextn rows these
     // are not a tail privilege.
     const bool tap_ok = stage_collect_taps(s, n_tok);
-    const uint8_t  tap_flag = (want_tap && tap_ok) ? RSP_FLAG_LAYER_INP : (uint8_t) 0;
-    const uint8_t  tap_n    = (want_tap && tap_ok) ? (uint8_t) s.tap_ids_out.size() : (uint8_t) 0;
-    const void *   tap_ids_p   = (want_tap && tap_ok) ? (const void *) s.tap_ids_out.data() : nullptr;
-    const size_t   tap_ids_n   = (want_tap && tap_ok) ? s.tap_ids_out.size() * sizeof(int32_t) : 0;
-    const void *   tap_rows_p  = (want_tap && tap_ok) ? (const void *) s.tap_rows_out.data() : nullptr;
-    const size_t   tap_rows_n  = (want_tap && tap_ok) ? s.tap_rows_out.size() * sizeof(float) : 0;
-    const uint32_t tap_embd    = (want_tap && tap_ok) ? s.n_embd : 0;
-    const uint32_t tap_bytes   = (uint32_t) (tap_ids_n + tap_rows_n);
+    tap_parts tap;
+    tap.flag   = (want_tap && tap_ok) ? RSP_FLAG_LAYER_INP : (uint8_t) 0;
+    tap.n      = (want_tap && tap_ok) ? (uint8_t) s.tap_ids_out.size() : (uint8_t) 0;
+    tap.embd   = (want_tap && tap_ok) ? s.n_embd : 0;
+    tap.ids_p  = (want_tap && tap_ok) ? (const void *) s.tap_ids_out.data() : nullptr;
+    tap.ids_n  = (want_tap && tap_ok) ? s.tap_ids_out.size() * sizeof(int32_t) : 0;
+    tap.rows_p = (want_tap && tap_ok) ? (const void *) s.tap_rows_out.data() : nullptr;
+    tap.rows_n = (want_tap && tap_ok) ? s.tap_rows_out.size() * sizeof(float) : 0;
 
     if (s.relay) {
         // [QLH-SPLIT] v10: reuse the stage's scratch, like every other answer channel here
@@ -2149,10 +2328,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
         // [QLH-SPLIT] v9: hidden rows, then the tap ids, then the tap rows -- the sections a reply that
         // carries both puts in that order (see RSP_FLAG_LAYER_INP). n_embd stays the hidden width, so
         // the tap width is the one the frame asked for.
-        reply_parts(c.peer, ST_OK, n_tok, s.n_embd, 0, -1,
-                    (uint32_t) (s.relay_out.size() * sizeof(float) + tap_bytes), tap_flag, tap_n,
-                    s.relay_out.data(), s.relay_out.size() * sizeof(float),
-                    tap_ids_p, tap_ids_n, tap_rows_p, tap_rows_n);
+        answer_relay(c, s, n_tok, tap);
         return true;
     }
 
@@ -2187,10 +2363,11 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
         }
     }
 
-    const uint8_t  nextn_flag  = want_nextn ? RSP_FLAG_NEXTN_ROWS : (uint8_t) 0;
-    const uint32_t nextn_embd  = want_nextn ? s.n_embd : 0;
-    const uint32_t nextn_bytes = want_nextn ? (uint32_t) (s.nextn_out.size() * sizeof(float)) : 0;
-    const void *   nextn_data  = want_nextn ? (const void *) s.nextn_out.data() : nullptr;
+    nextn_parts nextn;
+    nextn.flag = want_nextn ? RSP_FLAG_NEXTN_ROWS : (uint8_t) 0;
+    nextn.embd = want_nextn ? s.n_embd : 0;
+    nextn.p    = want_nextn ? (const void *) s.nextn_out.data() : nullptr;
+    nextn.n    = want_nextn ? s.nextn_out.size() * sizeof(float) : 0;
 
     // [QLH-SPLIT] v7: the per-row answer. One int32 per row, in row order: the argmax of that
     // row's logits. Nothing else is needed, because the only caller that asks is a greedy
@@ -2234,19 +2411,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
         // [QLH-SPLIT] v9: with layer-input taps the body is ids, then the tap ids, then the tap rows;
         // h_nextn and taps never share a reply (one reply has one n_embd field, and a frame that asked
         // for both would be answered at one of the two widths).
-        if (tap_flag) {
-            reply_parts(c.peer, ST_OK, n_tok, tap_embd, 0, -1,
-                        (uint32_t) (s.verify_out.size() * sizeof(int32_t) + tap_bytes),
-                        (uint8_t) (RSP_FLAG_VERIFY_ROWS | tap_flag), tap_n,
-                        s.verify_out.data(), s.verify_out.size() * sizeof(int32_t),
-                        tap_ids_p, tap_ids_n, tap_rows_p, tap_rows_n);
-        } else {
-            reply_parts(c.peer, ST_OK, n_tok, nextn_embd, 0, -1,
-                        (uint32_t) (s.verify_out.size() * sizeof(int32_t) + nextn_bytes),
-                        (uint8_t) (RSP_FLAG_VERIFY_ROWS | nextn_flag), 0,
-                        s.verify_out.data(), s.verify_out.size() * sizeof(int32_t),
-                        nextn_data, nextn_bytes, nullptr, 0);
-        }
+        answer_verify(c, s, n_tok, tap, nextn);
         if (g_timing) {
             const double t_now = now_ms();
             s.timing.n_verify++;
@@ -2314,20 +2479,8 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
             s.cand_out[i].logit = cur_p.data[i].logit;
         }
         const double t_post = g_timing ? now_ms() : 0.0;
-        if (tap_flag) {
-            // [QLH-SPLIT] v9: the candidate pairs first, then the taps (a tap section is always last).
-            reply_parts(c.peer, ST_OK, 1, tap_embd, 0, -1,
-                        (uint32_t) (s.cand_out.size() * sizeof(token_cand) + tap_bytes),
-                        (uint8_t) (RSP_FLAG_CANDIDATES | tap_flag), tap_n,
-                        s.cand_out.data(), s.cand_out.size() * sizeof(token_cand),
-                        tap_ids_p, tap_ids_n, tap_rows_p, tap_rows_n);
-        } else {
-            reply_parts(c.peer, ST_OK, 1, nextn_embd, 0, -1,
-                        (uint32_t) (s.cand_out.size() * sizeof(token_cand) + nextn_bytes),
-                        (uint8_t) (RSP_FLAG_CANDIDATES | nextn_flag), 0,
-                        nextn_data, nextn_bytes,
-                        s.cand_out.data(), s.cand_out.size() * sizeof(token_cand), nullptr, 0);
-        }
+        // [QLH-SPLIT] v9: the candidate pairs first, then the taps (a tap section is always last).
+        answer_cand(c, s, n_tok, tap, nextn);
         if (g_timing) {
             s.timing.n_cand++;
             s.timing.cand_build  += t_build - t_frame;
@@ -2359,25 +2512,12 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     // "answered 0 of 2 layer-input taps" on every request and drafted from an unseeded KV: the head
     // asks for both (its tail reports a NextN block, so server-context arms the row channel too), the
     // stage answered the row, and the taps were never sent. MTP chains are unaffected: they ask for
-    // no taps, so tap_flag stays 0 and they take the row branch.
-    if (tap_flag) {
-        // [QLH-SPLIT] v9: the logits row first (it is what the caller samples from), then the taps.
-        // Both are sent as pieces, so the ~1 MB row is never copied to glue the tap block onto it.
-        reply_parts(c.peer, ST_OK, 1, tap_embd, s.n_vocab, -1,
-                    (uint32_t) (s.n_vocab * sizeof(float) + tap_bytes), tap_flag, tap_n,
-                    lg, (size_t) s.n_vocab * sizeof(float),
-                    tap_ids_p, tap_ids_n, tap_rows_p, tap_rows_n);
-    } else if (want_nextn) {
-        // Body order: the h rows, then the logits row (see RSP_FLAG_NEXTN_ROWS). The logits row is
-        // ~1 MB, so it must not be copied to append 16 KB to it -- reply_parts sends the pieces.
-        reply_parts(c.peer, ST_OK, 1, nextn_embd, s.n_vocab, -1,
-                    (uint32_t) (nextn_bytes + s.n_vocab * sizeof(float)), nextn_flag, 0,
-                    nextn_data, nextn_bytes, lg, (size_t) s.n_vocab * sizeof(float), nullptr, 0);
-    } else {
-        reply_parts(c.peer, ST_OK, 1, 0, s.n_vocab, -1,
-                    (uint32_t) ((size_t) s.n_vocab * sizeof(float)), 0, 0,
-                    lg, (size_t) s.n_vocab * sizeof(float));
-    }
+    // no taps, so tap.flag stays 0 and they take the row branch.
+    //
+    // [QLH-SPLIT] v9: the logits row first (it is what the caller samples from), then the taps; the
+    // h row branch puts the h rows first (see RSP_FLAG_NEXTN_ROWS). Both are sent as pieces, so the
+    // ~1 MB row is never copied to glue another section onto it -- reply_parts sends the pieces.
+    answer_plain(c, s, n_tok, tap, nextn, lg, (size_t) s.n_vocab * sizeof(float));
     if (g_timing) {
         if (n_tok > (uint32_t) MAX_VERIFY_ROWS) {
             // A prompt frame. Its decode is 512 rows at once and has nothing to do with the

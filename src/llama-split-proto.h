@@ -16,6 +16,7 @@
 // seq_cp / seq_add / seq_keep / seq_div, which a serving path never calls.
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 
 namespace qlh_split {
@@ -569,5 +570,178 @@ struct rsp_header {
 };
 
 static_assert(sizeof(rsp_header) == 32, "rsp_header is a wire structure; keep its size explicit");
+
+// [QLH-SPLIT] A1: THE body layout. This table is the single source of truth for how a reply body is
+// cut into sections -- both ends read it, neither adds nor subtracts section widths on its own.
+//
+// Why it exists: the same rule used to be implemented twice. tools/split-stage/main.cpp added the
+// section widths up at seven call sites to produce rsp_header::n_bytes, and
+// src/llama-split-remote.cpp derived the same sections back by subtracting them from the n_bytes it
+// had received. One was an addition, the other a subtraction, and every protocol upgrade from v5 to
+// v9 had to change both -- five double diffs, and the one place a new section could be added to the
+// writer and forgotten in the reader (the symptom being a body read at the wrong offset, i.e. the
+// next frame's header parsed out of hidden rows).
+//
+// The sections, in wire order (see the RSP_FLAG_* notes above):
+//
+//   verify ids   n_tokens * int32                  RSP_FLAG_VERIFY_ROWS
+//   h_nextn rows nextn_rows() * n_embd * f32       RSP_FLAG_NEXTN_ROWS
+//   output       candidates | logits row | hidden rows -- exactly one of the three
+//   tap ids      n_taps * int32                    RSP_FLAG_LAYER_INP
+//   tap rows     n_tokens * n_taps * n_embd * f32  RSP_FLAG_LAYER_INP
+//
+// Two row counts are in play, and they are not the same number:
+//  - n_tokens (the parameter) is how many rows of the *frame* every per-row section covers. A tap
+//    row exists for every position of the batch, so the tap section is sized from it even when the
+//    reply answers a single row (a candidate or a plain answer says n_tokens = 1 in the header but
+//    was decoded from a whole ubatch).
+//  - the h_nextn section only covers the rows the reply answers *for*: all of them on a verify
+//    answer, the last one otherwise -- see nextn_rows() and RSP_FLAG_NEXTN_ROWS.
+//
+// The candidate section is the one width this table cannot know: it is the chain's top_k, which no
+// header field carries (the reader recovers the count from n_bytes / sizeof(token_cand)). It is
+// therefore 0 here and filled in by with_cand() on the answering side; the reader subtracts this
+// table's total from n_bytes. That subtraction is not a second layout -- every fixed section still
+// comes from this table, and the candidates are the only section whose width is decided at runtime.
+//
+// total is what rsp_header::n_bytes must be. On an answer that carries candidates it is the width of
+// everything *but* the candidates (so the count can be recovered); with_cand() returns the layout
+// whose total is the whole body.
+struct body_layout {
+    uint32_t positions_bytes = 0; // verify ids: one int32 per frame row
+    uint32_t cand_bytes      = 0; // candidate pairs; runtime width, see with_cand()
+    uint32_t verify_bytes    = 0; // the verify channel's width: the ids section, nothing else
+    uint32_t nextn_bytes     = 0; // h_nextn rows
+    uint32_t tap_ids_bytes   = 0; // layer-input source ids
+    uint32_t tap_rows_bytes  = 0; // layer-input rows, [row][tap][n_embd]
+    uint32_t logits_bytes    = 0; // the logits row (plain answer)
+    uint32_t hidden_bytes    = 0; // the hidden rows (relay answer)
+    uint32_t total           = 0; // sum of the sections above; rsp_header::n_bytes
+
+    uint8_t  flags    = 0; // the rsp_header::flags this layout describes
+    uint32_t n_tokens = 0; // rows every per-row section covers (the frame's row count)
+    uint32_t n_embd   = 0; // row width of the h_nextn and tap sections
+    uint32_t n_taps   = 0; // tap ids this reply answers
+
+    // Where a section starts. Named rather than numeric so a reader does not re-derive the order --
+    // re-deriving it is the other half of the duplication this table removes.
+    enum class seg : uint8_t { verify_ids, nextn, output, tap_ids, tap_rows };
+
+    uint32_t output_bytes() const { return cand_bytes + logits_bytes + hidden_bytes; }
+    uint32_t offset_of(seg s) const;
+    uint32_t nextn_rows() const;
+    bool     has_taps() const { return (flags & RSP_FLAG_LAYER_INP) != 0; }
+
+    // 64-bit width of the whole tap section. The answering side builds it in 32 bits (a frame that
+    // large cannot be sent anyway, n_bytes is uint32), but a reader has to be able to ask "is this
+    // section alone larger than the body I was told about" without the multiplication wrapping
+    // first: n_tokens * n_taps * n_embd * 4 does not fit 32 bits at the protocol caps.
+    uint64_t tap_section_bytes64() const;
+
+    // The whole body, with the one section whose width only the answering side knows.
+    body_layout with_cand(uint32_t n_cand) const;
+
+    // Self-check shared by both ends: does this layout describe exactly this body? A mismatch means
+    // the two ends disagree about the frame, and reading on would take the next frame's header for
+    // this body.
+    bool matches(uint32_t body_bytes) const { return total == body_bytes; }
+};
+
+// [QLH-SPLIT] A1: the self-check on both ends is an explicit `if`, NOT an `assert`, and that is not
+// redundant belt-and-braces: libllama and split-stage are built Release (/DNDEBUG), where an assert
+// compiles away -- exactly in the binary that talks on the wire. So the stage refuses to send a body
+// whose pieces do not add up to `total` (ST_INTERNAL, see answer() in tools/split-stage/main.cpp),
+// and the head refuses a reply whose n_bytes is not `total` (-3, see decode() in
+// src/llama-split-remote.cpp). A reply that carries candidates is the one exception on the reading
+// side: its section width is the remainder, so the head checks that instead. Do not "simplify" these
+// into an assert -- that would delete the check from every build that ships.
+
+// [QLH-SPLIT] A1: the compile-time half of the self-check. layout_of() is called with request flags
+// by the head and with reply flags by the stage; the two enums have to stay numerically identical or
+// the same table would mean two different things on the two ends.
+static_assert(DECODE_FLAG_CANDIDATES == RSP_FLAG_CANDIDATES, "decode/reply candidate bit must agree");
+static_assert(DECODE_FLAG_VERIFY_ROWS == RSP_FLAG_VERIFY_ROWS, "decode/reply verify bit must agree");
+static_assert(DECODE_FLAG_NEXTN_ROWS  == RSP_FLAG_NEXTN_ROWS,  "decode/reply nextn bit must agree");
+static_assert(DECODE_FLAG_LAYER_INP   == RSP_FLAG_LAYER_INP,   "decode/reply layer-inp bit must agree");
+
+inline uint32_t body_layout::nextn_rows() const {
+    return (flags & RSP_FLAG_VERIFY_ROWS) ? n_tokens : 1;
+}
+
+inline uint32_t body_layout::offset_of(seg s) const {
+    switch (s) {
+        case seg::verify_ids: return 0;
+        case seg::nextn:      return positions_bytes;
+        case seg::output:     return positions_bytes + nextn_bytes;
+        case seg::tap_ids:    return positions_bytes + nextn_bytes + output_bytes();
+        case seg::tap_rows:   return positions_bytes + nextn_bytes + output_bytes() + tap_ids_bytes;
+    }
+    return 0;
+}
+
+inline uint64_t body_layout::tap_section_bytes64() const {
+    return (uint64_t) tap_ids_bytes +
+           (uint64_t) n_tokens * (uint64_t) n_taps * (uint64_t) n_embd * sizeof(float);
+}
+
+inline body_layout body_layout::with_cand(uint32_t n_cand) const {
+    body_layout l = *this;
+    l.cand_bytes = n_cand * (uint32_t) sizeof(token_cand);
+    l.total = l.positions_bytes + l.cand_bytes + l.nextn_bytes + l.logits_bytes +
+              l.hidden_bytes + l.tap_ids_bytes + l.tap_rows_bytes;
+    return l;
+}
+
+// [QLH-SPLIT] A1: derive the body layout of one reply from its header fields.
+//
+// flags is rsp_header::flags (the RSP_FLAG_* bits; they are numerically the DECODE_FLAG_* ones, see
+// the static_asserts above). n_tokens is the frame's row count -- not necessarily the reply's own
+// n_tokens, see the note on body_layout. n_embd is the row width of the h_nextn and tap sections,
+// n_vocab the logits width (0 when the reply carries no logits row), n_taps the ids this reply
+// answers (0 when it carries no tap section).
+//
+// The output section is chosen by the flags, in this order: candidates, else the verify ids (which
+// *are* that answer's output), else a logits row when the reply states a vocabulary, else the relay's
+// hidden rows. That is exactly the precedence the reader has always used, now stated once.
+inline body_layout layout_of(uint8_t flags, uint32_t n_tokens, uint32_t n_embd, uint32_t n_vocab,
+                             uint32_t n_taps) {
+    body_layout l;
+    l.flags    = flags;
+    l.n_tokens = n_tokens;
+    l.n_embd   = n_embd;
+    l.n_taps   = (flags & RSP_FLAG_LAYER_INP) ? n_taps : 0;
+
+    l.positions_bytes = (flags & RSP_FLAG_VERIFY_ROWS) ? n_tokens * (uint32_t) sizeof(int32_t) : 0;
+    l.verify_bytes    = l.positions_bytes;
+
+    l.nextn_bytes = (flags & RSP_FLAG_NEXTN_ROWS)
+            ? l.nextn_rows() * n_embd * (uint32_t) sizeof(float)
+            : 0;
+
+    if (flags & RSP_FLAG_CANDIDATES) {
+        // Filled in by with_cand(): the count is the chain's top_k, which no header field carries.
+    } else if (flags & RSP_FLAG_VERIFY_ROWS) {
+        // The per-row ids are this answer's output; there is no third section.
+    } else if (n_vocab > 0) {
+        l.logits_bytes = n_vocab * (uint32_t) sizeof(float);
+    } else {
+        l.hidden_bytes = n_tokens * n_embd * (uint32_t) sizeof(float);
+    }
+
+    if (l.has_taps()) {
+        l.tap_ids_bytes  = l.n_taps * (uint32_t) sizeof(int32_t);
+        l.tap_rows_bytes = n_tokens * l.n_taps * n_embd * (uint32_t) sizeof(float);
+    }
+
+    l.total = l.positions_bytes + l.cand_bytes + l.nextn_bytes + l.logits_bytes +
+              l.hidden_bytes + l.tap_ids_bytes + l.tap_rows_bytes;
+
+    // Runtime half of the self-check: every section this table names has to be inside total. A
+    // section added to one side of the sum and not the other is the failure mode this table exists
+    // to make impossible, and this catches the day someone edits one line of it.
+    assert(l.total == l.positions_bytes + l.cand_bytes + l.nextn_bytes + l.logits_bytes +
+                      l.hidden_bytes + l.tap_ids_bytes + l.tap_rows_bytes);
+    return l;
+}
 
 } // namespace qlh_split

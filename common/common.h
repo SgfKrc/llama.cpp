@@ -370,6 +370,35 @@ struct common_params_speculative_draft {
     // MTP context, and it is what makes the draft implementation take the remote branch.
     bool ctx_tail_remote = false;
 
+    // [QLH-SPLIT] B2: which part of a split chain this drafter sits on -- the single definition of
+    // "chain / local tail / remote tail", decided once from the two fields above and read by both
+    // draft implementations in common/speculative.cpp.
+    //
+    // Before this existed the same test was spelled out ten times in two shapes: DFlash kept a
+    // local `tail_remote` plus a three-way condition over (id, ctx_tail, ctx_tail_remote), while
+    // MTP kept is_chain / is_remote members. Two spellings of one rule is how a split chain has
+    // drifted behaviour before, and the paths that drifted were the ones no test covered. A new
+    // chain shape extends this enum; it must not add another predicate at a call site.
+    //
+    // The two fields are exclusive by construction on the server side (ctx_tail_remote is only set
+    // when ctx_tail is null). If a library caller sets both, the remote tail wins -- the order
+    // DFlash resolved them in before this enum existed -- and MTP's ctor asserts on the conflict.
+    enum class chain_kind {
+        WHOLE,       // no chain: the target context is the whole model
+        LOCAL_TAIL,  // the tail segment is a context in this process (ctx_tail)
+        REMOTE_TAIL, // the tail segment is another process (ctx_tail_remote): no tail context here
+    };
+
+    chain_kind kind() const {
+        return ctx_tail_remote ? chain_kind::REMOTE_TAIL
+             : ctx_tail        ? chain_kind::LOCAL_TAIL
+                               : chain_kind::WHOLE;
+    }
+
+    bool is_whole()       const { return kind() == chain_kind::WHOLE; }
+    bool is_local_tail()  const { return kind() == chain_kind::LOCAL_TAIL; }
+    bool is_remote_tail() const { return kind() == chain_kind::REMOTE_TAIL; }
+
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)

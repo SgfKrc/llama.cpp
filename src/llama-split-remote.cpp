@@ -695,9 +695,17 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
     // [QLH-SPLIT] v8: the body sections are read in the order the protocol documents --
     // per-row ids, then h_nextn rows, then candidates or the logits row, and (v9) the layer-input
     // taps after all of them. So a reply can carry several channels without either side guessing.
-    const size_t   nextn_off   = (rsp.flags & RSP_FLAG_VERIFY_ROWS) ? (size_t) rsp.n_tokens * sizeof(int32_t) : 0;
-    const uint32_t nextn_wide  = (rsp.flags & RSP_FLAG_NEXTN_ROWS) ? rsp.n_embd : 0;
-    const size_t   nextn_bytes = (size_t) rsp.n_tokens * nextn_wide * sizeof(float);
+    //
+    // [QLH-SPLIT] A1: *where* each of those sections starts, and how wide it is, comes from
+    // layout_of() -- the same table the stage used to produce rsp_header::n_bytes. This side used to
+    // derive the same sections by subtracting them back out of n_bytes, which was the second
+    // implementation of one rule: every protocol upgrade had to change both, and a section the
+    // writer learned about but the reader did not would be read at the wrong offset (the next
+    // frame's header parsed out of hidden rows).
+    //
+    // The layout is built from the *frame's* row count, not from rsp.n_tokens: a tap row exists for
+    // every position of the batch, so a reply that answers one row still carries n_tok of them. The
+    // h_nextn section is the one that follows the answered rows instead -- see body_layout.
 
     // [QLH-SPLIT] v9: the tap section this reply owes, and the check that it is exactly the shape this
     // frame asked for. A tap row is *per frame row*, not per answered row: the draft injects every
@@ -715,6 +723,10 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
                                                RSP_FLAG_NEXTN_ROWS)) == 0;
     const bool tap_on_hidden   = reply_is_hidden && (rsp.flags & RSP_FLAG_LAYER_INP) != 0;
     const uint32_t tap_wide    = tap_on_hidden ? tap.n_embd : rsp.n_embd;
+
+    // One table, both ends (llama-split-proto.h). The row width is the tap width: on a relay answer
+    // that is the width the frame asked for, on every other shape it is rsp.n_embd.
+    const body_layout lay = layout_of(rsp.flags, n_tok, tap_wide, rsp.n_vocab, rsp.n_taps);
 
     uint64_t tap_bytes = 0;
     if (rsp.flags & RSP_FLAG_LAYER_INP) {
@@ -734,8 +746,7 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
         }
         // A tap block wider than one frame's rows * taps * n_embd would overflow n_bytes, so the
         // arithmetic is done in 64 bits and the frame is refused instead of truncated.
-        tap_bytes = (uint64_t) rsp.n_taps * sizeof(int32_t) +
-                    (uint64_t) n_tok * rsp.n_taps * tap_wide * sizeof(float);
+        tap_bytes = lay.tap_section_bytes64();
         if (tap_bytes > (uint64_t) rsp.n_bytes) {
             err = "stage answered " + std::to_string(rsp.n_bytes) + " bytes for a tap section of " +
                   std::to_string(tap_bytes) + " (" + std::to_string((unsigned) rsp.n_taps) +
@@ -748,6 +759,22 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
         // missing tap means.
     } else if (rsp.n_taps != 0) {
         err = "stage named layer-input taps in a reply that carries none";
+        return -3;
+    }
+
+    // Self-check, the reading half, and it is an if rather than an assert: libllama is built Release
+    // (/DNDEBUG), so an assert would be compiled out of exactly the binary that reads the wire. On a
+    // reply that carries no candidates the body is exactly what the table says it is -- a stage built
+    // from this tree always sets n_bytes to the table's total -- so this cannot fire on a valid frame.
+    // It fires on a frame from anything else, which is the point: reading on would take the next
+    // frame's header for this body. A candidate reply is exempt, because its section width is the
+    // remainder and is checked below.
+    if (!(rsp.flags & RSP_FLAG_CANDIDATES) && rsp.n_bytes != 0 && !lay.matches(rsp.n_bytes)) {
+        err = "stage answered " + std::to_string(rsp.n_bytes) + " bytes for a " +
+              std::to_string(lay.total) + "-byte body (flags " + std::to_string((unsigned) rsp.flags) +
+              ", " + std::to_string(n_tok) + " rows, n_embd " + std::to_string(rsp.n_embd) +
+              ", n_vocab " + std::to_string(rsp.n_vocab) + ", n_taps " +
+              std::to_string((unsigned) rsp.n_taps) + ")";
         return -3;
     }
 
@@ -790,7 +817,10 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
             return -3;
         }
         const uint64_t hidden_bytes = (uint64_t) n_tok * n_embd * sizeof(float);
-        if ((uint64_t) rsp.n_bytes != hidden_bytes + tap_bytes) {
+        // [QLH-SPLIT] A1: the body is exactly what the layout table says it is -- hidden rows plus
+        // the tap section -- and this is the strict form of that check (a relay answer states both
+        // widths in its header, so nothing here is inferred).
+        if (!lay.matches(rsp.n_bytes)) {
             err = "stage answered " + std::to_string(rsp.n_bytes) + " bytes for " +
                   std::to_string(hidden_bytes) + " hidden bytes plus " + std::to_string(tap_bytes) +
                   " of taps";
@@ -816,7 +846,7 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
             err = "stage answered per-row results that were not requested";
             return -3;
         }
-        if (rsp.n_tokens != n_tok || rsp.n_bytes < nextn_off + nextn_bytes + tap_bytes) {
+        if (rsp.n_tokens != n_tok || rsp.n_bytes < lay.total) {
             err = "stage answered " + std::to_string(rsp.n_tokens) + " rows / " +
                   std::to_string(rsp.n_bytes) + " bytes for a " + std::to_string(n_tok) +
                   "-row verify frame, expected at least " +
@@ -848,7 +878,7 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
         // answered a different shape is caught here instead of shifting every later reply.
         const uint32_t n_rows = rsp.n_tokens;
         if (rsp.n_embd != n_embd || n_rows == 0 ||
-            nextn_bytes != (size_t) n_rows * n_embd * sizeof(float) ||
+            (size_t) lay.nextn_bytes != (size_t) n_rows * n_embd * sizeof(float) ||
             (!(rsp.flags & RSP_FLAG_VERIFY_ROWS) && n_rows != 1)) {
             err = "stage answered implausible h_nextn rows (n_tokens " + std::to_string(rsp.n_tokens) +
                   ", n_embd " + std::to_string(rsp.n_embd) + ", n_bytes " +
@@ -878,13 +908,16 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
         // above; one that answers the row instead would leave this branch empty and out_logits
         // filled, which decode_split() accepts as the slow-but-correct path -- the one thing it
         // must not do is invent candidates.
-        if ((uint64_t) rsp.n_bytes < nextn_bytes + tap_bytes) {
+        if ((uint64_t) rsp.n_bytes < lay.total) {
             err = "stage answered " + std::to_string(rsp.n_bytes) + " bytes for " +
-                  std::to_string(nextn_bytes) + " of h rows and " + std::to_string(tap_bytes) +
-                  " of taps";
+                  std::to_string(lay.nextn_bytes) + " of h rows and " +
+                  std::to_string(tap_bytes) + " of taps";
             return -3;
         }
-        const uint32_t cand_bytes = rsp.n_bytes - (uint32_t) nextn_bytes - (uint32_t) tap_bytes;
+        // [QLH-SPLIT] A1: the candidates are the one section whose width the layout table cannot
+        // know -- it is the chain's top_k, and no header field carries it. Everything else comes
+        // from the table, so the count is the remainder, not a re-derivation of the body.
+        const uint32_t cand_bytes = rsp.n_bytes - lay.total;
         if (cand_bytes % sizeof(token_cand) != 0 || cand_bytes == 0) {
             err = "stage answered an implausible candidate payload (" +
                   std::to_string(cand_bytes) + " bytes)";
@@ -914,7 +947,7 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
     // the row plus the taps, and one that leaves it 0 is answering the v8 shape, which is what the
     // head parsed before this channel existed.
     if (rsp.n_vocab > 0 && rsp.n_bytes > 0 &&
-        (uint64_t) rsp.n_bytes < logits_bytes + tap_bytes) {
+        (uint64_t) rsp.n_bytes < lay.total) {
         err = "stage answered " + std::to_string(rsp.n_bytes) + " bytes for a " +
               std::to_string(logits_bytes) + "-byte logits row and " +
               std::to_string(tap_bytes) + " of taps";

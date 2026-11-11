@@ -992,6 +992,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+    // [QLH-SPLIT] B2: the chain-shape enum lives on the params struct (common/common.h); alias it
+    // here so the tap resolution below reads as a switch on one value instead of three conditions.
+    using chain_kind = common_params_speculative_draft::chain_kind;
+
     common_params_speculative_draft params;
 
     common_batch batch;        // noise tokens
@@ -1094,23 +1098,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // [QLH-SPLIT] v9: a remote chain has no tail context in this process. Its depth comes from
             // the source model instead -- and only for a bounds message, because the stage resolves the
             // ids against its own range and is the authority on what it owns.
-            const bool    tail_remote   = this->params.ctx_tail_remote;
-            const int32_t head_n_layer  = (int32_t) llama_model_n_layer(model_tgt);
-            const int32_t tail_n_layer  = ctx_tail
+            //
+            // [QLH-SPLIT] B2: the chain shape is read once from params.kind(). The previous version
+            // re-derived it here (a local `tail_remote` plus `ctx_tail == nullptr && !tail_remote`),
+            // which is one of the ten spellings the enum replaced.
+            const chain_kind kind         = this->params.kind();
+            const int32_t    head_n_layer = (int32_t) llama_model_n_layer(model_tgt);
+            const int32_t    tail_n_layer = kind == chain_kind::LOCAL_TAIL
                     ? (int32_t) llama_model_n_layer(llama_get_model(ctx_tail))
-                    : (tail_remote ? (int32_t) llama_model_n_layer_src(model_tgt) - head_n_layer : 0);
+                    : (kind == chain_kind::REMOTE_TAIL
+                        ? (int32_t) llama_model_n_layer_src(model_tgt) - head_n_layer : 0);
 
             tap_ctx.resize(target_layer_ids_n);
             tap_lid.resize(target_layer_ids_n);
             tap_remote.assign(target_layer_ids_n, 0);
             for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                 const int32_t id = target_layer_ids[k];
-                if (id < head_n_layer || (ctx_tail == nullptr && !tail_remote)) {
+                if (id < head_n_layer || kind == chain_kind::WHOLE) {
                     // A whole model keeps every id on one context -- there is no cut to resolve, and a
                     // whole-model load must behave exactly as it did before the chain existed.
                     tap_ctx[k] = ctx_tgt;
                     tap_lid[k] = (uint32_t) id;
-                } else if (tail_remote) {
+                } else if (kind == chain_kind::REMOTE_TAIL) {
                     // [QLH-SPLIT] v9: this layer is computed by another process, so there is nothing
                     // to read here -- it has to come back on the decode. The id stays a *source* id and
                     // the stage subtracts its own range start, which is what lets the same set of ids
@@ -1120,6 +1129,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     tap_ctx[k] = nullptr;
                     tap_lid[k] = (uint32_t) id;
                 } else {
+                    // kind == chain_kind::LOCAL_TAIL: the id is a source id, this context owns it
+                    // offset by the head's block count.
                     tap_ctx[k] = ctx_tail;
                     tap_lid[k] = (uint32_t) (id - head_n_layer);
                     if ((int32_t) tap_lid[k] >= tail_n_layer) {
@@ -1241,7 +1252,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     "the rest are read back from the stages)\n", __func__,
                     tap_remote_src.size(), target_layer_ids_n, (int) llama_model_n_layer(model_tgt));
         }
-        if (this->params.ctx_tail) {
+        if (this->params.is_local_tail()) {
             LOG_INF("%s: split chain: %u DFlash taps over 2 stages (head %d blocks, tail %d blocks; "
                     "%d on the head, %u on the tail; source layer %d -> tail local %u)\n", __func__,
                     target_layer_ids_n,
@@ -1808,22 +1819,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // One MTP draft driver, four modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
-    //   is_chain (split chain): the target is the tail segment of a local chain, so h_nextn
+    //   local tail (split chain): the target is the tail segment of a local chain, so h_nextn
     //       comes from that context and the draft cannot replay the chain's token history.
     //   none of them (qwen35 / qwen35moe): a single trained MTP head over a whole model.
     //
-    // [QLH-SPLIT] v8 adds a fifth, `is_remote`, which is not a variant of the four but their
+    // [QLH-SPLIT] v8 adds a fifth, the remote tail, which is not a variant of the four but their
     // absence: the MTP head is in another process. There is no ctx_dft at all -- no draft KV, no
     // batch, no sampler here -- and both the h_nextn rows and the drafts come over the chain's
     // connection (llama-ext.h: llama_context_split_mtp_draft / llama_split_take_nextn_rows). Every
     // branch below that reaches for ctx_dft is guarded by it.
+    //
+    // [QLH-SPLIT] B2: "local tail" and "remote tail" are read from params (is_local_tail() /
+    // is_remote_tail(), one definition in common/common.h), not kept in a second pair of members
+    // that could disagree with the params they were copied from.
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
-    bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared && !is_chain
-                                     // (why !is_chain: see the derivation in the ctor -- a chain never
+    bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared && !is_local_tail
+                                     // (why !is_local_tail: see the derivation in the ctor -- a chain never
                                      // gives the draft the prompt KV that the per-head rebuild needs)
-    bool    is_chain      = false;   // [QLH-SPLIT] split chain: draft belongs to the tail segment
-    bool    is_remote     = false;   // [QLH-SPLIT] v8: ... which is a stage process; no ctx_dft here
 
     // [QLH-SPLIT] keep-KV chain route (default on; QLH_CHAIN_DRAFT_KEEP_KV=0 restores the
     // per-round clear it replaced, bit for bit).
@@ -1913,8 +1926,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
-        is_remote = this->params.ctx_tail_remote;
-        GGML_ASSERT(ctx_tgt && (ctx_dft || is_remote) &&
+        GGML_ASSERT(ctx_tgt && (ctx_dft || this->params.is_remote_tail()) &&
                 "MTP requires ctx_tgt and either ctx_dft or a remote tail to draft on");
 
         // [QLH-SPLIT] v8: in remote mode the width comes from the chain, not from a draft model --
@@ -1929,7 +1941,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d, remote=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling, (int) is_remote);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d, remote=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling, (int) this->params.is_remote_tail());
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1982,15 +1994,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // range has no NextN block (enabling the channel on it makes the graph ask for a buffer
         // that was never planned), and the rows arrive over the wire instead.
 
-        is_chain = this->params.ctx_tail != nullptr;
-
-        // [QLH-SPLIT] "the tail is in another process" and "the tail is a context here" are
-        // exclusive by construction on the server side (ctx_tail_remote is only set when ctx_tail
-        // is null), but common/ is a library and this is the only place that can check it. The two
-        // flags feed different subsets of the route predicates below -- keep_kv reads is_chain,
-        // catchup_enabled reads both -- so a caller that set both would make them disagree about
-        // whether a draft KV exists, and the catch-up arrays would be read unassigned.
-        GGML_ASSERT(!(is_chain && is_remote) &&
+        // [QLH-SPLIT] B2: the chain shape is params.kind() (common/common.h) -- one value read from
+        // the two fields, with no member copy that could drift from them.
+        //
+        // "the tail is in another process" and "the tail is a context here" are exclusive by
+        // construction on the server side (ctx_tail_remote is only set when ctx_tail is null), but
+        // common/ is a library and this is the only place that can check it. kind() resolves a
+        // conflict by letting the remote tail win (deliberate for DFlash's tap resolution), which
+        // would silently hide a caller that set both -- so assert on the raw fields, not on kind().
+        GGML_ASSERT(!(this->params.ctx_tail != nullptr && this->params.ctx_tail_remote) &&
                 "a chain cannot have both a local tail (ctx_tail) and a remote tail (ctx_tail_remote)");
         // note: is_mem_shared keeps its old meaning on purpose. In chain mode ctx_other is the
         // tail segment's context, which the llama_context ctor drops for every arch that does
@@ -2001,7 +2013,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // and llama_get_ctx_other(nullptr) is a null dereference, not a query.
         is_mem_shared = ctx_dft != nullptr && llama_get_ctx_other(ctx_dft) == ctx_tgt;
 
-        // [QLH-SPLIT] !is_chain is load-bearing, not symmetry with the branch above.
+        // [QLH-SPLIT] !is_local_tail is load-bearing, not symmetry with the branch above.
         //
         // chain_heads makes draft() rebuild the draft's cursor one trained head at a time, and
         // each head needs the KV of everything before pos0 *in its own decoder layer* -- that is
@@ -2009,19 +2021,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // reaches the tail as embeddings, and replaying the prompt into the draft would be a full
         // extra draft pass) and draft() clears the draft KV every round, so those rows never
         // exist: the multi-head path would decode the prefix against an empty range and draft
-        // over nothing, silently. With !is_chain a multi-head model falls back to the single-head
+        // over nothing, silently. With !is_local_tail a multi-head model falls back to the single-head
         // growth path (head 0, one row per step), which is correct and merely a weaker draft.
         //
         // Not reachable with the models on hand -- a split-chain head must be qwen35/qwen35moe
         // (split_arch_exports_pre_norm) and those ship one nextn layer here, so n_mtp_layers == 1
         // already makes this false. It is derived from the model file, though, not from the arch,
         // so the guard is what stops the next multi-head checkpoint from drafting blind.
-        chain_heads   = n_mtp_layers > 1 && !is_mem_shared && !is_chain;
+        chain_heads   = n_mtp_layers > 1 && !is_mem_shared && !this->params.is_local_tail();
         // [QLH-SPLIT] v8: a remote chain enables neither channel -- ctx_dft is null there (the
         // draft runs in the stage) and the head's layer range has no NextN block, so asking the
         // head for the channel makes the graph request a buffer that was never planned. Those rows
-        // arrive over the wire instead (see the is_remote branch in process()).
-        if (!is_remote) {
+        // arrive over the wire instead (see the remote-tail branch in process()).
+        if (!this->params.is_remote_tail()) {
             llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
             llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         }
@@ -2044,7 +2056,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // instead of re-deriving the conjunction -- draft()'s per-round clear, the catch-up decode,
         // the stats. That conjunction is exactly where this project has had two implementations
         // drift apart before, and the three-way version is the one nobody notices.
-        const bool chain_local_draft = is_chain && !is_mem_shared && ctx_dft != nullptr;
+        const bool chain_local_draft = this->params.is_local_tail() && !is_mem_shared && ctx_dft != nullptr;
         keep_kv = chain_local_draft && []() {
             // [QLH-SPLIT] Default ON. "0" (or an empty value) is the opt-out, and it must
             // reproduce the pre-route behaviour exactly: per-round clear, no retained rows,
@@ -2073,7 +2085,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // only decide whether this implementation is *capable* of catching up and seed the arrays
         // the per-request path writes into; a chain that cannot catch up leaves them empty and
         // begin() never touches them.
-        catchup_enabled = keep_kv && !is_remote;
+        catchup_enabled = keep_kv && !this->params.is_remote_tail();
         if (catchup_enabled) {
             catchup_mode.assign(n_seq, 0);
             catchup_pending.assign(n_seq, 0);
@@ -2184,7 +2196,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // [QLH-SPLIT] v8: a remote chain has no draft sampler here and no draft KV to inspect;
         // nothing in this hook applies. (The stage clears its own draft memory per round.)
-        if (is_remote) {
+        if (this->params.is_remote_tail()) {
             return;
         }
 
@@ -2238,7 +2250,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
-        if (pos_max < N - 1 && !is_mem_shared && !is_chain) {
+        if (pos_max < N - 1 && !is_mem_shared && !this->params.is_local_tail()) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
                     "(need_embd / output flag on every prompt position?). "
@@ -2360,7 +2372,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
         }
 
-        // A chain is single-head by construction: chain_heads is false whenever is_chain (the
+        // A chain is single-head by construction: chain_heads is false whenever is_local_tail (the
         // ctor derives it that way), so the multi-head rebuild the non-chain branch does here
         // cannot happen -- it needs the prompt's draft KV, which is exactly what this route
         // exists to skip. One decode, at the default layer offset.
@@ -2445,7 +2457,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // fed to the tail as *embeddings* (decode_split hands the head's hidden rows over), and
         // the draft would have to be replayed token by token with h shifted right by one -- a
         // full extra draft pass over the prompt -- only to build history that draft() never
-        // reads: draft() starts from a cleared draft KV (see is_chain there) and attends to the
+        // reads: draft() starts from a cleared draft KV (see is_local_tail there) and attends to the
         // k+1 positions it built in that round alone. So only the h rows are needed here, and
         // those come from the tail's own embeddings_nextn buffer (non-masked: one row per token
         // of the batch it just decoded, i.e. rows align 1:1 with the server batch indices).
@@ -2453,7 +2465,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // [QLH-SPLIT] v8: a *remote* chain skips it for the same reason and has no ctx_dft to run
         // it on anyway. Its h rows are the ones the tail sent back on the decode this hook follows
         // (llama_split_take_nextn_rows below), not an in-process buffer.
-        if (!is_mem_shared && !is_chain && !is_remote) {
+        if (!is_mem_shared && this->params.is_whole()) {
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -2557,7 +2569,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //     which is all a round needs (draft() starts from it).
             // Anything else leaves the previous pending_h alone; drafts then get verified like any
             // other, and a wrong draft costs speed, never correctness.
-            if (is_remote) {
+            if (this->params.is_remote_tail()) {
                 const float *  rows_got  = nullptr;
                 int32_t        row0      = -1;
                 uint32_t       rows_embd = 0;
@@ -2630,7 +2642,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // channel these drafts are checked against is only armed for a chain that samples the
         // argmax (common_sampler_verify_rows_check). A probabilistic drafter would need q over the
         // whole vocabulary on the wire, which is the cost this layer exists to avoid.
-        if (is_remote) {
+        if (this->params.is_remote_tail()) {
             auto * ctx_tgt = this->params.ctx_tgt;
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2697,7 +2709,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        if (is_chain && !is_mem_shared && !keep_kv) {
+        // [QLH-SPLIT] C7 (docs/OPEN-ISSUES.md): the `!is_mem_shared` conjunct is kept on purpose.
+        // It is implied for every arch a chain can carry today (a split head must be
+        // qwen35/qwen35moe, which drop ctx_other in the llama_context ctor), but it is not implied
+        // by construction -- a library caller can hand in a draft context whose ctx_other is the
+        // target, and clearing that KV would clear the *target's*. The simplification is therefore
+        // not behaviour-preserving in the general case, and the predicate now comes from the one
+        // chain-shape definition (params.is_local_tail()).
+        if (this->params.is_local_tail() && !is_mem_shared && !keep_kv) {
             // [QLH-SPLIT] v1's qlh_kh_mtp_reset, for the same reason it existed there: the
             // draft never saw the prompt (process() skips the catch-up), so a round must not
             // inherit rows from whatever the previous round / previous request left at the
@@ -3815,14 +3834,14 @@ common_speculative_init_result::common_speculative_init_result(
     // This is MTP-only: DFlash is a draft model with no tok_embd/output.weight, and its ctor
     // needs ctx_other (the target context) to borrow them -- clearing ctx_other here makes
     // llama_init_from_model throw "DFlash requires ctx_other to be set" / return nullptr.
-    const bool spec_chain = params.speculative.draft.ctx_tail != nullptr && spec_mtp;
+    const bool spec_chain = params.speculative.draft.is_local_tail() && spec_mtp;
     // [QLH-SPLIT] v8: a remote tail owns the MTP head, so there is no draft context to build in
     // this process at all. Building one here would be impossible anyway -- model_tgt is the head
     // range, which loads no NextN layers -- and the previous behaviour (refusing to start) is what
     // kept a remote chain on ngram drafts. ctx_tgt stays the head context (the chain driver, and
     // the only thing this process has); the drafts themselves go through
     // llama_context_split_mtp_draft().
-    const bool spec_remote = params.speculative.draft.ctx_tail_remote && spec_mtp;
+    const bool spec_remote = params.speculative.draft.is_remote_tail() && spec_mtp;
     if (spec_chain) {
         // 1. the shared params force the head's hidden export on (embeddings + pre-norm) since
         //    the head hands rows to the next stage. Inheriting that replaces the draft's logits
@@ -3951,7 +3970,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         // stage), so "ctx_dft != nullptr" is not the test for "MTP is available" -- ctx_tail_remote
         // is. Requiring the pointer here made the server log "no implementations specified for
         // speculative decoding" and silently serve without drafts.
-        const bool mtp_available = params.draft.ctx_dft != nullptr || params.draft.ctx_tail_remote;
+        const bool mtp_available = params.draft.ctx_dft != nullptr || params.draft.is_remote_tail();
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    mtp_available);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);

@@ -6090,7 +6090,9 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
-extern "C" void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+// [QLH-SPLIT] C6 (docs/OPEN-ISSUES.md): no `extern "C"` here -- llama-ext.h already declares these
+// with C linkage (and LLAMA_API), and a definition after such a declaration inherits it.
+void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
@@ -6134,7 +6136,7 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
-extern "C" float * llama_get_embeddings_nextn(llama_context * ctx) {
+float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();

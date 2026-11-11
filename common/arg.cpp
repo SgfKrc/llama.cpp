@@ -2894,7 +2894,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.split_remote.push_back(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // [QLH-SPLIT] Also offered to llama-cli: tools/cli spawns the very same llama-server in a
+    // thread (cli-server.h, `llama_server` as a library symbol) and talks to it over HTTP on a
+    // local port, so a CLI session can drive a chain exactly like the server does. Without this
+    // the only way to reach a remote tail from a terminal was the server's web UI.
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--split-rs-seq"}, "N",

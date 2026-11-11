@@ -919,6 +919,11 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 // while copy() nulled it. The rule is the same for both: the biases pointer is never carried
 // across samplers, because common_sampler_candidates_check() re-points it at the sampler it is
 // asked about. Everything else is a plain value copy.
+//
+// [QLH-SPLIT] C8 (docs/OPEN-ISSUES.md): `t_total_us` is deliberately NOT in this function. The two
+// call sites answer different questions -- clone() starts a new sampler (and its perf clock) from
+// zero, copy() restores a checkpoint and must carry the source's elapsed time -- so the field is
+// set at each call site instead of being quietly unified here.
 static void sampler_plan_copy(const common_sampler & src, common_sampler & dst) {
     dst.merged_bias      = src.merged_bias;
     dst.cand_first       = src.cand_first;
@@ -964,8 +969,16 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
+    // [QLH-SPLIT] C8 (docs/OPEN-ISSUES.md): re-point at dst's own buffer. The premise this line
+    // has always relied on is "the source's cur_p points at its own cur" -- that is what
+    // set_logits() and common_sampler_sample_candidates() establish, and what makes the copy a
+    // copy of an index into dst->cur rather than a pointer to src->cur. Assert it instead of
+    // leaving the premise unstated: a cur_p pointing anywhere else would now dangle.
+    GGML_ASSERT(src->cur_p.data == nullptr || src->cur_p.data == src->cur.data());
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    // [QLH-SPLIT] C8: copy() restores a checkpoint, so the source's elapsed sampling time comes
+    // with it; clone() does not (it starts a new sampler), see sampler_plan_copy().
     dst->t_total_us = src->t_total_us;
 
     // [QLH-SPLIT] v5/v7: the candidate plan and the verify analysis -- the same fields, and the
