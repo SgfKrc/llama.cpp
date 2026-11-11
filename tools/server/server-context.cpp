@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdint>   // [QLH-SPLIT] v7: INT32_MAX for the "no draft cap" sentinel
 #include <cinttypes>
+#include <cstdlib>   // [QLH-SPLIT] std::getenv, for the adaptive chain catch-up decision
 #include <deque>
 #include <exception>
 #include <memory>
@@ -4642,6 +4643,65 @@ private:
                         // (what "a new request" means for the keep-KV route) and resets the draft
                         // sampler, both of which are as true before the prefill as after it.
                         if (spec && slot.can_speculate()) {
+                            // [QLH-SPLIT] Adaptive chain catch-up -- the only behaviour change of
+                            // this round. "Unset" used to mean "off"; it now means "pick a mode
+                            // for this request", and the two quantities the choice needs are both
+                            // here: N_prompt is the request's token count, n_predict its own
+                            // generation budget (slot.n_predict_max is the per-request value, with
+                            // the server default already folded in).
+                            //
+                            //   N_prompt > 3 * n_predict -> no catch-up. The route costs
+                            //       N_prompt * 1.19 ms of draft decode (2000 prompt rows ~ 2.4 s),
+                            //       and it only buys a lower per-round cost, so a short generation
+                            //       never earns that back.
+                            //   n_predict <= 128         -> mode 2 (every batch). The 64-token tier
+                            //       nets 8.8% of generation time at the same acceptance as the
+                            //       whole model.
+                            //   otherwise                -> mode 1 (prefill only).
+                            //
+                            // n_predict < 0 is "no limit" (-1 until the context is full, -2 until
+                            // the client goes away): there is no 3 * n_predict to compare against,
+                            // so rule 1 cannot fire and the choice falls to rules 2/3, where a
+                            // negative value is emphatically NOT <= 128.
+                            //
+                            // An explicit QLH_CHAIN_DRAFT_CATCHUP (0/1/2) is the manual override
+                            // and disables all of this: the adaptive value is written to a
+                            // separate variable that the speculative layer only reads when the
+                            // explicit one is unset. That is what keeps "unset" and "=0" distinct.
+                            // Only a *local* chain has a tail in this process, and only a local
+                            // chain can catch up (speculative.cpp's catchup_enabled is
+                            // !is_remote && ctx_dft != nullptr). A remote chain and a whole model
+                            // would ignore the value silently, so they must not print a decision
+                            // either -- measured: on the --split-remote topology this line used to
+                            // claim "adaptive mode 2" while the draft ran in the stage and no
+                            // catch-up existed at all.
+                            if (params_base.speculative.draft.ctx_tail != nullptr &&
+                                    std::getenv("QLH_CHAIN_DRAFT_CATCHUP") == nullptr) {
+                                const int32_t n_prompt  = (int32_t) slot.task->n_tokens();
+                                const int32_t n_predict = slot.n_predict_max;
+
+                                int32_t mode = 1;
+                                if (n_predict > 0 && (int64_t) n_prompt > 3 * (int64_t) n_predict) {
+                                    mode = 0;
+                                } else if (n_predict > 0 && n_predict <= 128) {
+                                    mode = 2;
+                                }
+
+                                // The speculative layer is in common/ and its interface has no
+                                // per-request slot for this (deliberately: the server decides, the
+                                // implementation only obeys). The environment is the channel it
+                                // already used for the manual override, so the hand-off adds no
+                                // API; the write is immediately followed by begin() on this thread.
+                                common_set_env("QLH_CHAIN_DRAFT_CATCHUP_AUTO", std::to_string(mode));
+
+                                // Unconditional, not debug-gated: this line is what makes the
+                                // decision observable from a log a test can wait on.
+                                SLT_INF(slot, "[QLH-SPLIT] chain draft catch-up: adaptive mode %d "
+                                        "(N_prompt = %d, n_predict = %d%s)\n",
+                                        mode, n_prompt, n_predict,
+                                        n_predict <= 0 ? ", no limit" : "");
+                            }
+
                             common_speculative_begin(spec.get(), slot.id,
                                     slot.task->tokens.get_text_tokens());
                         }

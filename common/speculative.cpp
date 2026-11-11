@@ -1766,6 +1766,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// [QLH-SPLIT] chain catch-up mode requested by the user, or -1 when the variable is unset.
+//
+// -1 is the whole point: "unset" (adaptive) and "=0" (explicitly off) must not collapse into the
+// same value, or the adaptive default could never be reached and an explicit 0 could not be told
+// apart from it. An empty value counts as an explicit 0, matching what the variable meant before
+// this round (and what QLH_CHAIN_DRAFT_KEEP_KV still means).
+static int catchup_mode_env() {
+    const char * v = std::getenv("QLH_CHAIN_DRAFT_CATCHUP");
+    if (v == nullptr) {
+        return -1;
+    }
+    return (v[0] == '\0' || v[0] == '0') ? 0 : (v[0] == '2' ? 2 : 1);
+}
+
+// [QLH-SPLIT] chain catch-up mode the server picked for this request, or -1 when it wrote nothing
+// (a chain that cannot catch up, or an older server). The server writes it in batch_building only
+// when the explicit variable is unset, so the two never fight: the explicit one is read first.
+static int catchup_mode_auto() {
+    const char * v = std::getenv("QLH_CHAIN_DRAFT_CATCHUP_AUTO");
+    if (v == nullptr) {
+        return -1;
+    }
+    return (v[0] == '\0' || v[0] == '0') ? 0 : (v[0] == '2' ? 2 : 1);
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1822,7 +1847,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     size_t keep_kv_rounds = 0;               // rounds that continued from history
     size_t keep_kv_resets = 0;               // rounds that had to start from an empty draft KV
 
-    // [QLH-SPLIT] chain catch-up route (opt-in, off by default: QLH_CHAIN_DRAFT_CATCHUP=1 or =2).
+    // [QLH-SPLIT] chain catch-up route. Adaptive by default since the model-swap round; the
+    // QLH_CHAIN_DRAFT_CATCHUP environment variable still overrides it completely.
     //
     // keep_kv gave the draft a *reader* for rows below pos0; the prompt's rows were still absent
     // because process() skips its catch-up decode on a chain. A local chain has everything that
@@ -1836,7 +1862,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //       (exactly the keep_kv-only route for them).
     //   2 = every batch: same as the non-chain path, which runs this decode on every target
     //       batch, so accepted tokens also get the tail's real h back.
-    int chain_catchup = 0;
+    //
+    // [QLH-SPLIT] THE ONE BEHAVIOUR CHANGE of this round: "unset" used to mean 0 and now means
+    // "pick one per request". QLH_CHAIN_DRAFT_CATCHUP unset + QLH_CHAIN_DRAFT_CATCHUP_AUTO (which
+    // the server writes in batch_building, where N_prompt and n_predict are both in hand) decides:
+    //   N_prompt > 3 * n_predict  -> 0 (the replay costs N_prompt * 1.19 ms, more than it saves)
+    //   n_predict <= 128          -> 2 (every batch; the 64-token tier nets 8.8%)
+    //   otherwise                 -> 1 (prefill only)
+    // An *explicit* QLH_CHAIN_DRAFT_CATCHUP=0/1/2 wins outright and the adaptive default is never
+    // consulted -- "0" and "unset" must stay distinguishable, and that is what catchup_mode_env()
+    // below encodes. Nothing here needs the server to know this implementation's internals: the
+    // hand-off is the same environment channel the manual override already used (common_set_env /
+    // common_get_env are the repo's cross-platform wrappers for it).
+    int chain_catchup = 0;                   // mode of the most recent request (logging / stats)
+    bool catchup_enabled = false;            // this implementation can catch up at all
+    bool catchup_warned  = false;            // keep_kv-off warning printed once
+    std::vector<uint8_t>   catchup_mode;     // per-seq mode for the request in flight; 0 = off
     std::vector<uint8_t>   catchup_pending;  // 1 = this seq has not had its first draft() yet
     std::vector<llama_pos> catchup_pos;      // pos the next catch-up batch must start at; -2 = any
     size_t catchup_rows      = 0;            // rows written into the draft KV
@@ -2007,10 +2048,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // [QLH-SPLIT] chain catch-up: fills the draft KV that keep_kv then continues from. It is
         // only meaningful with keep_kv on (a per-round clear would throw the rows away again),
         // so a request for it without the route is refused loudly rather than silently wasted.
-        if (is_chain && !is_remote && !is_mem_shared && ctx_dft != nullptr) {
-            const char * v = std::getenv("QLH_CHAIN_DRAFT_CATCHUP");
-            if (v != nullptr && v[0] != '\0' && v[0] != '0') {
-                chain_catchup = v[0] == '2' ? 2 : 1;
+        //
+        // The per-request mode is resolved in begin() (see there), because the adaptive default
+        // needs N_prompt and n_predict and the server can only supply them per request. Here we
+        // only decide whether this implementation is *capable* of catching up and seed the arrays
+        // the per-request path writes into; a chain that cannot catch up leaves them empty and
+        // begin() never touches them.
+        catchup_enabled = is_chain && !is_remote && !is_mem_shared && ctx_dft != nullptr;
+        if (catchup_enabled) {
+            catchup_mode.assign(n_seq, 0);
+            catchup_pending.assign(n_seq, 0);
+            catchup_pos    .assign(n_seq, -2);
+
+            // An explicit variable is honoured from here on, including its keep_kv conflict check:
+            // that one is a configuration error, so it is reported once at startup, not per request.
+            const int forced = catchup_mode_env();
+            if (forced > 0) {
+                chain_catchup = forced;
                 if (!keep_kv) {
                     SPC_WRN("QLH_CHAIN_DRAFT_CATCHUP=%d needs the keep-KV route; it is off "
                             "(QLH_CHAIN_DRAFT_KEEP_KV=0), so the catch-up is disabled too\n",
@@ -2018,13 +2072,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     chain_catchup = 0;
                 }
             }
-        }
-        if (chain_catchup) {
-            catchup_pending.assign(n_seq, 0);
-            catchup_pos    .assign(n_seq, -2);
-            LOG_INF("%s: [QLH-SPLIT] chain draft catch-up ON (mode %d: %s), reading h rows from "
-                    "the tail's unmasked embeddings_nextn buffer\n",
-                    __func__, chain_catchup, chain_catchup == 1 ? "prefill only" : "every batch");
+            if (chain_catchup) {
+                LOG_INF("%s: [QLH-SPLIT] chain draft catch-up ON (mode %d: %s), reading h rows "
+                        "from the tail's unmasked embeddings_nextn buffer\n",
+                        __func__, chain_catchup, chain_catchup == 1 ? "prefill only" : "every batch");
+            }
         }
 
         this->n_max = this->params.n_max;
@@ -2080,8 +2132,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         std::string s = string_format("%zu round(s) continued from history, %zu started empty",
                 keep_kv_rounds, keep_kv_resets);
-        if (chain_catchup) {
-            s += string_format("; catch-up mode %d wrote %zu row(s), %zu fallback(s)",
+        if (catchup_enabled) {
+            // chain_catchup is the mode of the most recent request; the counters are cumulative,
+            // so a run that ended in mode 0 still reports the rows an earlier request wrote.
+            s += string_format("; catch-up mode %d (last request) wrote %zu row(s), %zu fallback(s)",
                     chain_catchup, catchup_rows, catchup_fallbacks);
         }
         return s;
@@ -2096,6 +2150,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_dft = this->params.ctx_dft;
 
+        // [QLH-SPLIT] chain catch-up: pick this request's mode before the prompt goes through
+        // process(), because that is the window the route fills. Precedence, highest first:
+        //   1. an explicit QLH_CHAIN_DRAFT_CATCHUP (0/1/2) -- the manual override, untouched;
+        //   2. QLH_CHAIN_DRAFT_CATCHUP_AUTO, written per request by the server's batch_building
+        //      from N_prompt and n_predict (see the field comment for the thresholds);
+        //   3. off, i.e. what an unset variable meant before this round.
+        // A mode that needs keep_kv but has none is refused (keep_kv's per-round clear would throw
+        // the rows away again) -- loudly, but once, not once per request.
+        if (catchup_enabled) {
+            int mode = catchup_mode_env();
+            if (mode < 0) {
+                mode = catchup_mode_auto();
+            }
+            if (mode < 0) {
+                mode = 0;
+            }
+            if (mode > 0 && !keep_kv) {
+                if (!catchup_warned) {
+                    catchup_warned = true;
+                    SPC_WRN("chain draft catch-up mode %d needs the keep-KV route; it is off "
+                            "(QLH_CHAIN_DRAFT_KEEP_KV=0), so the catch-up is disabled too\n", mode);
+                }
+                mode = 0;
+            }
+            chain_catchup     = mode;
+            catchup_mode[seq_id] = (uint8_t) mode;
+            if (mode > 0) {
+                // this request's first process() batch(es) are its prompt: that is the window
+                // mode 1 replays, and draft() closes it by consuming this flag.
+                catchup_pending[seq_id] = 1;
+                catchup_pos    [seq_id] = -2;
+            } else {
+                catchup_pending[seq_id] = 0;
+            }
+        }
+
         // [QLH-SPLIT] keep-KV route: a request boundary is the one place that must clear. Rows
         // the *previous* request left at the same positions are another token's state and would
         // be read silently -- that is exactly why the per-round clear existed (see draft()), and
@@ -2105,12 +2195,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, 0, -1);
             keep_kv_expected[seq_id] = -1;
             keep_kv_pos0    [seq_id] = -1;
-            if (chain_catchup) {
-                // this request's first process() batch(es) are its prompt: that is the window
-                // mode 1 replays, and draft() closes it by consuming this flag.
-                catchup_pending[seq_id] = 1;
-                catchup_pos    [seq_id] = -2;
-            }
         }
 
         // reset here rather than per round, or two identical requests differ
@@ -2148,7 +2232,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
-            if (chain_catchup == 1 && !catchup_pending[seq_id]) {
+            if (catchup_mode[seq_id] == 0) {
+                continue;
+            }
+            if (catchup_mode[seq_id] == 1 && !catchup_pending[seq_id]) {
                 continue;
             }
             want[seq_id] = 1;
@@ -2172,7 +2259,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!want[seq_id]) {
                 continue;
             }
-            if (chain_catchup == 2 && !catchup_pending[seq_id]) {
+            if (catchup_mode[seq_id] == 2 && !catchup_pending[seq_id]) {
                 continue;
             }
             const llama_pos pos_beg = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
@@ -2419,12 +2506,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // [QLH-SPLIT] chain catch-up (opt-in, see chain_catchup): the local chain has the same h
-        // rows the branch above reads, just on the tail's context, so the draft can be given the
-        // same history the non-chain path gives it. A failure here degrades the draft to "no
-        // history" and never fails the request -- and it has already cleared the sequence's draft
-        // KV, which is all draft() needs to know to start empty.
-        if (chain_catchup) {
+        // [QLH-SPLIT] chain catch-up (see catchup_mode): the local chain has the same h rows the
+        // branch above reads, just on the tail's context, so the draft can be given the same
+        // history the non-chain path gives it. A failure here degrades the draft to "no history"
+        // and never fails the request -- and it has already cleared the sequence's draft KV, which
+        // is all draft() needs to know to start empty.
+        //
+        // No per-seq pre-test here on purpose: chain_catchup_decode() starts by building its
+        // `want` mask from catchup_mode and returns immediately when no sequence wants a row,
+        // so a request that opted out costs one loop over n_seq per batch, nothing else.
+        if (catchup_enabled) {
             chain_catchup_decode(batch_in);
         }
 
@@ -2573,9 +2664,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // [QLH-SPLIT] chain catch-up, mode 1: the first draft() of a request is where the prompt
         // is known to be complete (the server only drafts from SLOT_STATE_DECODING), so the
         // prefill window closes here and later batches are left to keep_kv. Mode 2 replays every
-        // batch and does not care about the flag.
-        if (chain_catchup) {
-            std::fill(catchup_pending.begin(), catchup_pending.end(), (uint8_t) 0);
+        // batch and does not care about the flag -- but it is cleared for mode 2 as well, because
+        // chain_catchup_decode() reads "pending" as "this is the request's first batch" and uses it
+        // both for the position-continuity check and for setting keep_kv_expected (which accept()
+        // owns from the second round on). Only sequences that asked for the route are touched.
+        if (catchup_enabled) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (catchup_mode[seq_id] > 0) {
+                    catchup_pending[seq_id] = 0;
+                }
+            }
         }
 
         if (is_chain && !is_mem_shared && !keep_kv) {
@@ -2638,8 +2736,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             SPC_INF("draft KV: continuing from %d row(s) below pos0=%d "
                                     "(seq %d)%s\n",
                                     (int) pmax, (int) dp.pos0, (int) seq_id,
-                                    chain_catchup == 0 ? "; the prompt is still absent"
-                                                       : "; the prompt rows are the tail's own");
+                                    catchup_mode[seq_id] == 0 ? "; the prompt is still absent"
+                                                              : "; the prompt rows are the tail's own");
                         }
                     }
                 } else {
