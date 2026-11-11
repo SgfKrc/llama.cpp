@@ -584,6 +584,19 @@ int llama_split_remote::decode(const std::vector<float> & hidden,
 
     const uint32_t n_tok = (uint32_t) (hidden.size() / (n_embd == 0 ? 1 : n_embd));
 
+    // [QLH-SPLIT] The frame-size bounds are the *sender's* to enforce, not the stage's: a stage
+    // refuses an oversized frame only after these bytes are already on the wire, and its
+    // ST_BAD_REQ then leaves the stream desynchronized -- the next reply is read as this frame's
+    // body. Same two constants the stage checks with (llama-split-proto.h), so the two ends cannot
+    // drift apart on what "too large" means.
+    if (n_tok > qlh_split::MAX_TOKENS || n_embd > qlh_split::MAX_EMBD) {
+        err = "decode frame too large to send (n_tokens " + std::to_string(n_tok) +
+              ", n_embd " + std::to_string(n_embd) + "; MAX_TOKENS " +
+              std::to_string(qlh_split::MAX_TOKENS) + ", MAX_EMBD " +
+              std::to_string(qlh_split::MAX_EMBD) + ")";
+        return -1;
+    }
+
     // [QLH-SPLIT] v9: ask for the layer-input taps of this frame. Empty/null ids means "send no tap
     // request", which is what a whole-model and a local chain always have.
     const size_t n_tap_ask = tap.ids != nullptr ? tap.ids->size() : 0;

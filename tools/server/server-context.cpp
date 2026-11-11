@@ -4667,16 +4667,22 @@ private:
                             // An explicit QLH_CHAIN_DRAFT_CATCHUP (0/1/2) is the manual override
                             // and disables all of this: the adaptive value is written to a
                             // separate variable that the speculative layer only reads when the
-                            // explicit one is unset. That is what keeps "unset" and "=0" distinct.
+                            // explicit one is unset. That is what keeps "unset" and "=0" distinct,
+                            // and the test for "unset" is the speculative layer's own parser
+                            // (common_speculative_catchup_mode_read, common/speculative.h) rather
+                            // than a second getenv() here: the two answers have to be the same
+                            // parse, or the server writes a value the reader ignores (or the
+                            // reverse) on exactly the path nobody exercises.
                             // Only a *local* chain has a tail in this process, and only a local
-                            // chain can catch up (speculative.cpp's catchup_enabled is
-                            // !is_remote && ctx_dft != nullptr). A remote chain and a whole model
+                            // chain can catch up (common/speculative.cpp derives catchup_enabled
+                            // from keep_kv, which requires a local tail and an independent draft
+                            // KV). A remote chain and a whole model
                             // would ignore the value silently, so they must not print a decision
                             // either -- measured: on the --split-remote topology this line used to
                             // claim "adaptive mode 2" while the draft ran in the stage and no
                             // catch-up existed at all.
                             if (params_base.speculative.draft.ctx_tail != nullptr &&
-                                    std::getenv("QLH_CHAIN_DRAFT_CATCHUP") == nullptr) {
+                                    common_speculative_catchup_mode_read("QLH_CHAIN_DRAFT_CATCHUP") < 0) {
                                 const int32_t n_prompt  = (int32_t) slot.task->n_tokens();
                                 const int32_t n_predict = slot.n_predict_max;
 

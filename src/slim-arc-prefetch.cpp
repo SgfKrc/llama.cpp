@@ -109,6 +109,19 @@ void atomic_saturating_add(std::atomic<T> & target, T increment) noexcept {
     }
 }
 
+// [QLH] expert_hot_locked_bytes_ is unsigned, and both places that maintain it subtract from it.
+// A bookkeeping slip (an entry counted twice, or an eviction after a partially failed mlock) must
+// not wrap the counter around: the wrapped value is huge, so the headroom below turns into "no
+// room at all, ever", the eviction loop stops running, and the hot cache silently stops admitting
+// experts for the rest of the process. Both operations go through these two helpers instead.
+uint64_t hot_cache_release(uint64_t locked, uint64_t bytes) noexcept {
+    return locked > bytes ? locked - bytes : 0;
+}
+
+uint64_t hot_cache_headroom(uint64_t budget, uint64_t locked) noexcept {
+    return locked < budget ? budget - locked : 0;
+}
+
 void append_unique_nonnegative(std::vector<int> & ids, int id) {
     if (id >= 0 && std::find(ids.begin(), ids.end(), id) == ids.end()) {
         ids.push_back(id);
@@ -646,51 +659,98 @@ void prefetch_scheduler::shutdown() noexcept {
 
 void prefetch_scheduler::register_tensor(const char * name, void * addr, size_t size, int layer) {
     if (layer < 0 || addr == nullptr || size == 0) return;
-    std::lock_guard<std::mutex> lock(mtx_);
     if (stop_.load()) return;
-    if (shared_mlock_enabled_ && name != nullptr && std::strstr(name, "_shexp") != nullptr) {
-        const long raw_page_size = page_size_query_();
-        const page_range range = covering_page_range(
-            reinterpret_cast<uintptr_t>(addr),
-            size,
-            raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0);
-        if (range.valid && mlock(reinterpret_cast<void *>(range.address), range.length) == 0) {
-            shared_locked_ranges_.push_back(range);
-            atomic_saturating_add(shared_locked_bytes_, static_cast<uint64_t>(range.length));
+
+    // [QLH] Every decision that needs the page size, and every mlock() syscall, is taken before
+    // mtx_ is acquired: mlock can block on a page fault, and mtx_ is also taken by eval_cb() on
+    // the compute thread, so holding it across the syscall would park inference behind a model
+    // load. Only the bookkeeping below runs under the lock.
+    const bool lock_shared = shared_mlock_enabled_ && name != nullptr &&
+        std::strstr(name, "_shexp") != nullptr;
+    const bool lock_small = small_mlock_enabled_ && name != nullptr && size <= (1ULL << 20) &&
+        std::strstr(name, "_exps") == nullptr && std::strstr(name, "_shexp") == nullptr &&
+        std::strstr(name, "ffn_gate_inp") == nullptr;
+    // router 张量走独立的两张表，不进 tensors_by_layer_；但 return 只能在 is_router 时执行——
+    // 早先写成「开了 router_prefetch 或 router_mlock 就整块 return」，于是单独开
+    // SLIM_ARC_ROUTER_MLOCK=1 会把所有非 router 张量一起吞掉，tensors_by_layer_ 永远为空、
+    // 层预取一条都不发，而日志里没有任何错。
+    //
+    // [QLH] The gate is `router_mode && is_router`, not just `is_router`. With both router
+    // switches off (the default configuration) the router weight is an ordinary layer tensor and
+    // must stay in tensors_by_layer_: an unconditional `if (is_router) return;` would silently
+    // drop it from layer-ahead prefetch exactly when the router path is switched *off*. Do not
+    // "simplify" this back -- the only case that may return early is the one where the tensor was
+    // actually recorded in router_tensors_ / router_locked_ranges_ above.
+    const bool router_mode = router_prefetch_enabled_ || router_mlock_enabled_;
+    const bool is_router = name != nullptr && std::strstr(name, ".ffn_gate_inp") != nullptr &&
+        std::strstr(name, ".weight") != nullptr;
+    const bool lock_router = router_mode && is_router && router_mlock_enabled_;
+
+    const long   raw_page_size = (lock_shared || lock_small || lock_router) ? page_size_query_() : 0;
+    const size_t page_size = raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0;
+
+    page_range shared_range;
+    page_range small_range;
+    page_range router_range;
+    bool shared_locked = false;
+    bool small_locked  = false;
+    bool router_locked = false;
+    if (lock_shared) {
+        shared_range  = covering_page_range(reinterpret_cast<uintptr_t>(addr), size, page_size);
+        shared_locked = shared_range.valid &&
+            mlock(reinterpret_cast<void *>(shared_range.address), shared_range.length) == 0;
+    }
+    if (lock_small) {
+        small_range  = covering_page_range(reinterpret_cast<uintptr_t>(addr), size, page_size);
+        small_locked = small_range.valid &&
+            mlock(reinterpret_cast<void *>(small_range.address), small_range.length) == 0;
+    }
+    if (lock_router) {
+        router_range  = covering_page_range(reinterpret_cast<uintptr_t>(addr), size, page_size);
+        router_locked = router_range.valid &&
+            mlock(reinterpret_cast<void *>(router_range.address), router_range.length) == 0;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (stop_.load()) {
+        // Shut down between the mlock above and this lock. These pages are not in any of the
+        // tables the destructor sweeps, so they have to be released here or they stay locked for
+        // the rest of the process.
+        if (shared_locked) {
+            (void) munlock(reinterpret_cast<void *>(shared_range.address), shared_range.length);
+        }
+        if (small_locked) {
+            (void) munlock(reinterpret_cast<void *>(small_range.address), small_range.length);
+        }
+        if (router_locked) {
+            (void) munlock(reinterpret_cast<void *>(router_range.address), router_range.length);
+        }
+        return;
+    }
+    if (lock_shared) {
+        if (shared_locked) {
+            shared_locked_ranges_.push_back(shared_range);
+            atomic_saturating_add(shared_locked_bytes_, static_cast<uint64_t>(shared_range.length));
         } else {
             atomic_saturating_add(shared_lock_failures_, uint64_t{1});
         }
     }
-    if (small_mlock_enabled_ && name != nullptr && size <= (1ULL << 20) &&
-        std::strstr(name, "_exps") == nullptr && std::strstr(name, "_shexp") == nullptr &&
-        std::strstr(name, "ffn_gate_inp") == nullptr) {
-        const long raw_page_size = page_size_query_();
-        const page_range range = covering_page_range(
-            reinterpret_cast<uintptr_t>(addr),
-            size,
-            raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0);
-        if (range.valid && mlock(reinterpret_cast<void *>(range.address), range.length) == 0) {
-            small_locked_ranges_.push_back(range);
-            atomic_saturating_add(small_locked_bytes_, static_cast<uint64_t>(range.length));
+    if (lock_small) {
+        if (small_locked) {
+            small_locked_ranges_.push_back(small_range);
+            atomic_saturating_add(small_locked_bytes_, static_cast<uint64_t>(small_range.length));
         } else {
             atomic_saturating_add(small_lock_failures_, uint64_t{1});
         }
     }
-    if (router_prefetch_enabled_ || router_mlock_enabled_) {
-        const bool is_router = name != nullptr && std::strstr(name, ".ffn_gate_inp") != nullptr &&
-            std::strstr(name, ".weight") != nullptr;
-        if (is_router && router_prefetch_enabled_) {
+    if (router_mode && is_router) {
+        if (router_prefetch_enabled_) {
             router_tensors_.push_back({addr, size, layer, 0});
         }
-        if (is_router && router_mlock_enabled_) {
-            const long raw_page_size = page_size_query_();
-            const page_range range = covering_page_range(
-                reinterpret_cast<uintptr_t>(addr),
-                size,
-                raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0);
-            if (range.valid && mlock(reinterpret_cast<void *>(range.address), range.length) == 0) {
-                router_locked_ranges_.push_back(range);
-                atomic_saturating_add(router_locked_bytes_, static_cast<uint64_t>(range.length));
+        if (router_mlock_enabled_) {
+            if (router_locked) {
+                router_locked_ranges_.push_back(router_range);
+                atomic_saturating_add(router_locked_bytes_, static_cast<uint64_t>(router_range.length));
             } else {
                 atomic_saturating_add(router_lock_failures_, uint64_t{1});
             }
@@ -725,16 +785,20 @@ void prefetch_scheduler::attach_user_callback(ggml_backend_sched_eval_callback c
 
 void prefetch_scheduler::prepare_graph(const ggml_cgraph * gf) {
     if (gf == nullptr) return;
-    // the graph-reuse path calls this again for the very same graph; the tables cannot have
-    // changed because the tensors were not rebuilt
-    if (prepared_gf_ == gf) return;
 
     std::lock_guard<std::mutex> lock(mtx_);
+
+    // the graph-reuse path calls this again for the very same graph; the tables cannot have
+    // changed because the tensors were not rebuilt. [QLH] The idempotency check is inside the
+    // lock: eval_cb() reads prepared_gf_'s consequences (observe_/observe_layer_) on the compute
+    // thread, so the whole "is it the same graph" decision belongs to the same critical section
+    // that publishes the tables.
+    if (prepared_gf_ == gf) return;
 
     prepared_gf_ = gf;
     observe_.clear();
     observe_layer_.clear();
-    last_notified_ = -1;
+    last_notified_.store(-1, std::memory_order_relaxed);
     graph_signalling_disabled_ = false;
 
     auto * graph = const_cast<ggml_cgraph *>(gf);
@@ -795,12 +859,18 @@ void prefetch_scheduler::prepare_graph(const ggml_cgraph * gf) {
 
 void prefetch_scheduler::on_layer_boundary(int32_t layer) {
     if (layer < 0) return;
+    // [QLH] last_notified_ is written here (compute thread) and reset by prepare_graph()
+    // (context thread), so it is atomic. Relaxed is enough: the value only suppresses a duplicate
+    // advice for a layer already covered by the previous request, it publishes nothing else.
+    int32_t previous = last_notified_.load(std::memory_order_relaxed);
     // the layer counter wraps at the start of every token
-    if (last_notified_ >= 0 && layer < last_notified_) last_notified_ = -1;
-    // the request issued for `last_notified_` already covers [last+1, last+window]; issuing
+    if (previous >= 0 && layer < previous) {
+        previous = -1;
+    }
+    // the request issued for `previous` already covers [previous+1, previous+window]; issuing
     // another one for a layer inside that window would advise the same pages twice
-    if (last_notified_ >= 0 && layer - last_notified_ < window_) return;
-    last_notified_ = layer;
+    if (previous >= 0 && layer - previous < window_) return;
+    last_notified_.store(layer, std::memory_order_relaxed);
     notify_layer_compute(layer);
 }
 
@@ -808,24 +878,44 @@ bool prefetch_scheduler::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     auto * sched = static_cast<prefetch_scheduler *>(user_data);
     if (sched == nullptr || t == nullptr) return true;
 
-    const bool has_user = sched->user_cb_ != nullptr;
-    const bool user_ret = has_user && sched->user_cb_(t, ask, sched->user_cb_data_);
+    // [QLH] The chained user callback (attach_user_callback) and the layer-boundary tables
+    // (prepare_graph) are both owned by the context thread, while this callback runs on the
+    // compute thread: a graph rebuild would otherwise clear/swap observe_ under the reader.
+    // Everything is therefore *read* under mtx_, and the lock is dropped before either the user
+    // callback runs or on_layer_boundary() is entered -- both may re-enter this class, and
+    // notify_layer_compute() takes mtx_ again, so holding it across the call would deadlock on a
+    // non-recursive mutex.
+    ggml_backend_sched_eval_callback user_cb      = nullptr;
+    void *                          user_cb_data = nullptr;
+    int32_t                         boundary_layer = -1;
+    bool                            signalling_disabled = false;
+    {
+        std::lock_guard<std::mutex> lock(sched->mtx_);
+        user_cb      = sched->user_cb_;
+        user_cb_data = sched->user_cb_data_;
+        signalling_disabled = sched->graph_signalling_disabled_;
+        if (!signalling_disabled) {
+            const auto it = std::lower_bound(sched->observe_.begin(), sched->observe_.end(),
+                                             static_cast<const ggml_tensor *>(t));
+            if (it != sched->observe_.end() && *it == t) {
+                boundary_layer =
+                    sched->observe_layer_[static_cast<size_t>(it - sched->observe_.begin())];
+            }
+        }
+    }
+
+    const bool has_user = user_cb != nullptr;
+    const bool user_ret = has_user && user_cb(t, ask, user_cb_data);
 
     if (ask) {
         // returning true makes the scheduler stop at this node to hand it back with ask == false
         if (user_ret) return true;
-        if (sched->graph_signalling_disabled_) return false;
-        return std::binary_search(sched->observe_.begin(), sched->observe_.end(),
-                                  static_cast<const ggml_tensor *>(t));
+        if (signalling_disabled) return false;
+        return boundary_layer >= 0;
     }
 
-    if (!sched->graph_signalling_disabled_) {
-        const auto it = std::lower_bound(sched->observe_.begin(), sched->observe_.end(),
-                                         static_cast<const ggml_tensor *>(t));
-        if (it != sched->observe_.end() && *it == t) {
-            const size_t index = static_cast<size_t>(it - sched->observe_.begin());
-            sched->on_layer_boundary(sched->observe_layer_[index]);
-        }
+    if (boundary_layer >= 0) {
+        sched->on_layer_boundary(boundary_layer);
     }
 
     // keep the user's cancel semantics; without a user callback the compute always continues
@@ -1042,6 +1132,46 @@ void prefetch_scheduler::worker_loop() {
     }
 }
 
+// ============================================================================================
+// [QLH] NOT WIRED UP -- kept for future work, not for current behaviour.
+//
+// WHAT THIS IS: the complete MoE expert path -- expert tensor registration, router observation,
+// cross-layer transition prediction, hot-expert residency (mlock), page reclaim, popularity /
+// confidence gating and the residency budget. It was ported along with SLIM-ARC so that a later
+// change can switch it on without re-deriving any of it.
+//
+// CURRENT STATE: nothing in this repository calls it. Every entry point below has exactly zero
+// external references in src/, tools/, common/ and examples/:
+//     register_expert_tensor   cache_router_experts   prefetch_experts   cancel_expert_prefetch
+//     set_expert_residency_pressure   set_expert_budget   reset_expert_budget_usage
+//     budget_stats   expert_*_statistics
+// All three consequences are silent:
+//   - the expert counters printed by dump_metrics() ([SLIM-ARC-METRICS], [SLIM-ARC-HOT],
+//     [SLIM-ARC-TRANSITION], [SLIM-ARC-EXPERT-MADV]) are always zero, so the summary cannot
+//     distinguish "not wired" from "wired and idle";
+//   - expert_pressure_ only ever changes through set_expert_residency_pressure(), which is also
+//     never called, so it stays expert_pressure_state::missing; select_resident_experts() then
+//     takes its "no pressure signal" path and admits every candidate that fits the budget, i.e.
+//     the residency policy degenerates to pass-through even with SLIM_ARC_EXPERT_RESIDENCY=1;
+//   - SLIM_ARC_EXPERT_HOT_MB has no effect, because update_expert_hot_cache() is only reachable
+//     from cache_router_experts().
+//
+// HOW TO WIRE IT (in this order):
+//   1. llama-model-loader: next to the existing register_tensor() call, call
+//      register_expert_tensor(name, addr, ggml_nbytes(t), layer, n_experts = ne[2]) for every
+//      merged *_exps tensor, and register_mapping() for the mapping it lives in (the file-offset
+//      advice path needs the file id).
+//   2. Feed a real pressure source: sample expert-page residency (mincore() on POSIX,
+//      QueryWorkingSetEx() on Windows) into an expert_pressure_sample and drive
+//      expert_pressure_controller::update(). That controller is NOT a member of
+//      prefetch_scheduler yet -- set_expert_residency_pressure() currently takes the state as a
+//      parameter, so the controller has to be added here and its return value passed instead.
+//   3. On the layer boundary that already exists (on_layer_boundary / notify_layer_compute),
+//      call prefetch_experts(layer, ids, n) with the router's selection, then settle the same
+//      generation with cache_router_experts(layer, ids, n, generation).
+// Until all three exist, treat everything below as unreachable and do not read its counters as
+// evidence about a run.
+// ============================================================================================
 // ---- SLIM-ARC FIX 2026-08-05: Phase 2a MoE expert prefetch ----
 void prefetch_scheduler::register_expert_tensor(const char *, void * addr, size_t size, int layer, int n_experts) {
     if (addr == nullptr || size == 0 || n_experts < 1 || layer < 0) return;
@@ -1467,7 +1597,7 @@ void prefetch_scheduler::update_expert_hot_cache(
             for (const page_range & range : entry->ranges) {
                 (void) munlock(reinterpret_cast<void *>(range.address), range.length);
             }
-            expert_hot_locked_bytes_ -= entry->locked_bytes;
+            expert_hot_locked_bytes_ = hot_cache_release(expert_hot_locked_bytes_, entry->locked_bytes);
             expert_hot_evictions_ = saturating_add(expert_hot_evictions_, uint64_t{1});
             entry = expert_hot_entries_.erase(entry);
         }
@@ -1526,7 +1656,8 @@ void prefetch_scheduler::update_expert_hot_cache(
             continue;
         }
         if (expert_hot_lru_enabled_) {
-            while (candidate_bytes > static_cast<uint64_t>(expert_hot_budget_bytes_) - expert_hot_locked_bytes_) {
+            while (candidate_bytes > hot_cache_headroom(
+                       static_cast<uint64_t>(expert_hot_budget_bytes_), expert_hot_locked_bytes_)) {
                 auto victim = expert_hot_entries_.end();
                 for (auto entry = expert_hot_entries_.begin(); entry != expert_hot_entries_.end(); ++entry) {
                     const bool selected_now = entry->layer == layer && std::find(
@@ -1562,12 +1693,13 @@ void prefetch_scheduler::update_expert_hot_cache(
                 for (const page_range & range : victim->ranges) {
                     (void) munlock(reinterpret_cast<void *>(range.address), range.length);
                 }
-                expert_hot_locked_bytes_ -= victim->locked_bytes;
+                expert_hot_locked_bytes_ = hot_cache_release(expert_hot_locked_bytes_, victim->locked_bytes);
                 expert_hot_evictions_ = saturating_add(expert_hot_evictions_, uint64_t{1});
                 expert_hot_entries_.erase(victim);
             }
         }
-        if (candidate_bytes > static_cast<uint64_t>(expert_hot_budget_bytes_) - expert_hot_locked_bytes_) {
+        if (candidate_bytes > hot_cache_headroom(
+                static_cast<uint64_t>(expert_hot_budget_bytes_), expert_hot_locked_bytes_)) {
             expert_hot_budget_rejections_ = saturating_add(expert_hot_budget_rejections_, uint64_t{1});
             continue;
         }

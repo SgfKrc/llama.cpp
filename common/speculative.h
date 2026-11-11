@@ -102,6 +102,16 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// [QLH-SPLIT] parse a chain catch-up mode from an environment variable: 0/1/2, or -1 when the
+// variable is unset (an empty value counts as an explicit 0).
+//
+// One implementation, deliberately exported rather than file-local: the server asks this to decide
+// whether the user set the override at all -- it only writes QLH_CHAIN_DRAFT_CATCHUP_AUTO when
+// this returns -1 -- and the speculative layer asks it to read that value back. Two readers of one
+// variable must not disagree about what "unset" means, or "the adaptive default" silently becomes
+// "off" (or the other way round) on the one path nobody tests.
+int common_speculative_catchup_mode_read(const char * name);
+
 // [QLH-SPLIT] true when an implementation keeps its own draft KV across rounds (the keep-KV chain
 // route, QLH_CHAIN_DRAFT_KEEP_KV). The server must then skip its per-round trim of the draft KV
 // after draft(): the rows of the round that was just made are the history this route exists for,

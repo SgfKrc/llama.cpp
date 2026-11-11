@@ -203,17 +203,37 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
-// [QLH-SPLIT] v5: is a penalties step a no-op? Mirrors llama_sampler_penalties::is_disabled()
-// exactly, because the decision here is "does the tail have to run it", and a disagreement with
-// the library would either drop a real penalty or send parameters nobody uses.
+// [QLH-SPLIT] v5/v7: the four "is this step a no-op on this request" predicates.
+//
+// They live here, together and above both chain analyses, because there are two analyses (the
+// candidate split and the argmax proof) and four steps, and the previous version had two of the
+// eight answers inlined inside one of the analyses. A no-op step is safe on *both* channels and a
+// live one is a reason to refuse on both, so the two analyses must ask the same question.
+//
+// Each mirrors the library's own early-out exactly; the file/line is recorded so a future change
+// there can be found. The library cannot be asked directly: the samplers are file-local structs in
+// src/llama-sampler.cpp and there is no accessor for their disabled state.
+//   penalties : llama_sampler_penalties::is_disabled()
+//   DRY       : llama_sampler_dry_apply(), the first three lines
+//   typical   : llama_sampler_typical_apply(), p >= 1.0f
+//   XTC       : llama_sample_xtc_apply(), probability <= 0 || threshold > 0.5
 static bool cand_penalties_enabled(const common_params_sampling & p) {
     return p.penalty_last_n != 0 &&
            !(p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f);
 }
 
-// Same for DRY (llama_sampler_dry_apply's early-out).
 static bool cand_dry_enabled(const common_params_sampling & p) {
     return p.dry_multiplier != 0.0f && p.dry_base >= 1.0f && p.dry_penalty_last_n != 0;
+}
+
+// typ_p >= 1 is the default and returns immediately, i.e. a no-op.
+static bool cand_typical_enabled(const common_params_sampling & p) {
+    return p.typ_p < 1.0f;
+}
+
+// probability <= 0 is the default and returns immediately; a threshold above 0.5 does too.
+static bool cand_xtc_enabled(const common_params_sampling & p) {
+    return p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f;
 }
 
 // [QLH-SPLIT] v5: where can this chain be cut?
@@ -387,19 +407,19 @@ static bool verify_plan_chain(
                 // Prune the tail, or rescale monotonically; the maximum stays the maximum.
                 break;
             case COMMON_SAMPLER_TYPE_TYPICAL_P:
-                // llama_sampler_typical_apply returns immediately at p >= 1, which is the default.
-                // Below that it keeps the tokens whose log-probability is close to the entropy --
-                // a ranking that can leave the maximum out, so it must not be used here.
-                if (params.typ_p >= 1.0f) {
+                // A no-op at the default typ_p >= 1 (cand_typical_enabled). Below that it keeps
+                // the tokens whose log-probability is close to the entropy -- a ranking that can
+                // leave the maximum out, so it must not be used here.
+                if (!cand_typical_enabled(params)) {
                     break;
                 }
                 why = "typical sampling is enabled (typ_p < 1), and it can drop the argmax";
                 return false;
             case COMMON_SAMPLER_TYPE_XTC:
-                // llama_sample_xtc_apply is a no-op at probability <= 0 (the default) and at
-                // threshold > 0.5. Above that it removes the top choices on purpose, which is
+                // A no-op at the default (probability <= 0, or a threshold above 0.5); see
+                // cand_xtc_enabled. Above that it removes the top choices on purpose, which is
                 // exactly the token this channel assumes survives.
-                if (params.xtc_probability <= 0.0f || params.xtc_threshold > 0.5f) {
+                if (!cand_xtc_enabled(params)) {
                     break;
                 }
                 why = "XTC is enabled, and it removes the top choices on purpose";
@@ -413,7 +433,8 @@ static bool verify_plan_chain(
     return true;
 }
 
-std::string common_params_sampling::print() const {    char result[1024];
+std::string common_params_sampling::print() const {
+    char result[1024];
 
     snprintf(result, sizeof(result),
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
@@ -666,6 +687,13 @@ struct common_sampler * common_sampler_init(
                     GGML_ASSERT(false && "unknown sampler type");
             }
 
+            // [QLH-SPLIT] v5: record which step each push is, so the candidate split can be
+            // analysed without parsing sampler names. Every case above adds at most one sampler
+            // (adaptive-p adds none here: it is appended after this loop and is not a chain step),
+            // so the count of new entries is exactly the number of types to record. The assert is
+            // what keeps that true -- a case that pushed two would be recorded as one type twice,
+            // and both analyses would then reason about a chain that does not exist.
+            GGML_ASSERT(samplers.size() - n_before <= 1);
             for (size_t i = n_before; i < samplers.size(); ++i) {
                 s_types.push_back(cnstr);
             }
@@ -882,8 +910,31 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
+// [QLH-SPLIT] v5/v7: the per-sampler analysis that has to travel with the sampler.
+//
+// One function for both paths that reproduce a sampler -- clone() builds a new one, copy()
+// restores a checkpoint into an existing one -- because the previous version listed the same six
+// fields twice and the two lists already disagreed: clone() copied `cand_full` verbatim, which
+// carries a pointer into the *source* sampler's merged_bias (dangling as soon as the source dies),
+// while copy() nulled it. The rule is the same for both: the biases pointer is never carried
+// across samplers, because common_sampler_candidates_check() re-points it at the sampler it is
+// asked about. Everything else is a plain value copy.
+static void sampler_plan_copy(const common_sampler & src, common_sampler & dst) {
+    dst.merged_bias      = src.merged_bias;
+    dst.cand_first       = src.cand_first;
+    dst.cand_full        = src.cand_full;
+    dst.cand_why         = src.cand_why;
+    dst.cand_full.biases = nullptr;
+
+    // [QLH-SPLIT] v7: the verify analysis is a pure function of the chain's construction, so a
+    // copy agrees with the source by definition; copying it keeps a restored sampler's plan
+    // identical to the one the request started with.
+    dst.verify_ok        = src.verify_ok;
+    dst.verify_why       = src.verify_why;
+}
+
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -892,13 +943,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
-        /* .merged_bias = */ gsmpl->merged_bias,
-        /* .cand_first  = */ gsmpl->cand_first,
-        /* .cand_full   = */ gsmpl->cand_full,
-        /* .cand_why    = */ gsmpl->cand_why,
-        /* .verify_ok   = */ gsmpl->verify_ok,
-        /* .verify_why  = */ gsmpl->verify_why,
     };
+    sampler_plan_copy(*gsmpl, *result);
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -921,20 +968,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 
-    // [QLH-SPLIT] v5: the candidate plan. The biases pointer mirrors merged_bias, so it is never
-    // copied -- it is re-pointed below, or a checkpoint restore would hand the caller the other
-    // sampler's list.
-    dst->merged_bias = src->merged_bias;
-    dst->cand_first  = src->cand_first;
-    dst->cand_full   = src->cand_full;
-    dst->cand_why    = src->cand_why;
-    dst->cand_full.biases = nullptr;
-
-    // [QLH-SPLIT] v7: the verify analysis is a pure function of the chain's construction, so a
-    // copy agrees with the source by definition; copying it keeps a restored sampler's plan
-    // identical to the one the request started with.
-    dst->verify_ok  = src->verify_ok;
-    dst->verify_why = src->verify_why;
+    // [QLH-SPLIT] v5/v7: the candidate plan and the verify analysis -- the same fields, and the
+    // same rule for the biases pointer, as a clone (see sampler_plan_copy).
+    sampler_plan_copy(*src, *dst);
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -1106,7 +1142,8 @@ bool common_sampler_verify_rows_check(
 
 uint32_t common_sampler_candidates_history(
         const struct common_sampler * gsmpl,
-        std::vector<llama_token> & out) {    out.clear();
+        std::vector<llama_token> & out) {
+    out.clear();
     if (gsmpl == nullptr) {
         return 0;
     }

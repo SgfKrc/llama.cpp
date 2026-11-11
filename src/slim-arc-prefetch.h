@@ -193,7 +193,17 @@ class prefetch_scheduler {
     void set_memory_budget(size_t bytes) { memory_budget_.store(bytes); }
     prefetch_budget_stats budget_stats() const;
 
-    // Phase 2a: register MoE expert tensors (merged 3D tensor *_exps)
+    // ========================================================================================
+    // [QLH] NOT WIRED UP. Every expert-path method declared from here to the end of the class
+    // has zero callers in this repository (see the long note at the top of the implementation in
+    // slim-arc-prefetch.cpp, "NOT WIRED UP"). They are kept for future integration, not because
+    // anything runs them: register_expert_tensor / cache_router_experts / prefetch_experts /
+    // cancel_expert_prefetch / set_expert_residency_pressure / set_expert_budget /
+    // reset_expert_budget_usage / budget_stats / expert_*_statistics are all unreachable today,
+    // so their counters stay zero and SLIM_ARC_EXPERT_* have no effect. Do not read a declaration
+    // here as "this is active".
+    // ========================================================================================
+    // Phase 2a: register MoE expert tensors (merged 3D tensor *_exps)  [NOT WIRED]
     void register_expert_tensor(const char * name, void * addr, size_t size, int layer, int n_experts);
     // Cache the expert IDs the router selected for this layer (for cross-layer prediction)
     void cache_router_experts(int layer, const int * expert_ids, int n);
@@ -472,8 +482,11 @@ class prefetch_scheduler {
     std::vector<const ggml_tensor *>                observe_;
     // layer index of the matching observe_ entry (not sorted: it follows observe_)
     std::vector<int32_t>                            observe_layer_;
-    // last layer we issued a request for; reset when the layer counter wraps (= new token)
-    int32_t                                         last_notified_ = -1;
+    // last layer we issued a request for; reset when the layer counter wraps (= new token).
+    // [QLH] Atomic: written by on_layer_boundary() on the compute thread and reset by
+    // prepare_graph() on the context thread (the other two tables above are protected by mtx_,
+    // this one is a single word and does not need the lock on the hot path).
+    std::atomic<int32_t>                            last_notified_{-1};
     // graph the tables above were built from, for idempotency across the graph-reuse path
     const ggml_cgraph *                             prepared_gf_ = nullptr;
     // set when the scan could not recover layer boundaries; eval_cb then degrades to the user cb

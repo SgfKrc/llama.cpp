@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -278,9 +279,15 @@ static void timing_report(const frame_timer & t) {
 // case: any write that follows unacknowledged data leaves immediately).
 static constexpr size_t kCoalesceMax = 1400; // one Ethernet MTU minus a little, header included
 
-static bool reply(sock_t s, status st, uint32_t n_tokens, uint32_t n_embd, uint32_t n_vocab,
-                  const void * data, size_t data_bytes, int32_t pos_max = -1, uint32_t n_bytes = 0,
-                  uint8_t flags = 0, uint8_t n_taps = 0) {
+// [QLH-SPLIT] v10: the one place a reply header is built.
+//
+// It used to be written out twice -- once in reply(), once in reply_parts() -- ten fields each,
+// identical except for the order their arguments arrived in. That is the state where the next
+// field gets added to one of the two copies and not the other, and the symptom would be a header
+// the peer parses with a field still zero. A header is a pure function of these numbers, so it is
+// one function now and both call paths go through it.
+static rsp_header make_rsp_header(status st, uint32_t n_tokens, uint32_t n_embd, uint32_t n_vocab,
+                                  int32_t pos_max, uint32_t n_bytes, uint8_t flags, uint8_t n_taps) {
     rsp_header h{};
     h.magic    = MAGIC;
     h.version  = PROTO_VER;
@@ -292,16 +299,7 @@ static bool reply(sock_t s, status st, uint32_t n_tokens, uint32_t n_embd, uint3
     h.n_vocab  = n_vocab;
     h.pos_max  = pos_max;
     h.n_bytes  = n_bytes;
-    if (data_bytes > 0 && data_bytes <= kCoalesceMax) {
-        return net::send_two(s, &h, sizeof(h), data, data_bytes);
-    }
-    if (!net::send_all(s, &h, sizeof(h))) {
-        return false;
-    }
-    if (data_bytes > 0 && !net::send_all(s, data, data_bytes)) {
-        return false;
-    }
-    return true;
+    return h;
 }
 
 // [QLH-SPLIT] v8: a reply whose body is up to three sections, sent as one header plus each
@@ -310,24 +308,21 @@ static bool reply(sock_t s, status st, uint32_t n_tokens, uint32_t n_embd, uint3
 // The two-section cases are the ones v8 introduces: a verify frame answers token ids *and* h_nextn
 // rows (id array, then rows), and a plain frame answers the logits row *and* one h row. Neither may
 // be collapsed into one buffer: the logits row is ~1 MB, and copying it to glue 16 KB onto it
-// would be a memcpy on the per-token path. The coalescing rule of reply() is kept for the small
+// would be a memcpy on the per-token path. The coalescing rule of kCoalesceMax is kept for the small
 // case (header + candidates), which is the frame Nagle actually delayed.
+//
+// [QLH-SPLIT] v10: this replaced reply(). There is no second reply path any more -- a one-section
+// body is this function with p2/p3 defaulted, which is why every former reply() call site now says
+// reply_parts(..., p1, n1) and nothing else. The header's trailing fields default too, so the
+// common "refuse this frame" answer stays five arguments long.
 static bool reply_parts(sock_t s, status st, uint32_t n_tokens, uint32_t n_embd, uint32_t n_vocab,
-                        int32_t pos_max, uint32_t n_bytes, uint8_t flags, uint8_t n_taps,
-                        const void * p1, size_t n1,
-                        const void * p2, size_t n2,
-                        const void * p3, size_t n3) {
-    rsp_header h{};
-    h.magic    = MAGIC;
-    h.version  = PROTO_VER;
-    h.status   = (uint8_t) st;
-    h.flags    = flags;
-    h.n_taps   = n_taps;
-    h.n_tokens = n_tokens;
-    h.n_embd   = n_embd;
-    h.n_vocab  = n_vocab;
-    h.pos_max  = pos_max;
-    h.n_bytes  = n_bytes;
+                        int32_t pos_max = -1, uint32_t n_bytes = 0, uint8_t flags = 0,
+                        uint8_t n_taps = 0,
+                        const void * p1 = nullptr, size_t n1 = 0,
+                        const void * p2 = nullptr, size_t n2 = 0,
+                        const void * p3 = nullptr, size_t n3 = 0) {
+    const rsp_header h = make_rsp_header(st, n_tokens, n_embd, n_vocab, pos_max, n_bytes,
+                                         flags, n_taps);
 
     const std::pair<const void *, size_t> parts[3] = { { p1, n1 }, { p2, n2 }, { p3, n3 } };
 
@@ -509,35 +504,74 @@ struct stage_options {
 };
 
 
-// [QLH-SPLIT] v9: a thread count, parsed so that a non-number is a sentence and not an exception.
-static int32_t parse_int(const std::string & v, const char * flag) {
+// [QLH-SPLIT] v9: every numeric flag is parsed here, so that a non-number is a sentence and not an
+// exception.
+//
+// The two-way split was the defect: `-t abc` went through this function and printed a sentence,
+// while `--port abc` went through std::stoi and left main() with "terminate called after throwing
+// an instance of 'std::invalid_argument'" and nothing about ports. A stage that exits for the wrong
+// stated reason is how the next person loses an hour, so there is one parser now.
+//
+// The range is int32 because that is what every field it feeds is. A value outside it is a typo,
+// not a large number, and is refused here rather than silently truncated by the cast at the
+// assignment (which is how `-c -1` used to become 4294967295 and ask for a 4 GiB KV cache).
+static bool parse_i32(const std::string & v, const char * flag, int32_t & out) {
     char * end = nullptr;
+    errno = 0;
     const long x = std::strtol(v.c_str(), &end, 10);
-    if (end == v.c_str() || (end != nullptr && *end != '\0')) {
+    if (end == v.c_str() || (end != nullptr && *end != '\0') || errno == ERANGE ||
+        x < INT32_MIN || x > INT32_MAX) {
         fprintf(stderr, "%s expects an integer (got '%s')\n", flag, v.c_str());
-        exit(1);
+        return false;
     }
-    return (int32_t) x;
+    out = (int32_t) x;
+    return true;
 }
 
 static int parse_args(int argc, char ** argv, stage_options & o) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        auto next = [&](const char * name) -> std::string {
+        // [QLH-SPLIT] v10: nothing in here calls exit() any more. parse_args returns non-zero and
+        // main is the single exit, so a half-parsed stage_options is never acted on.
+        auto next = [&](const char * name, std::string & out) -> bool {
             if (i + 1 >= argc) {
                 fprintf(stderr, "missing value for %s\n", name);
-                exit(1);
+                return false;
             }
-            return argv[++i];
+            out = argv[++i];
+            return true;
         };
-        if      (a == "-m" || a == "--model")           { o.model_path = next("-m"); }
-        else if (a == "--role")                         { o.role    = next("--role"); }
-        else if (a == "--host")                         { o.host    = next("--host"); }
-        else if (a == "--layer-range") {
+        auto take_i32 = [&](const char * flag, int32_t & dst) -> bool {
+            std::string v;
+            return next(flag, v) && parse_i32(v, flag, dst);
+        };
+        // A value stored in an unsigned field: a negative one would wrap to 4 billion at the cast,
+        // so it is refused where the operator can still see the number they typed.
+        auto take_u32 = [&](const char * flag, uint32_t & dst) -> bool {
+            int32_t v = 0;
+            if (!take_i32(flag, v)) {
+                return false;
+            }
+            if (v < 0) {
+                fprintf(stderr, "%s must be >= 0 (got %d)\n", flag, v);
+                return false;
+            }
+            dst = (uint32_t) v;
+            return true;
+        };
+
+        if (a == "-m" || a == "--model") {
+            if (!next("-m", o.model_path)) { return 1; }
+        } else if (a == "--role") {
+            if (!next("--role", o.role)) { return 1; }
+        } else if (a == "--host") {
+            if (!next("--host", o.host)) { return 1; }
+        } else if (a == "--layer-range") {
             // A half-parsed range used to start a stage on the default -1:-1 (or on a lo that
             // sscanf wrote before it stopped), which is a stage serving a range nobody asked
             // for. Refuse to start instead of running on a value the operator did not type.
-            const std::string v = next("--layer-range");
+            std::string v;
+            if (!next("--layer-range", v)) { return 1; }
             int32_t lo = -1;
             int32_t hi = -1;
             if (sscanf(v.c_str(), "%d:%d", &lo, &hi) != 2) {
@@ -547,35 +581,74 @@ static int parse_args(int argc, char ** argv, stage_options & o) {
             }
             o.layer_lo = lo;
             o.layer_hi = hi;
+        } else if (a == "--port") {
+            // A port is 1..65535. Outside that it used to reach htons() and be truncated modulo
+            // 65536, so the stage bound a port the operator never typed while the chain dialed
+            // the one they did type -- a failure that looks like "the stage never came up".
+            int32_t v = 0;
+            if (!take_i32("--port", v)) { return 1; }
+            if (v < 1 || v > 65535) {
+                fprintf(stderr, "--port must be in 1..65535 (got %d)\n", v);
+                return 1;
+            }
+            o.port = v;
+        } else if (a == "--rs-seq") {
+            if (!take_u32("--rs-seq", o.rs_seq)) { return 1; }
+            o.rs_seq_set = true;
+        } else if (a == "-v" || a == "--verbose") {
+            g_verbose = true;
+        } else if (a == "-c" || a == "--ctx-size") {
+            if (!take_i32("-c", o.n_ctx)) { return 1; }
+        } else if (a == "-b" || a == "--batch-size") {
+            if (!take_i32("-b", o.n_batch)) { return 1; }
+        } else if (a == "-ub" || a == "--ubatch-size") {
+            if (!take_i32("-ub", o.n_ubatch)) { return 1; }
         }
-        else if (a == "--port")                         { o.port    = std::stoi(next("--port")); }
-        else if (a == "--rs-seq")                       { o.rs_seq  = (uint32_t) std::stoul(next("--rs-seq")); o.rs_seq_set = true; }
-        else if (a == "-v" || a == "--verbose")         { g_verbose = true; }
-        else if (a == "-c" || a == "--ctx-size")        { o.n_ctx   = std::stoi(next("-c")); }
-        else if (a == "-b" || a == "--batch-size")      { o.n_batch = std::stoi(next("-b")); }
-        else if (a == "-ub" || a == "--ubatch-size")    { o.n_ubatch = std::stoi(next("-ub")); }
-        // [QLH-SPLIT] v9: thread count. Parse into int32 and check the value in validate_options,
-        // where the refusal is a sentence instead of a std::stoi exception: `-t abc` throwing out
-        // of main() prints "terminate called after throwing" and nothing about threads, and a
-        // stage that exits for the wrong stated reason is how the next person loses an hour.
-        else if (a == "-t" || a == "--threads")         { o.n_threads = parse_int(next("-t"), "-t"); }
-        else if (a == "-tb" || a == "--threads-batch")  { o.n_threads_batch = parse_int(next("-tb"), "-tb"); }
+        // [QLH-SPLIT] v9: thread counts. Parsed here, range-checked in validate_options, where the
+        // refusal can name the hardware this machine reports.
+        else if (a == "-t" || a == "--threads") {
+            if (!take_i32("-t", o.n_threads)) { return 1; }
+        } else if (a == "-tb" || a == "--threads-batch") {
+            if (!take_i32("-tb", o.n_threads_batch)) { return 1; }
+        }
         // [QLH-SPLIT] v2.2: -ngl, the same spelling common/arg.cpp uses. "all" maps to -1, which
         // llama_model::n_gpu_layers() expands to "every block of this range + the output slot";
         // an explicit N counts the last N blocks of *this range* (see load_tensors in
         // src/llama-model.cpp for why that base is the range's high bound and not the whole model).
         else if (a == "-ngl" || a == "--gpu-layers" || a == "--n-gpu-layers") {
-            const std::string v = next("-ngl");
-            o.n_gpu_layers = (v == "all") ? -1 : parse_int(v, "-ngl");
-        }
-        else if (a == "--no-host")                      { o.no_host = true; }
-        else if (a == "--moe-cache-mib")                { o.moe_cache_mib = parse_int(next("--moe-cache-mib"), "--moe-cache-mib"); }
-        else if (a == "--moe-cache-cpu-share")          { o.moe_cache_cpu_share = (float) std::atof(next("--moe-cache-cpu-share").c_str()); }
-        else if (a == "-nr" || a == "--no-repack")      { o.no_repack = true; }
-        else if (a == "--no-op-offload")                { o.no_op_offload = true; }
-        else if (a == "--op-offload")                   { o.no_op_offload = false; }
-        else if (a == "--state-cache")                  { o.state_cache = (uint32_t) std::stoul(next("--state-cache")); }
-        else {
+            std::string v;
+            if (!next("-ngl", v)) { return 1; }
+            if (v == "all") {
+                o.n_gpu_layers = -1;
+            } else if (!parse_i32(v, "-ngl", o.n_gpu_layers)) {
+                return 1;
+            }
+        } else if (a == "--no-host") {
+            o.no_host = true;
+        } else if (a == "--moe-cache-mib") {
+            if (!take_i32("--moe-cache-mib", o.moe_cache_mib)) { return 1; }
+        } else if (a == "--moe-cache-cpu-share") {
+            // atof() answers 0.0 for "abc", and 0.0 is inside [0, 1] -- so a typo used to pass
+            // validate_options as "upload every miss". A share is a number or it is not a share.
+            std::string v;
+            if (!next("--moe-cache-cpu-share", v)) { return 1; }
+            char * end = nullptr;
+            errno = 0;
+            const double d = std::strtod(v.c_str(), &end);
+            if (end == v.c_str() || (end != nullptr && *end != '\0') || errno == ERANGE) {
+                fprintf(stderr, "--moe-cache-cpu-share expects a number (got '%s')\n", v.c_str());
+                return 1;
+            }
+            o.moe_cache_cpu_share = (float) d;
+        } else if (a == "-nr" || a == "--no-repack") {
+            o.no_repack = true;
+        } else if (a == "--no-op-offload") {
+            o.no_op_offload = true;
+        } else if (a == "--op-offload") {
+            o.no_op_offload = false;
+        } else if (a == "--state-cache") {
+            if (!take_u32("--state-cache", o.state_cache)) { return 1; }
+        } else {
             fprintf(stderr, "unknown argument: %s\n", a.c_str());
             return 1;
         }
@@ -640,6 +713,21 @@ static int validate_options(const stage_options & o) {
                 return 1;
             }
         }
+    }
+    // [QLH-SPLIT] v10: -c and -b were not checked at all, and both are stored through a cast to
+    // uint32_t (stage_init, s.cparams.n_ctx / n_batch). `-c -1` therefore reached the context
+    // constructor as 4294967295 and asked for a KV cache the machine does not have; `-b 0` made
+    // every OP_DECODE answer ST_NO_SPACE because no frame is <= 0 rows. Neither is a value an
+    // operator means, and both are cheap to refuse here, before anything is loaded.
+    if (o.n_ctx < 1) {
+        fprintf(stderr, "-c must be at least 1 (got %d); it is the context this stage holds for "
+                        "the sequence it is served\n", o.n_ctx);
+        return 1;
+    }
+    if (o.n_batch < 1) {
+        fprintf(stderr, "-b must be at least 1 (got %d); it must also be at least the driving "
+                        "server's -ubatch-size\n", o.n_batch);
+        return 1;
     }
     // -ub is either absent or a real physical batch. It is bounded by the same rule llama_context
     // applies (n_ubatch <= n_batch); a value larger than -b would be silently clamped there, so it
@@ -730,6 +818,9 @@ struct stage {
 
     std::vector<float>            hidden;
     std::vector<llama_pos>        positions;
+    // [QLH-SPLIT] v10: a relay's answer rows, one per token of the frame. Reused like the scratch
+    // below it -- a fresh n_tok * n_embd vector per frame was a 4 MB malloc+free on every prefill.
+    std::vector<float>            relay_out;
     // [QLH-SPLIT] v5 candidate scratch, allocated once. sized to the vocabulary (a few MB at
     // most) and reused: a fresh 248k-entry vector per token would put an allocation and a
     // zero-fill on the decode path for no reason.
@@ -1265,7 +1356,7 @@ static bool check_frame(conn & c, const req_header & req) {
         fprintf(stderr, "[split-stage] protocol error: first-frame/header magic %08x, "
                         "expected %08x; the peer is not a split-stage client\n",
                 req.magic, MAGIC);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     // [QLH-SPLIT] Say "version", not "bad request": a version skew is always a build
@@ -1277,24 +1368,24 @@ static bool check_frame(conn & c, const req_header & req) {
                         "source tree (rebuild llama-server and split-stage together); "
                         "this is not a network problem\n",
                 req.version, PROTO_VER);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     if (!c.greeted && req.op != OP_HELLO) {
         fprintf(stderr, "[split-stage] protocol error: the first frame is op=%u, not "
                         "OP_HELLO; a stage only accepts work after the v4 identity "
                         "handshake\n", (unsigned) req.op);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     if (c.greeted && req.op == OP_HELLO) {
         fprintf(stderr, "[split-stage] protocol error: a second OP_HELLO on the same "
                         "connection\n");
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     if (req.n_tokens > MAX_TOKENS || req.n_embd > MAX_EMBD) {
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     return true;
@@ -1313,7 +1404,7 @@ static bool check_seq_id(conn & c, const stage & s, const req_header & req) {
         fprintf(stderr, "[split-stage] op=%u carries seq_id=%d, out of range [0, %d); this "
                         "stage's context holds %d sequence(s)\n",
                 (unsigned) req.op, req.seq_id, n_seq_max, n_seq_max);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     return true;
@@ -1328,7 +1419,7 @@ static bool op_hello(conn & c, stage & s, const req_header & req) {
     if (req.n_bytes != sizeof(stage_id)) {
         fprintf(stderr, "[split-stage] OP_HELLO carried n_bytes=%u, expected %zu\n",
                 req.n_bytes, sizeof(stage_id));
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     stage_id expect{};
@@ -1364,14 +1455,15 @@ static bool op_hello(conn & c, stage & s, const req_header & req) {
                         "previous chain\n", s.snapshots.size());
         s.snapshots.clear();
     }
-    reply(c.peer, ST_OK, 0, 0, 0, &s.self, sizeof(s.self), -1, (uint32_t) sizeof(s.self));
+    reply_parts(c.peer, ST_OK, 0, 0, 0, -1, (uint32_t) sizeof(s.self), 0, 0,
+                &s.self, sizeof(s.self));
     return true;
 }
 
 static bool op_clear(conn & c, stage & s, const req_header & req) {
     (void) req;
     llama_memory_clear(llama_get_memory(s.ctx), true);
-    reply(c.peer, ST_OK, 0, 0, 0, nullptr, 0);
+    reply_parts(c.peer, ST_OK, 0, 0, 0);
     return true;
 }
 
@@ -1391,7 +1483,7 @@ static bool op_seq_rm(conn & c, stage & s, const req_header & req) {
     fprintf(stderr, "[split-stage] OP_SEQ_RM seq=%d p0=%d p1=%d -> %s, pos_max %d -> %d\n",
             req.seq_id, req.pos0, req.pos1, ok ? "ok" : "refused",
             (int) pos_max_before, (int) pos_max_after);
-    reply(c.peer, ok ? ST_OK : ST_INTERNAL, 0, 0, 0, nullptr, 0);
+    reply_parts(c.peer, ok ? ST_OK : ST_INTERNAL, 0, 0, 0);
     return true;
 }
 
@@ -1421,18 +1513,18 @@ static bool op_state_save(conn & c, stage & s, const req_header & req) {
                 ? (size_t) STATE_HANDLE_BYTES
                 : llama_state_seq_get_size_ext(s.ctx, req.seq_id, sflags);
         if (n > MAX_STATE) {
-            reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
             return true;
         }
         fprintf(stderr, "[split-stage] OP_STATE_SAVE seq=%d flags=%u size-only -> %zu bytes, pos_max=%d\n",
                 req.seq_id, (unsigned) sflags, n, (int) pm);
-        reply(c.peer, ST_OK, 0, 0, 0, nullptr, 0, pm, (uint32_t) n);
+        reply_parts(c.peer, ST_OK, 0, 0, 0, pm, (uint32_t) n);
         return true;
     }
 
     const size_t n = llama_state_seq_get_size_ext(s.ctx, req.seq_id, sflags);
     if (n > MAX_STATE) {
-        reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
         return true;
     }
     std::vector<uint8_t> blob(n);
@@ -1442,7 +1534,7 @@ static bool op_state_save(conn & c, stage & s, const req_header & req) {
     if (got != n) {
         fprintf(stderr, "[split-stage] OP_STATE_SAVE seq=%d failed: %zu of %zu bytes\n",
                 req.seq_id, got, n);
-        reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0, pm, 0);
+        reply_parts(c.peer, ST_INTERNAL, 0, 0, 0, pm, 0);
         return true;
     }
 
@@ -1452,7 +1544,8 @@ static bool op_state_save(conn & c, stage & s, const req_header & req) {
         // always asks for a handle) -- see the proto header's note on the flag.
         fprintf(stderr, "[split-stage] OP_STATE_SAVE seq=%d flags=%u -> %zu bytes, pos_max=%d\n",
                 req.seq_id, (unsigned) sflags, n, (int) pm);
-        reply(c.peer, ST_OK, 0, 0, 0, blob.data(), blob.size(), pm, (uint32_t) n);
+        reply_parts(c.peer, ST_OK, 0, 0, 0, pm, (uint32_t) n, 0, 0,
+                    blob.data(), blob.size());
         return true;
     }
 
@@ -1479,7 +1572,8 @@ static bool op_state_save(conn & c, stage & s, const req_header & req) {
                     "(%zu bytes kept, %zu/%u cached), pos_max=%d\n",
             req.seq_id, (unsigned) sflags, (unsigned long long) handle, n,
             s.snapshots.size(), s.opt.state_cache, (int) pm);
-    reply(c.peer, ST_OK, 0, 0, 0, &handle, sizeof(handle), pm, STATE_HANDLE_BYTES);
+    reply_parts(c.peer, ST_OK, 0, 0, 0, pm, STATE_HANDLE_BYTES, 0, 0,
+                &handle, sizeof(handle));
     return true;
 }
 
@@ -1497,9 +1591,13 @@ static bool op_state_load(conn & c, stage & s, const req_header & req) {
             return false;
         }
     } else {
+        // [QLH-SPLIT] v10: the body was never read, so the bytes that follow are not the next
+        // header and this stream cannot be resynchronised. Answer (so the peer learns why) and let
+        // the connection go with it -- returning true here left the caller parsing a state blob as
+        // a frame header, which is the one failure mode every other check in this file avoids.
         if (req.n_bytes > MAX_STATE) {
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return true;
+            reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+            return false;
         }
         blob.resize(req.n_bytes);
         if (req.n_bytes > 0 && !net::recv_all(c.peer, blob.data(), blob.size())) {
@@ -1536,7 +1634,7 @@ static bool op_state_load(conn & c, stage & s, const req_header & req) {
                             "(%zu/%u cached); nothing applied\n",
                     req.seq_id, (unsigned long long) handle,
                     s.snapshots.size(), s.opt.state_cache);
-            reply(c.peer, ST_STALE, 0, 0, 0, nullptr, 0, pm, 0);
+            reply_parts(c.peer, ST_STALE, 0, 0, 0, pm, 0);
             return true;
         }
         // Most recently used goes last: that is the eviction order the cache is
@@ -1563,7 +1661,7 @@ static bool op_state_load(conn & c, stage & s, const req_header & req) {
             // Put it back: the caller gets a refusal, not a lost snapshot.
             blob.swap(snap->blob);
         }
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0, pm, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0, pm, 0);
         return true;
     }
 
@@ -1581,32 +1679,75 @@ static bool op_state_load(conn & c, stage & s, const req_header & req) {
         // restored by a later request (the head keeps it until it is invalidated).
         blob.swap(snap->blob);
     }
-    reply(c.peer, ok ? ST_OK : ST_INTERNAL, 0, 0, 0, nullptr, 0, pm, 0);
+    reply_parts(c.peer, ok ? ST_OK : ST_INTERNAL, 0, 0, 0, pm, 0);
     return true;
 }
 
+// [QLH-SPLIT] v10: what reading one frame ended with.
+//
+// The bool this used to return had two meanings squeezed into it -- "the whole frame was consumed,
+// go decode it" and "the stream is gone" -- so a refusal that had already answered the peer had
+// nowhere to say "answered, do not decode, the connection is still parseable". It said `false`, and
+// the caller dropped a connection that was in fact perfectly aligned on the next header. These
+// three outcomes are what the code actually has, and the type now says so.
+enum class frame_read {
+    ok,      // the whole frame was consumed; the caller decodes it
+    refused, // the whole frame was consumed and already answered; keep serving, do not decode
+    broken,  // the stream is mid-frame; nothing was answered and the connection has to go
+};
+
+// [QLH-SPLIT] v10: the decode channels only a tail can answer, checked in one place.
+//
+// Three copies of `if (s.relay) { fprintf(...); reply_parts(...); return ...; }` were the reason the
+// role appeared three times in the frame reader. The role is decided once (stage_init, s.relay);
+// what it costs here is one table scan: a relay exports hidden rows and owns neither logits nor a
+// NextN block, so every channel defined in terms of logits is tail-only.
+//
+// The frame is fully consumed before this runs, so a refusal is `refused`: answering and keeping the
+// connection is the whole point, and dropping it would turn a recoverable protocol error into a
+// dead chain.
+static frame_read check_tail_only(conn & c, const stage & s, uint8_t flags) {
+    if (!s.relay) {
+        return frame_read::ok;
+    }
+    const char * what = nullptr;
+    if (flags & DECODE_FLAG_CANDIDATES) {
+        what = "candidates (only a tail can answer those)";
+    } else if (flags & DECODE_FLAG_VERIFY_ROWS) {
+        what = "per-row results (only a tail produces the logits they come from)";
+    } else if (flags & DECODE_FLAG_NEXTN_ROWS) {
+        what = "h_nextn rows (only a tail owns the last layer and the NextN block)";
+    }
+    if (what == nullptr) {
+        return frame_read::ok;
+    }
+    fprintf(stderr, "[split-stage] OP_DECODE asked a relay stage for %s\n", what);
+    reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+    return frame_read::refused;
+}
+
 // Read one OP_DECODE frame: positions, hidden rows, and the optional candidate request, with
-// every check that has to happen before a single byte is decoded. Returns true when the whole
-// frame has been consumed; a false means the stream is no longer parseable, so nothing is
-// answered to it.
-static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint32_t n_tok,
-                              bool & want_cand, cand_req & creq,
-                              std::vector<llama_logit_bias> & cbias,
-                              std::vector<llama_token> & chist,
-                              bool & want_verify, bool & want_nextn,
-                              std::vector<int32_t> & tap_ask) {
+// every check that has to happen before a single byte is decoded. A `broken` answer means the
+// stream is no longer parseable and nothing was answered to it; a `refused` answer means the frame
+// was consumed and the peer already has its reply.
+static frame_read decode_read_frame(conn & c, stage & s, const req_header & req, uint32_t n_tok,
+                                    bool & want_cand, cand_req & creq,
+                                    std::vector<llama_logit_bias> & cbias,
+                                    std::vector<llama_token> & chist,
+                                    bool & want_verify, bool & want_nextn,
+                                    std::vector<int32_t> & tap_ask) {
     // section-major, n_pos per token: the caller sends what the head's graph
     // actually used, so the stride has to be the one both ends agree on
     if (req.n_pos == 0 || req.n_pos > GGML_MROPE_SECTIONS) {
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-        return false;
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+        return frame_read::broken;
     }
     if (req.n_pos != s.n_pos_per_embd) {
         fprintf(stderr, "[split-stage] OP_DECODE n_pos=%u but this stage uses %u; "
                         "the two ends were not built from the same model\n",
                 req.n_pos, s.n_pos_per_embd);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-        return false;
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+        return frame_read::broken;
     }
     // [QLH-SPLIT] The hidden rows are read at *this* stage's width, not at the
     // width the header declares, so a frame from a head built for a different
@@ -1620,12 +1761,12 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
         fprintf(stderr, "[split-stage] OP_DECODE n_embd=%u but this stage is %u wide; "
                         "the two ends were not built from the same model\n",
                 req.n_embd, s.n_embd);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-        return false;
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+        return frame_read::broken;
     }
     s.positions.resize((size_t) n_tok * s.n_pos_per_embd);
     if (!net::recv_all(c.peer, s.positions.data(), s.positions.size() * sizeof(llama_pos))) {
-        return false;
+        return frame_read::broken;
     }
 
     // OP_DECODE always carries hidden rows: every stage of a chain consumes
@@ -1634,7 +1775,7 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
     // header was parsed out of hidden data.
     s.hidden.resize((size_t) n_tok * s.n_embd);
     if (!net::recv_all(c.peer, s.hidden.data(), s.hidden.size() * sizeof(float))) {
-        return false;
+        return frame_read::broken;
     }
 
     // [QLH-SPLIT] v5 candidate request, only when the caller asked for one.
@@ -1644,34 +1785,26 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
     want_cand = (req.flags & DECODE_FLAG_CANDIDATES) != 0;
     if (want_cand) {
         if (!net::recv_all(c.peer, &creq, sizeof(creq))) {
-            return false;
+            return frame_read::broken;
         }
         if (creq.n_bias > kMaxCandBias || creq.n_hist > kMaxCandHist ||
             creq.n_steps == 0 || creq.n_steps > sizeof(creq.steps)) {
             fprintf(stderr, "[split-stage] OP_DECODE candidate request is out of "
                             "range (n_bias=%u n_hist=%u n_steps=%u)\n",
                     creq.n_bias, creq.n_hist, (unsigned) creq.n_steps);
-            return false;
+            // The bias/history arrays this header promised are still unread, and their lengths are
+            // exactly what is out of range: the frame cannot be skipped, so the stream is broken.
+            return frame_read::broken;
         }
         cbias.resize(creq.n_bias);
         if (creq.n_bias > 0 &&
             !net::recv_all(c.peer, cbias.data(), cbias.size() * sizeof(llama_logit_bias))) {
-            return false;
+            return frame_read::broken;
         }
         chist.resize(creq.n_hist);
         if (creq.n_hist > 0 &&
             !net::recv_all(c.peer, chist.data(), chist.size() * sizeof(llama_token))) {
-            return false;
-        }
-        // A relay exports hidden and cannot answer with candidates; the driving
-        // side never asks (it only asks the last stage), so this is a frame from
-        // something other than a head built from this tree. Refuse after the
-        // whole frame is consumed, so the connection stays parseable.
-        if (s.relay) {
-            fprintf(stderr, "[split-stage] OP_DECODE asked a relay stage for "
-                            "candidates; only a tail can answer those\n");
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
+            return frame_read::broken;
         }
     }
 
@@ -1679,23 +1812,6 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
     // the frame, so there is nothing to read; what it changes is how many rows this stage must
     // mark as output, which is decided in decode_run.
     want_verify = (req.flags & DECODE_FLAG_VERIFY_ROWS) != 0;
-    if (want_verify) {
-        // Both at once is a frame no build of this tree sends. Refuse it *after* the frame has
-        // been consumed (the candidate block above was read) so the connection stays parseable.
-        if (want_cand) {
-            fprintf(stderr, "[split-stage] OP_DECODE set both DECODE_FLAG_CANDIDATES and "
-                            "DECODE_FLAG_VERIFY_ROWS; they answer different questions and "
-                            "cannot both be asked of one frame\n");
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
-        }
-        if (s.relay) {
-            fprintf(stderr, "[split-stage] OP_DECODE asked a relay stage for per-row results; "
-                            "only a tail produces logits to take an argmax of\n");
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
-        }
-    }
 
     // [QLH-SPLIT] v8: the h_nextn rows a decode answers with. Like the verify flag this adds no
     // bytes to the frame -- it only changes what the reply carries, which decode_run builds.
@@ -1707,23 +1823,6 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
     // attach and now degrades to "no drafts" instead of failing the request. That is the same rule
     // OP_MTP_DRAFT follows with ST_UNSUPPORTED, one level earlier.
     want_nextn = (req.flags & DECODE_FLAG_NEXTN_ROWS) != 0;
-    if (want_nextn) {
-        if (s.relay) {
-            fprintf(stderr, "[split-stage] OP_DECODE asked a relay stage for h_nextn rows; only a "
-                            "tail owns the model's last layer and the NextN block\n");
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
-        }
-        if (!s.has_nextn || s.ctx_mtp == nullptr) {
-            if (!s.logged_no_nextn) {
-                s.logged_no_nextn = true;
-                fprintf(stderr, "[split-stage] OP_DECODE asked for h_nextn rows but this stage has "
-                                "no NextN/MTP block; answering without them (the head will not "
-                                "draft), which is not an error\n");
-            }
-            want_nextn = false;
-        }
-    }
 
     // [QLH-SPLIT] v9: the layer-input taps this frame asks for. Read last, after the candidate block,
     // because that is where the frame puts it (see layer_inp_req).
@@ -1739,7 +1838,7 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
     if (req.flags & DECODE_FLAG_LAYER_INP) {
         layer_inp_req treq{};
         if (!net::recv_all(c.peer, &treq, sizeof(treq))) {
-            return false;
+            return frame_read::broken;
         }
         if (treq.n_taps == 0 || treq.n_taps > MAX_LAYER_INP_TAPS || treq.n_embd == 0 ||
             treq.n_embd > MAX_EMBD) {
@@ -1747,18 +1846,21 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
                             "(n_taps=%u n_embd=%u, at most %u taps and %u wide)\n",
                     treq.n_taps, treq.n_embd, MAX_LAYER_INP_TAPS, MAX_EMBD);
             // The ids still follow the refused block, so read them before answering or the next
-            // header would be parsed out of them.
-            std::vector<int32_t> skip(treq.n_taps <= MAX_TOKENS ? treq.n_taps : 0);
+            // header would be parsed out of them. When n_taps itself is the field that is out of
+            // range there is no trustworthy length to skip, so that frame cannot be resynchronised
+            // and the connection has to go with the refusal.
+            const bool drainable = treq.n_taps <= MAX_LAYER_INP_TAPS;
+            std::vector<int32_t> skip(drainable ? treq.n_taps : 0);
             if (!skip.empty() &&
                 !net::recv_all(c.peer, skip.data(), skip.size() * sizeof(int32_t))) {
-                return false;
+                return frame_read::broken;
             }
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
+            reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+            return drainable ? frame_read::refused : frame_read::broken;
         }
         tap_ask.resize(treq.n_taps);
         if (!net::recv_all(c.peer, tap_ask.data(), tap_ask.size() * sizeof(int32_t))) {
-            return false;
+            return frame_read::broken;
         }
         // A tap row is a layer input, which is always the trunk width (src/llama-context.cpp,
         // extract_layer_inputs asserts it). A frame from a different model is refused here rather
@@ -1767,12 +1869,43 @@ static bool decode_read_frame(conn & c, stage & s, const req_header & req, uint3
             fprintf(stderr, "[split-stage] OP_DECODE asked for layer-input taps of width %u but this "
                             "stage is %u wide; the two ends were not built from the same model\n",
                     treq.n_embd, s.n_embd);
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
+            reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+            return frame_read::refused;
         }
     }
 
-    return true;
+    // [QLH-SPLIT] v10: from here the whole frame has been consumed -- positions, hidden rows, the
+    // candidate block and the tap block -- so every remaining refusal is `refused`: answer it and
+    // keep serving. A check placed above this line cannot make that promise, because the bytes it
+    // refused are still in the stream; that is why the role check and the flag-conflict check live
+    // after the frame rather than next to the flags they read.
+    if (want_verify && want_cand) {
+        // Both at once is a frame no build of this tree sends.
+        fprintf(stderr, "[split-stage] OP_DECODE set both DECODE_FLAG_CANDIDATES and "
+                        "DECODE_FLAG_VERIFY_ROWS; they answer different questions and "
+                        "cannot both be asked of one frame\n");
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+        return frame_read::refused;
+    }
+
+    // [QLH-SPLIT] v10: the role decides once, here. The three tail-only channels used to be three
+    // separate `if (s.relay)` blocks with the same body; they are one check now (see check_tail_only).
+    if (const frame_read role_verdict = check_tail_only(c, s, req.flags);
+        role_verdict != frame_read::ok) {
+        return role_verdict;
+    }
+
+    if (want_nextn && (!s.has_nextn || s.ctx_mtp == nullptr)) {
+        if (!s.logged_no_nextn) {
+            s.logged_no_nextn = true;
+            fprintf(stderr, "[split-stage] OP_DECODE asked for h_nextn rows but this stage has "
+                            "no NextN/MTP block; answering without them (the head will not "
+                            "draft), which is not an error\n");
+        }
+        want_nextn = false;
+    }
+
+    return frame_read::ok;
 }
 
 // [QLH-SPLIT] v9: turn a frame's layer-input request into this stage's own layers.
@@ -1844,6 +1977,23 @@ static bool stage_collect_taps(stage & s, uint32_t n_tok) {
     return true;
 }
 
+// [QLH-SPLIT] v10: llama_batch has no C++ destructor, so every return path in decode_run used to
+// carry its own llama_batch_free(batch) -- twelve of them, each one a chance to leak a batch
+// (n_tok * n_embd floats of embeddings, plus the seq_id matrix) on a refused frame. A guard puts the
+// release next to the construction it undoes, and the return paths stop mentioning it.
+struct batch_guard {
+    llama_batch b;
+
+    batch_guard(int32_t n_tokens, int32_t n_embd, int32_t n_seq_max)
+        : b(llama_batch_init(n_tokens, n_embd, n_seq_max)) {}
+    ~batch_guard() { llama_batch_free(b); }
+
+    batch_guard(const batch_guard &)            = delete;
+    batch_guard & operator=(const batch_guard &) = delete;
+
+    llama_batch & get() { return b; }
+};
+
 // Build the batch for a frame that has already been read, decode it, and answer. Returns true
 // when the connection can keep serving.
 static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_tok,
@@ -1871,7 +2021,8 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     const uint64_t frame_id = ++s.frame_id;
     const double   t_frame  = g_timing ? now_ms() : 0.0;
 
-    llama_batch batch = llama_batch_init((int32_t) n_tok, (int32_t) s.n_embd, 1);
+    batch_guard   guard((int32_t) n_tok, (int32_t) s.n_embd, 1);
+    llama_batch & batch = guard.get();
     batch.n_tokens = (int32_t) n_tok;
 
     // [QLH-SPLIT] v7: the row count a verify frame asks for must fit in the cap the context was
@@ -1884,8 +2035,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
                         "built for %u; the frame is from a head that does not cap at "
                         "MAX_VERIFY_ROWS (%u)\n",
                 n_tok, s.cparams.n_outputs_max, MAX_VERIFY_ROWS);
-        llama_batch_free(batch);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return true;
     }
 
@@ -1899,8 +2049,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     free(batch.pos);
     batch.pos = (llama_pos *) malloc((size_t) n_tok * s.n_pos_per_embd * sizeof(llama_pos));
     if (n_tok > 0 && batch.pos == nullptr) {
-        llama_batch_free(batch);
-        reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
         return true;
     }
     if (!s.positions.empty()) {
@@ -1920,7 +2069,11 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
         // is also what allocates the rows: output_reserve() sizes the logits buffer from the
         // batch's output count, and cparams.n_outputs_max (MAX_VERIFY_ROWS for a tail) is the
         // ceiling that makes n_tok > MAX_VERIFY_ROWS a refusal instead of an assert.
-        batch.logits[i] = s.relay ? 0 : (want_verify || i + 1 == n_tok ? 1 : 0);
+        // relay 的每一行都必须显式标成 output：早先写 0 再靠 cparams.embeddings 触发上游
+        // llama-batch 的 override（日志里那行 `embeddings required but some input tokens
+        // were not marked as outputs -> overriding`）。那条兜底一旦被上游当兼容代码清掉，
+        // 症状是 "no embeddings" + ST_INTERNAL，排查会从网络查到模型。
+        batch.logits[i] = s.relay ? 1 : (want_verify || i + 1 == n_tok ? 1 : 0);
     }
 
     // [QLH-SPLIT] Print the position the stage will actually use, once per
@@ -1946,7 +2099,6 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     const int rc = llama_decode(s.ctx, batch);
 
     if (rc != 0) {
-        llama_batch_free(batch);
         // Say why, not just what: a refusal here used to be a 4-byte status and nothing else, and
         // the head's message ("stage rejected the request") is the only place an operator could
         // see it. The three cases are different problems (capacity, bad frame, compute failure).
@@ -1956,7 +2108,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
               : rc == -1 ? "invalid batch, the frame does not describe what this context accepts"
                          : "compute failure");
         const status st = rc == 1 ? ST_NO_SPACE : (rc == -1 ? ST_BAD_REQ : ST_INTERNAL);
-        reply(c.peer, st, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, st, 0, 0, 0);
         return true;
     }
 
@@ -1976,7 +2128,11 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     const uint32_t tap_bytes   = (uint32_t) (tap_ids_n + tap_rows_n);
 
     if (s.relay) {
-        std::vector<float> out((size_t) n_tok * s.n_embd);
+        // [QLH-SPLIT] v10: reuse the stage's scratch, like every other answer channel here
+        // (cand_cur / verify_out / nextn_out / tap_*). This was the one place that allocated a fresh
+        // n_tok * n_embd vector per frame -- 4 MB of malloc+free on a 512-row prefill frame, on the
+        // path that is supposed to be the steady state of a relay stage.
+        s.relay_out.resize((size_t) n_tok * s.n_embd);
         bool ok = true;
         for (uint32_t i = 0; i < n_tok; ++i) {
             const float * row = llama_get_embeddings_ith(s.ctx, (int32_t) i);
@@ -1984,19 +2140,18 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
                 ok = false;
                 break;
             }
-            memcpy(out.data() + (size_t) i * s.n_embd, row, s.n_embd * sizeof(float));
+            memcpy(s.relay_out.data() + (size_t) i * s.n_embd, row, s.n_embd * sizeof(float));
         }
-        llama_batch_free(batch);
         if (!ok) {
-            reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
             return true;
         }
         // [QLH-SPLIT] v9: hidden rows, then the tap ids, then the tap rows -- the sections a reply that
         // carries both puts in that order (see RSP_FLAG_LAYER_INP). n_embd stays the hidden width, so
         // the tap width is the one the frame asked for.
         reply_parts(c.peer, ST_OK, n_tok, s.n_embd, 0, -1,
-                    (uint32_t) (out.size() * sizeof(float) + tap_bytes), tap_flag, tap_n,
-                    out.data(), out.size() * sizeof(float),
+                    (uint32_t) (s.relay_out.size() * sizeof(float) + tap_bytes), tap_flag, tap_n,
+                    s.relay_out.data(), s.relay_out.size() * sizeof(float),
                     tap_ids_p, tap_ids_n, tap_rows_p, tap_rows_n);
         return true;
     }
@@ -2004,8 +2159,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     const int32_t last = (int32_t) n_tok - 1;
     const float * lg = llama_get_logits_ith(s.ctx, last);
     if (lg == nullptr) {
-        llama_batch_free(batch);
-        reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
         return true;
     }
 
@@ -2025,8 +2179,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
                 // draft from another token's state -- refuse instead.
                 fprintf(stderr, "[split-stage] OP_DECODE asked for h_nextn rows but row %u has "
                                 "none; this context does not export t_h_nextn for it\n", i);
-                llama_batch_free(batch);
-                reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+                reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
                 return true;
             }
             memcpy(s.nextn_out.data() + (size_t) (i - row0) * s.n_embd, h,
@@ -2060,8 +2213,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
                 fprintf(stderr, "[split-stage] OP_DECODE verify frame: row %u has no logits; "
                                 "this context does not build logits (a tail started with the "
                                 "relay shape?)\n", i);
-                llama_batch_free(batch);
-                reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+                reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
                 return true;
             }
             s.verify_out[i] = argmax_row(row, s.n_vocab);
@@ -2069,7 +2221,6 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
                       s.verify_out[i], s.hidden.data() + (size_t) i * s.n_embd, s.n_embd);
         }
         const double t_argmax1 = g_timing ? now_ms() : 0.0;
-        llama_batch_free(batch);
         if (!s.logged_verify) {
             s.logged_verify = true;
             fprintf(stderr, "[split-stage] first OP_DECODE verify frame: %u rows -> %u int32 "
@@ -2135,9 +2286,11 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
             fprintf(stderr, "[split-stage] OP_DECODE candidate request named a "
                             "sampler step this build does not have; refusing "
                             "the frame instead of guessing a chain\n");
-            llama_batch_free(batch);
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
-            return false;
+            reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
+            // [QLH-SPLIT] v10: the frame was consumed and answered, so the connection is still
+            // aligned on the next header. Dropping it here was the last place a decodable stream was
+            // killed over a recoverable request error.
+            return true;
         }
 
         s.cand_cur.resize(s.n_vocab);
@@ -2149,8 +2302,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
         llama_sampler_free(chain);
 
         if (cur_p.size == 0 || cur_p.size > s.n_vocab) {
-            llama_batch_free(batch);
-            reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
             return true;
         }
 
@@ -2161,7 +2313,6 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
             s.cand_out[i].id    = (int32_t) cur_p.data[i].id;
             s.cand_out[i].logit = cur_p.data[i].logit;
         }
-        llama_batch_free(batch);
         const double t_post = g_timing ? now_ms() : 0.0;
         if (tap_flag) {
             // [QLH-SPLIT] v9: the candidate pairs first, then the taps (a tap section is always last).
@@ -2190,7 +2341,7 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
         return true;
     }
 
-    // [QLH-SPLIT] No staging copy: reply() writes synchronously (net::send_all/send_two, both
+    // [QLH-SPLIT] No staging copy: reply_parts() writes synchronously (net::send_all, both
     // blocking until the kernel has the bytes), so the row is still valid while it is sent.
     //
     // v9: the trace prints only the row the caller samples from -- for a plain decode that is the
@@ -2199,7 +2350,6 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
     // line per prompt token and answer nothing.
     trace_row(frame_id, "plain", n_tok, (int32_t) batch.pos[last], (uint32_t) last, lg, s.n_vocab,
               argmax_row(lg, s.n_vocab), s.hidden.data() + (size_t) last * s.n_embd, s.n_embd);
-    llama_batch_free(batch);
     const double t_post = g_timing ? now_ms() : 0.0;
     // [QLH-SPLIT] v9: taps before h_nextn rows on a plain frame, mirroring the verify and candidate
     // branches above. The two cannot share a reply (one reply states one n_embd width), and only the
@@ -2224,7 +2374,9 @@ static bool decode_run(conn & c, stage & s, const req_header & req, uint32_t n_t
                     (uint32_t) (nextn_bytes + s.n_vocab * sizeof(float)), nextn_flag, 0,
                     nextn_data, nextn_bytes, lg, (size_t) s.n_vocab * sizeof(float), nullptr, 0);
     } else {
-        reply(c.peer, ST_OK, 1, 0, s.n_vocab, lg, (size_t) s.n_vocab * sizeof(float));
+        reply_parts(c.peer, ST_OK, 1, 0, s.n_vocab, -1,
+                    (uint32_t) ((size_t) s.n_vocab * sizeof(float)), 0, 0,
+                    lg, (size_t) s.n_vocab * sizeof(float));
     }
     if (g_timing) {
         if (n_tok > (uint32_t) MAX_VERIFY_ROWS) {
@@ -2257,9 +2409,17 @@ static bool op_decode(conn & c, stage & s, const req_header & req) {
     cand_req      creq{};
     std::vector<llama_logit_bias> cbias;
     std::vector<llama_token>      chist;
-    if (!decode_read_frame(c, s, req, n_tok, want_cand, creq, cbias, chist, want_verify,
-                           want_nextn, s.tap_ask)) {
-        return false;
+    // [QLH-SPLIT] v10: three outcomes, not two. `refused` means the frame was consumed and the peer
+    // already has its reply, so the connection keeps serving -- that is what the old `return false`
+    // could not express, and why a recoverable protocol error used to kill the chain.
+    switch (decode_read_frame(c, s, req, n_tok, want_cand, creq, cbias, chist, want_verify,
+                              want_nextn, s.tap_ask)) {
+        case frame_read::broken:
+            return false;
+        case frame_read::refused:
+            return true;
+        case frame_read::ok:
+            break;
     }
 
     // The whole frame is consumed at this point, so refusing does not desynchronize
@@ -2277,7 +2437,7 @@ static bool op_decode(conn & c, stage & s, const req_header & req) {
         fprintf(stderr, "[split-stage] OP_DECODE n_tok=%u exceeds this stage's -b %d; "
                         "-b must be at least the driving server's -ubatch-size\n",
                 n_tok, s.opt.n_batch);
-        reply(c.peer, ST_NO_SPACE, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_NO_SPACE, 0, 0, 0);
         return true;
     }
     return decode_run(c, s, req, n_tok, want_cand, creq, cbias, chist, want_verify, want_nextn);
@@ -2314,7 +2474,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
         fprintf(stderr, "[split-stage] OP_MTP_DRAFT carried n_bytes=%u n_embd=%u, expected %zu "
                         "and a width in (0, %u]\n",
                 req.n_bytes, req.n_embd, sizeof(mtp_req), MAX_EMBD);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
     // The hidden row is read at *this* stage's width, so a frame from a head built for another
@@ -2322,7 +2482,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
     if (req.n_embd != s.n_embd) {
         fprintf(stderr, "[split-stage] OP_MTP_DRAFT n_embd=%u but this stage is %u wide; the two "
                         "ends were not built from the same model\n", req.n_embd, s.n_embd);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return false;
     }
 
@@ -2339,7 +2499,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
     if (mreq.k == 0 || mreq.k > MAX_MTP_DRAFT) {
         fprintf(stderr, "[split-stage] OP_MTP_DRAFT asked for k=%u drafts, out of range [1, %u]\n",
                 mreq.k, MAX_MTP_DRAFT);
-        reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
         return true;
     }
     if (!check_seq_id(c, s, req)) {
@@ -2351,7 +2511,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
     if (!s.has_nextn || s.ctx_mtp == nullptr) {
         fprintf(stderr, "[split-stage] OP_MTP_DRAFT on a stage without an MTP draft context; "
                         "answering UNSUPPORTED\n");
-        reply(c.peer, ST_UNSUPPORTED, 0, 0, 0, nullptr, 0);
+        reply_parts(c.peer, ST_UNSUPPORTED, 0, 0, 0);
         return true;
     }
 
@@ -2380,7 +2540,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
             !llama_batch_ext_set_output_logits(b, idx, true)) {
             fprintf(stderr, "[split-stage] OP_MTP_DRAFT could not build draft step %u\n", i);
             llama_batch_ext_free(b);
-            reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
             return true;
         }
 
@@ -2395,7 +2555,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
             // stage or the chain (the head already handles ST_* as "no drafts this round").
             fprintf(stderr, "[split-stage] OP_MTP_DRAFT draft step %u failed rc=%d (pos=%d)\n",
                     i, (int) rc, (int) pos[0]);
-            reply(c.peer, rc == 1 ? ST_NO_SPACE : ST_INTERNAL, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, rc == 1 ? ST_NO_SPACE : ST_INTERNAL, 0, 0, 0);
             return true;
         }
 
@@ -2403,7 +2563,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
         if (row == nullptr) {
             fprintf(stderr, "[split-stage] OP_MTP_DRAFT draft step %u produced no logits; this "
                             "context does not build the DECODER_MTP graph\n", i);
-            reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
             return true;
         }
         s.mtp_out[i] = argmax_row(row, s.n_vocab);
@@ -2418,7 +2578,7 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
             if (h == nullptr) {
                 fprintf(stderr, "[split-stage] OP_MTP_DRAFT draft step %u produced no h_nextn; "
                                 "the draft cannot chain past it\n", i);
-                reply(c.peer, ST_INTERNAL, 0, 0, 0, nullptr, 0);
+                reply_parts(c.peer, ST_INTERNAL, 0, 0, 0);
                 return true;
             }
             memcpy(s.mtp_h.data(), h, s.n_embd * sizeof(float));
@@ -2436,9 +2596,9 @@ static bool op_mtp_draft(conn & c, stage & s, const req_header & req) {
                 llama_n_ctx(s.ctx_mtp));
     }
 
-    reply(c.peer, ST_OK, mreq.k, 0, 0, s.mtp_out.data(),
-          s.mtp_out.size() * sizeof(int32_t), -1,
-          (uint32_t) (s.mtp_out.size() * sizeof(int32_t)));
+    reply_parts(c.peer, ST_OK, mreq.k, 0, 0, -1,
+                (uint32_t) (s.mtp_out.size() * sizeof(int32_t)), 0, 0,
+                s.mtp_out.data(), s.mtp_out.size() * sizeof(int32_t));
     if (g_timing) {
         s.timing.n_draft++;
         s.timing.draft_total  += now_ms() - t_op;
@@ -2461,7 +2621,7 @@ static bool dispatch_frame(conn & c, stage & s, const req_header & req) {
         case OP_DECODE:     return op_decode(c, s, req);
         case OP_MTP_DRAFT:  return op_mtp_draft(c, s, req);
         default:
-            reply(c.peer, ST_BAD_REQ, 0, 0, 0, nullptr, 0);
+            reply_parts(c.peer, ST_BAD_REQ, 0, 0, 0);
             return false;
     }
 }
@@ -2558,7 +2718,28 @@ int main(int argc, char ** argv) {
     for (;;) {
         sock_t peer = accept(listener, nullptr, nullptr);
         if (!net::valid(peer)) {
-            break;
+            // [QLH-SPLIT] v10: a failed accept is not automatically the end of the stage. EINTR is
+            // what a signal (a debugger, a console event, a Ctrl-Break handler someone installed)
+            // does to a blocking accept, and both winsock and POSIX say the call simply did not
+            // happen -- retrying is the correct response. The old `break` here turned that into a
+            // silent exit(0): the listener closed, the port went away, and nothing was logged, which
+            // is indistinguishable from "the operator stopped it" in a supervisor's log.
+#ifdef _WIN32
+            const int err = WSAGetLastError();
+            const bool interrupted = (err == WSAEINTR);
+#else
+            const int err = errno;
+            const bool interrupted = (err == EINTR);
+#endif
+            if (interrupted) {
+                continue;
+            }
+            fprintf(stderr, "[split-stage] accept on %s:%d failed (socket error %d); the listener is "
+                            "gone, so this stage can no longer be reached\n",
+                    opt.host.c_str(), opt.port, err);
+            net::close_sock(listener);
+            stage_free(s);
+            return 1;
         }
         serve_connection(peer, s);
     }

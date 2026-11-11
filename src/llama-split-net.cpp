@@ -43,7 +43,19 @@ bool send_all(sock_t s, const void * src, size_t n) {
     while (n > 0) {
         const int put = (int) send(s, (const char *) p, (int) n, 0);
         if (put <= 0) {
+#ifdef _WIN32
             return false;
+#else
+            // A signal (SIGCHLD, SIGALRM, a debugger stop) interrupts the call without the peer
+            // having gone anywhere: resume from the same offset instead of failing the request
+            // and, through the caller, marking a healthy chain dead. send_two() below already
+            // documents this case for the scatter/gather path; the two must not disagree about
+            // what a short/aborted write means.
+            if (put < 0 && errno == EINTR) {
+                continue;
+            }
+            return false;
+#endif
         }
         p += put;
         n -= (size_t) put;
@@ -92,6 +104,12 @@ bool send_two(sock_t s, const void * a, size_t na, const void * b, size_t nb) {
         }
         const ssize_t sent = writev(s, iov, nbufs);
         if (sent <= 0) {
+            // Same split as send_all(): an interrupted write is not a dead peer, and the loop
+            // below already tracks how much of each buffer is left, so resuming is just another
+            // iteration. A zero-length writev is not something POSIX produces.
+            if (sent < 0 && errno == EINTR) {
+                continue;
+            }
             return false;
         }
         size_t left = (size_t) sent;
@@ -126,7 +144,16 @@ bool recv_all(sock_t s, void * dst, size_t n) {
     while (n > 0) {
         const int got = (int) recv(s, (char *) p, (int) n, 0);
         if (got <= 0) {
+#ifdef _WIN32
             return false;
+#else
+            // Same split as send_all(): an interrupted call is not a closed connection, but a
+            // zero-length read (got == 0) is the peer's EOF and must still fail.
+            if (got < 0 && errno == EINTR) {
+                continue;
+            }
+            return false;
+#endif
         }
         p += got;
         n -= (size_t) got;

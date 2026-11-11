@@ -1457,6 +1457,16 @@ void llama_context::set_embeddings(bool value) {
     // remote chain needs the same protection as a local one: the head is what fills the
     // carrier that gets sent over the wire.
     if ((!split_stages.empty() || !split_remotes.empty()) && !value) {
+        // [QLH-SPLIT] Not silent: the caller asked for something this context cannot do, and the
+        // price of ignoring it (an embedding-sized output buffer for the whole batch) is worth one
+        // line per process. call_once because llama-server toggles this from its slot loop, once
+        // per batch -- a line per call would be a line per token.
+        static std::once_flag once;
+        std::call_once(once, [] {
+            LLAMA_LOG_WARN("llama_context::set_embeddings: ignoring value = false on a context that "
+                    "drives a split chain -- the head owes pre-norm hidden to the next stage and "
+                    "cannot stop producing it\n");
+        });
         return;
     }
 
@@ -1894,6 +1904,14 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [QLH] SLIM-ARC: resolved once per call. The prefetcher is a process-wide singleton and the
+    // two uses below -- install the per-node eval callback, then scan the freshly built graph --
+    // have to agree on whether it is armed; asking twice is what lets a future edit change one of
+    // them and leave the other behind. CPU only: the callback path splits the graph at every
+    // observed node and synchronizes there, which would break GPU pipelining.
+    slim_arc::prefetch_scheduler * sched_arc =
+            model.n_gpu_layers() == 0 ? slim_arc::get_global_prefetch_scheduler() : nullptr;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1925,11 +1943,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         // [QLH] SLIM-ARC 2026-11-02: when the layer-ahead prefetcher is armed, the "which layer
         // is running" signal comes from the per-node eval callback -- the whole graph is
-        // submitted at once, so nothing in graph_compute() can know the current layer. CPU only:
-        // the callback path splits the graph at every observed node and synchronizes there,
-        // which would break GPU pipelining. The user callback is chained inside eval_cb().
-        if (auto * sched_arc = slim_arc::get_global_prefetch_scheduler();
-                sched_arc != nullptr && model.n_gpu_layers() == 0) {
+        // submitted at once, so nothing in graph_compute() can know the current layer. The user
+        // callback is chained inside eval_cb(). See the resolution at the top of this function.
+        if (sched_arc != nullptr) {
             sched_arc->attach_user_callback(cparams.cb_eval, cparams.cb_eval_user_data);
             ggml_backend_sched_set_eval_callback(sched.get(), slim_arc::prefetch_scheduler::eval_cb, sched_arc);
         } else {
@@ -1951,8 +1967,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // [QLH] SLIM-ARC 2026-11-02: scan the freshly built graph for the first node of every
         // layer. Has to run after build_graph() -- the per-tensor names that carry the layer
         // index are assigned by graph_get_cb() while the graph is being built.
-        if (auto * sched_arc = slim_arc::get_global_prefetch_scheduler();
-                sched_arc != nullptr && model.n_gpu_layers() == 0) {
+        if (sched_arc != nullptr) {
             sched_arc->prepare_graph(gf);
         }
 
@@ -2423,8 +2438,11 @@ int llama_context::split_attach_remote(const std::vector<std::string> & endpoint
     for (auto & r : split_remotes) {
         remote_ptrs.push_back(r.get());
     }
+    // The head argument is this context's own memory, not get_memory(): the accessor answers with
+    // split_memory once a chain exists, and split_memory.reset() above only happens to make the
+    // two equal here. Spelling out `memory` is what makes a future edit of that reset harmless.
     split_memory = std::make_unique<llama_memory_split>(
-            get_memory(), std::vector<llama_memory_t>{}, remote_ptrs);
+            memory.get(), std::vector<llama_memory_t>{}, remote_ptrs);
 
     return (int) split_remotes.size();
 }
@@ -2448,6 +2466,20 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
     // that this decode never writes.
     if (n > 0 && !split_remotes.empty()) {
         LLAMA_LOG_ERROR("%s: cannot mix remote and local stages in one chain\n", __func__);
+        return -1;
+    }
+
+    // [QLH-SPLIT] A chain is replaced by detaching it first, never by attaching on top of one.
+    //
+    // split_memory is what get_memory() answers with, so a second attach would build the new
+    // union view around the *old* view as its head (see the head argument below), and the old
+    // view is destroyed by that very assignment -- a head pointer into freed memory, touched by
+    // the first seq_rm/pos_min the server performs. Refusing here also keeps "one chain per
+    // context" a property of the API rather than of the caller's discipline.
+    if (n > 0 && !split_stages.empty()) {
+        LLAMA_LOG_ERROR("%s: this context already drives a chain of %zu stage(s); detach it "
+                "first (llama_split_attach(ctx, nullptr, 0)) before attaching another\n",
+                __func__, split_stages.size());
         return -1;
     }
 
@@ -2516,11 +2548,6 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
             return -1;
         }
 
-        if (n > hp.n_layer_src) {
-            LLAMA_LOG_ERROR("%s: %d stages for a source model with %d layers\n",
-                    __func__, n, hp.n_layer_src);
-            return -1;
-        }
         if (hp.layer_hi >= hp.n_layer_src) {
             LLAMA_LOG_ERROR("%s: head covers layers [%d, %d) of %d, so there is nothing left to "
                     "attach; the head cannot already be the tail\n",
@@ -2643,8 +2670,13 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
     for (auto * c : split_stages) {
         tail_mem.push_back(c->get_memory());
     }
+    // [QLH-SPLIT] The head of the view is this context's own memory, spelled out rather than
+    // through get_memory(): that accessor answers with split_memory itself once a chain exists,
+    // so it would nest the new view around the old one (and the assignment destroys the old one).
+    // The guard above makes that unreachable today; this is what keeps it unreachable if the
+    // guard is ever relaxed.
     split_memory = std::make_unique<llama_memory_split>(
-            get_memory(), tail_mem, std::vector<llama_split_remote *>{});
+            memory.get(), tail_mem, std::vector<llama_split_remote *>{});
 
     return n;
 }
@@ -2665,7 +2697,15 @@ int llama_context::split_attach(llama_context ** stages, int32_t n) {
 // has to be handed the expanded values explicitly -- otherwise every stage after position 0
 // rotates a different M-RoPE encoding than the head, which is a silent numerical divergence that
 // only shows up as "the chain's logits are close but not identical".
+//
+// [QLH-SPLIT] The body below is that upstream rule, and this is the only place in this file that
+// encodes it: everything that needs a row's graph position goes through this function. It cannot
+// be shared with llama_batch.cpp from here (the rule is a loop inside llama_batch_allocr::init),
+// so the two have to be changed together -- and the divergence is silent, which is why the
+// assertion below is the one thing that will not be: a section count the upstream rule does not
+// describe aborts instead of writing past `out`.
 static void split_expand_pos(const llama_batch_ext::token & tok, uint32_t n_pos_per_embd, llama_pos * out) {
+    GGML_ASSERT(n_pos_per_embd <= GGML_MROPE_SECTIONS);
     const bool expand = tok.id != LLAMA_TOKEN_NULL;
     for (uint32_t j = 0; j < n_pos_per_embd; ++j) {
         out[j] = expand ? (j < 3 ? tok.pos[0] : 0) : tok.pos[j];
@@ -2905,7 +2945,13 @@ static int split_run_hop(llama_context * stage, llama_batch_ext & hop,
                          std::vector<float> & carrier, bool last, size_t stage_no) {
     const int rc = stage->decode(hop);
     if (rc != 0) {
-        return rc; // preserves 0/1/negative semantics for the caller
+        // [QLH-SPLIT] rc == 1 means "could not find a KV slot for this batch -- retry with a
+        // smaller one" (llama.h), and the contract behind it is that the memory state was not
+        // touched. Neither half holds here: the head committed this batch before the hop was
+        // built, so handing 1 back would make the caller decode the same rows into the head a
+        // second time, and a stage cannot grow its KV anyway (it was fixed at startup). Every
+        // positive status is fatal for this request, exactly as the remote branch treats it.
+        return rc < 0 ? rc : -3;
     }
 
     if (!last) {
@@ -3092,6 +3138,31 @@ static int split_remote_take_hidden(std::vector<float> & carrier,
     return 0;
 }
 
+// [QLH-SPLIT] Record that the chain diverged because a hop failed.
+//
+// decode_plain() has already committed this batch to the head's KV, and so has every stage before
+// the failing one: their positions run ahead of the stages that never received the rows. Nothing
+// in the chain can be rewound to repair that -- a recurrent stage only keeps n_rs_seq snapshots,
+// and a partial seq_rm on a hybrid model is precisely the operation that has aborted in this tree
+// before -- so this is recorded instead of rolled back.
+//
+// "Recorded" is the memory layer's own dead-chain flag (llama_memory_split::remote_failure), which
+// decode_split consults before computing anything: the next request answers -3 with this reason
+// instead of continuing from a KV that no longer agrees with itself. A remote chain repairs itself
+// on the next batch that starts at position 0 (llama_memory_split::try_rebuild); a local chain
+// stays refused until it is re-attached, which is the honest state -- its stages are borrowed
+// contexts that this side cannot rebuild, and a refused request is strictly better than a token
+// computed from rows the tail never saw.
+static void split_note_diverged(llama_memory_split * mem, size_t stage_no, int rc) {
+    if (mem == nullptr || !mem->remote_failure.empty()) {
+        return;
+    }
+    mem->remote_failure = "stage " + std::to_string(stage_no) + " failed the hop (rc=" +
+            std::to_string(rc) + "): the head and every stage before it already committed this "
+            "batch, so their KV holds positions this stage never received";
+    LLAMA_LOG_ERROR("%s: %s\n", __func__, mem->remote_failure.c_str());
+}
+
 // [QLH-SPLIT] Remote chain: the head ran locally, hand the rows to each remote stage in turn and
 // adopt the last stage's answer.
 int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
@@ -3111,6 +3182,14 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
     std::vector<float>                 out_nextn;
     uint32_t                           out_nextn_embd = 0;
     std::string        err;
+
+    // [QLH-SPLIT] Every failure exit below has the same shape: the head (and every stage before
+    // s) already committed this batch, so the chain is diverged and has to be recorded as such --
+    // see split_note_diverged. One lambda keeps the exits from drifting apart.
+    const auto fail = [this](int rc, size_t stage_no) {
+        split_note_diverged(split_memory.get(), stage_no, rc);
+        return rc < 0 ? rc : -3;
+    };
 
     // [QLH-SPLIT] v9: the layer-input tap request goes to *every* remote stage, not just the last one.
     // A tap layer can land on any stage of the chain -- a three-stage chain puts some of DFlash's 8
@@ -3170,11 +3249,11 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
         if (rc != 0) {
             LLAMA_LOG_ERROR("%s: remote stage %zu failed: %s (rc=%d)\n",
                             __func__, s + 1, err.c_str(), rc);
-            return rc < 0 ? rc : -3;
+            return fail(rc, s + 1);
         }
         const int hrc = split_remote_take_hidden(carrier, out_hidden, last, s + 1);
         if (hrc != 0) {
-            return hrc;
+            return fail(hrc, s + 1);
         }
         // [QLH-SPLIT] v9: the taps are per stage and the stages own disjoint ranges, so the blocks
         // just accumulate. A stage that owned none contributes nothing (its flags say so), which is
@@ -3276,6 +3355,10 @@ int llama_context::split_drive_remote(const llama_batch_ext & batch_inp, std::ve
     LLAMA_LOG_ERROR("%s: the last remote stage returned no logits; it must be started "
             "with --role tail (a relay stage exports hidden and cannot end the chain)\n",
             __func__);
+    // Not recorded as a divergence: every stage decoded this batch successfully, so the chain's
+    // KV still agrees with itself -- what is wrong is the answer's type, which the handshake at
+    // attach time already refuses. Killing the chain here would turn a misconfigured --role into
+    // a local chain that can never serve again, for no gain.
     return -3;
 }
 
@@ -3294,7 +3377,11 @@ int llama_context::split_drive_local(const llama_batch_ext & batch_inp, std::vec
             rc = split_run_hop(split_stages[s], *hop, shape, plan, carrier, last, s + 1);
         }
         if (rc != 0) {
-            return rc;
+            // [QLH-SPLIT] Same rule as the remote branch: the head already committed this batch,
+            // so a failed hop leaves the chain diverged. Recorded, not rolled back -- see
+            // split_note_diverged for why a rewind is not an option here.
+            split_note_diverged(split_memory.get(), s + 1, rc);
+            return rc < 0 ? rc : -3;
         }
     }
     return 0;
