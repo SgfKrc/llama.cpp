@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -227,6 +228,41 @@ static __global__ void rms_norm_f32(const float * x,
             }
         }
     }
+}
+
+static __global__ void rms_norm_silu_gate_f32(
+        const float * x, const float * weight, const float * gate, float * dst,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = ((int64_t(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 128;
+    x += blockIdx.z * stride_sample + blockIdx.y * stride_channel + blockIdx.x * stride_row;
+    gate += row;
+    dst += row;
+    const int col = threadIdx.x;
+    ggml_cuda_pdl_sync();
+    // Match rms_norm_f32's 128-column vector path (32 threads x float4) so the
+    // fused result stays bitwise identical to RMS_NORM + MUL + MUL.
+    const float4 * x4 = (const float4 *) x;
+    const float4 * g4 = (const float4 *) gate;
+    const float4 * w4 = (const float4 *) weight;
+    float4 *       o4 = (float4 *)       dst;
+    extern __shared__ float shared[];
+    const float4 xs = x4[col];
+    float sum = xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    sum = block_reduce<block_reduce_method::SUM, 32>(sum, shared);
+    const float scale = rsqrtf(sum / 128 + eps);
+    float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+    const float4 m = w4[col];
+    r.x *= m.x;
+    r.y *= m.y;
+    r.z *= m.z;
+    r.w *= m.w;
+    const float4 g = g4[col];
+    r.x = ggml_cuda_op_silu_single(g.x) * r.x;
+    r.y = ggml_cuda_op_silu_single(g.y) * r.y;
+    r.z = ggml_cuda_op_silu_single(g.z) * r.z;
+    r.w = ggml_cuda_op_silu_single(g.w) * r.w;
+    o4[col] = r;
 }
 
 template <int block_size>
@@ -691,6 +727,21 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_silu_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm,
+                                    ggml_tensor * weighted, ggml_tensor * silu, ggml_tensor * dst) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * weight = weighted->src[0] == rms_norm ? weighted->src[1] : weighted->src[0];
+    const ggml_tensor * gate = silu->src[0];
+    const float eps = ggml_get_op_params_f32(rms_norm, 0);
+    const ggml_cuda_kernel_launch_params launch_params{
+        dim3(x->ne[1], x->ne[2], x->ne[3]), dim3(32), 32 * sizeof(float), ctx.stream()};
+    ggml_cuda_kernel_launch(rms_norm_silu_gate_f32, launch_params,
+        static_cast<const float *>(x->data), static_cast<const float *>(weight->data),
+        static_cast<const float *>(gate->data), static_cast<float *>(dst->data),
+        int64_t(x->nb[1] / sizeof(float)), int64_t(x->nb[2] / sizeof(float)),
+        int64_t(x->nb[3] / sizeof(float)), eps);
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

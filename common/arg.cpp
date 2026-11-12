@@ -2900,6 +2900,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // the only way to reach a remote tail from a terminal was the server's web UI.
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    // [QLH-KVMEM] The adapter swaps a context's memory for a sparse slot pool. These three only
+    // carry the values; common_init_result applies them before llama_init_from_model(), because
+    // the adapter reads them when the memory is built.
+    add_opt(common_arg(
+        {"--kvmem"},
+        {"--no-kvmem"},
+        "use the KVMem sparse-KV adapter instead of the stock memory "
+        "(requires a build with LLAMA_KVMEM=ON, see --kvmem-budget)",
+        [](common_params & params, bool value) {
+            params.kvmem.enabled = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kvmem-budget"}, "N",
+        string_format("KVMem sparse KV budget in tokens per sequence: rows kept in the slot "
+                      "pool before the working set is trimmed (default: %d, 0 = no sparsity)",
+                      params.kvmem.budget),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvmem.budget = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kvmem-gen-reserve"}, "N",
+        string_format("KVMem tokens always kept resident for generation, i.e. the tail of the "
+                      "working set that must not be evicted while decoding (default: %d)",
+                      params.kvmem.gen_reserve),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvmem.gen_reserve = value;
+        }
+    ));
+
     add_opt(common_arg(
         {"--split-rs-seq"}, "N",
         "[QLH-SPLIT] recurrent-state snapshots per sequence on every stage of a split chain. "

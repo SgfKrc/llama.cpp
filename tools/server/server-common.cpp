@@ -1359,6 +1359,43 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
     return process_mtmd_prompt(mctx, prompt, files, init_opt);
 }
 
+void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
+                                 std::vector<raw_buffer> & out_files) {
+    // get input files
+    if (!body.contains("messages")) {
+        throw std::invalid_argument("'messages' is required");
+    }
+    json & messages = body.at("messages");
+    if (!messages.is_array()) {
+        throw std::invalid_argument("Expected 'messages' to be an array");
+    }
+    for (auto & msg : messages) {
+        std::string role = json_value(msg, "role", std::string());
+        if (role != "assistant" && !msg.contains("content")) {
+            throw std::invalid_argument("All non-assistant messages must contain 'content'");
+        }
+        if (role == "assistant") {
+            if (!msg.contains("content") && !msg.contains("tool_calls")) {
+                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
+            }
+            if (!msg.contains("content")) {
+                continue; // avoid errors with no content
+            }
+        }
+        json & content = msg.at("content");
+        if (content.is_string() || content.is_null()) {
+            continue;
+        }
+
+        if (!content.is_array()) {
+            throw std::invalid_argument("Expected 'content' to be a string or an array");
+        }
+
+        oaicompat_content_load_media(content, opt, out_files);
+    }
+
+}
+
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
     const llama_vocab * vocab,
@@ -1421,38 +1458,8 @@ json oaicompat_chat_params_parse(
         json_schema["type"] = "object";
     }
 
-    // get input files
-    if (!body.contains("messages")) {
-        throw std::invalid_argument("'messages' is required");
-    }
+    oaicompat_chat_process_media(body, opt, out_files);
     json & messages = body.at("messages");
-    if (!messages.is_array()) {
-        throw std::invalid_argument("Expected 'messages' to be an array");
-    }
-    for (auto & msg : messages) {
-        std::string role = json_value(msg, "role", std::string());
-        if (role != "assistant" && !msg.contains("content")) {
-            throw std::invalid_argument("All non-assistant messages must contain 'content'");
-        }
-        if (role == "assistant") {
-            if (!msg.contains("content") && !msg.contains("tool_calls")) {
-                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
-            }
-            if (!msg.contains("content")) {
-                continue; // avoid errors with no content
-            }
-        }
-        json & content = msg.at("content");
-        if (content.is_string() || content.is_null()) {
-            continue;
-        }
-
-        if (!content.is_array()) {
-            throw std::invalid_argument("Expected 'content' to be a string or an array");
-        }
-
-        oaicompat_content_load_media(content, opt, out_files);
-    }
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 

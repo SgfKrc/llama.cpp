@@ -848,6 +848,7 @@ struct llm_graph_params {
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             ubatch.is_mixed()   == other.ubatch.is_mixed() &&
+            ubatch.n_pos        == other.ubatch.n_pos &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -1114,6 +1115,14 @@ struct llm_graph_context {
     bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
         return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
     }
+    // KVMem: side-channel copies. No-ops unless LLAMA_KVMEM is enabled and
+    // llama_kvmem_get_params()->enabled. Q is copied only when the ubatch
+    // overlaps the retrieval query span. V is copied in prefill only with
+    // --kvmem-harvest-v (or KVMEM_DUMP_CAPTURE); otherwise D2H on stage-out.
+    // Dest tensors are graph outputs named kvmem_{k,q,v}-<il>.
+    void kvmem_capture_k(ggml_tensor * k_prerope, int il) const;
+    void kvmem_capture_q(ggml_tensor * q, int il) const;
+    void kvmem_capture_v(ggml_tensor * v, int il) const;
 
     //
     // common

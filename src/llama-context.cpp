@@ -14,6 +14,9 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "slim-arc-prefetch.h"
 
 #include <algorithm>
@@ -812,6 +815,16 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    // [QLH-KVMEM] gf_res_prev / gf_res_decode hold unique_ptrs: reset the pointed-to results,
+    // never the pointers themselves (the loop below re-configures them right after).
+    for (auto & res : gf_res_prev) {
+        if (res) res->reset();
+    }
+    for (auto & res : gf_res_decode) {
+        if (res) res->reset();
+    }
+    decode_graph_stamp.fill(0);
+    gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
     gf_res_reserve->set_max_nodes(max_nodes);
@@ -1070,10 +1083,9 @@ bool llama_context::memory_update(bool optimize) {
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
-        for (auto & res : gf_res_prev) {
-            res->reset();
-        }
-        gf_res_prev_active = nullptr;
+        // [QLH-KVMEM] superset of the upstream reset: also drops the decode graphs, the capture
+        // stamps and the scheduler src rewrites, so a KVMem update cannot reuse a stale graph
+        reset_cached_graphs();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1918,14 +1930,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    static const bool decode_slots = [] {
+        const char * env = std::getenv("KVMEM_DECODE_GRAPH_SLOTS");
+        const bool on = !(env && env[0] == '0' && env[1] == '\0');
+        LLAMA_LOG_INFO("%s: fixed-width decode graph slots %s (1..%u)\n",
+                __func__, on ? "on" : "off", n_decode_graph_slots);
+        return on;
+    }();
+
+    const bool is_mtp = gtype == LLM_GRAPH_TYPE_DECODER_MTP;
+    const bool independent_draft = model.arch == LLM_ARCH_DFLASH;
+    const bool use_decode_slot = decode_slots && n_outputs > 0 &&
+            ubatch.n_tokens >= 1 && ubatch.n_tokens <= n_decode_graph_slots;
+
+    auto * res = use_decode_slot ? get_gf_res_decode(ubatch.n_tokens) : get_gf_res_prev();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    bool kvmem_ok = true;
+#if defined(LLAMA_KVMEM)
+    kvmem_ok = independent_draft || llama_kvmem_capture_can_reuse(ubatch.n_tokens, 1, ubatch.logical_pos ? ubatch.logical_pos : ubatch.pos,
+                                             is_mtp);
+    // The stamp belongs to the target graph. MTP reuse is already unconditional.
+    // Compare on every return to a width, including the slot that is still
+    // active: retrieval pin can change between two uses of the same width.
+    if (kvmem_ok && use_decode_slot && !is_mtp && !independent_draft) {
+        kvmem_ok = llama_kvmem_capture_stamp() == decode_graph_stamp[ubatch.n_tokens];
+    }
+#endif
+
+    const bool shape_ok = !graph_reuse_disable && res->can_reuse(gparams) && kvmem_ok;
+
+    // Decode slots share one scheduler arena. After another graph runs, a
+    // dormant slot's tensor addresses can alias that graph's temporaries or
+    // split-input copies. Rebuild on reactivation to allocate fresh bindings
+    // and register this graph's KVMem capture nodes; consecutive uses still reuse.
+    if (shape_ok && gf_res_prev_active == res) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1938,9 +1981,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        // [KVMEM] The previous compute is async. Restore scheduler-rewritten inputs,
+        // then recycle this graph's tensor headers.
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_reset(sched.get());
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
         // [QLH] SLIM-ARC 2026-11-02: when the layer-ahead prefetcher is armed, the "which layer
         // is running" signal comes from the per-node eval callback -- the whole graph is
         // submitted at once, so nothing in graph_compute() can know the current layer. The user
@@ -1954,6 +2000,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+#if defined(LLAMA_KVMEM)
+        if (!independent_draft) llama_kvmem_capture_on_new_graph(is_mtp);
+#endif
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1978,6 +2027,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+#if defined(LLAMA_KVMEM)
+        if (use_decode_slot && !is_mtp && !independent_draft) {
+            decode_graph_stamp[ubatch.n_tokens] = llama_kvmem_capture_stamp();
+        }
+#endif
     }
 
     // set the input data for the input tensors
@@ -1996,6 +2050,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+#if defined(LLAMA_KVMEM)
+    if (!independent_draft) llama_kvmem_harvest_ubatch(sched.get(), is_mtp);
+#endif
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -4251,6 +4309,33 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+void llama_context::reset_cached_graphs() {
+    // Scheduler copies point into these graphs. Restore the original inputs
+    // before the graph objects are recycled.
+    ggml_backend_sched_restore_graph_srcs(sched.get());
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    for (auto & res : gf_res_decode) {
+        if (res) {
+            res->reset();
+        }
+    }
+    decode_graph_stamp.fill(0);
+    gf_res_prev_active = nullptr;
+}
+
+llm_graph_result * llama_context::get_gf_res_decode(uint32_t n_tokens) {
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= n_decode_graph_slots);
+    auto & res = gf_res_decode[n_tokens];
+    if (!res) {
+        res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    return res.get();
+}
+
 llm_graph_result * llama_context::get_gf_res_prev() {
     return gf_res_prev[n_outputs > 0].get();
 }
@@ -4325,10 +4410,9 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
-    for (auto & res : gf_res_prev) {
-        res->reset();
-    }
-    gf_res_prev_active = nullptr;
+    // [QLH-KVMEM] superset of the upstream reset: also drops the decode graphs, the capture
+    // stamps and the scheduler src rewrites, so a reserve cannot reuse a stale graph
+    reset_cached_graphs();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -5678,6 +5762,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            ggml_backend_sched_restore_graph_srcs(sched.get());
             res->reset();
 
             auto * gf = model.build_graph(gparams);

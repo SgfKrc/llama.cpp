@@ -279,6 +279,16 @@ bool llama_batch_allocr::init(
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
     batch.logits   = output.data();
+    if (std::any_of(batch_inp.tokens.begin(), batch_inp.tokens.end(),
+                    [](const llama_batch_ext::token & t) { return t.logical_pos >= 0; })) {
+        logical_pos.resize(n_tok);
+        for (int32_t i = 0; i < n_tok; ++i) {
+            const auto & t = batch_inp.tokens[i];
+            logical_pos[i] = t.logical_pos >= 0 ? t.logical_pos : t.pos[0];
+        }
+        batch.logical_pos = logical_pos.data();
+    }
+
 
     //
     // compute stats
@@ -888,6 +898,7 @@ void llama_batch_allocr::clear() {
     embd_row_vec.clear();
     state_row_vec.clear();
     seq_id_data .clear();
+    logical_pos .clear();
     pos         .clear();
     n_seq_id    .clear();
     seq_id      .clear();
@@ -942,6 +953,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->embd_state.resize(n_state_all);
     udata->embd_row  .resize(has_row ? n_tokens : 0);
     udata->embd_state_row.resize(has_srow ? n_tokens : 0);
+    udata->logical_pos.resize(batch.logical_pos ? n_tokens : 0);
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
@@ -963,6 +975,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         if (use_embd) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+        }
+        if (batch.logical_pos) {
+            udata->logical_pos[i] = batch.logical_pos[idxs[i]];
         }
 
         if (mixed) {
@@ -1039,6 +1054,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
     };
+
+    res.logical_pos = batch.logical_pos ? res.data->logical_pos.data() : nullptr;
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
@@ -1236,11 +1253,12 @@ llama_batch_ext::llama_batch_ext(
         llama_seq_id n_seq_max,
         llama_memory_i * mem,
         llama_token n_vocab,
-        size_t n_pos_per_embd) :
+        size_t n_pos_per_embd,
+        size_t n_embd_state) :
         n_tokens_max(n_tokens_max),
         n_embd_inp(n_embd_inp),
         n_embd_inp_enc(n_embd_inp_enc),
-        n_embd_state(0),
+        n_embd_state(n_embd_state),
         n_seq_max(n_seq_max),
         mem(mem),
         n_vocab(n_vocab),
@@ -1492,6 +1510,12 @@ bool llama_batch_ext_add_seq(llama_batch_ext * batch, int32_t idx, llama_seq_id 
     return batch->add_seq(idx, seq_id);
 }
 
+bool llama_batch_ext_set_logical_pos(llama_batch_ext * batch, int32_t idx, llama_pos pos) {
+    if (idx < 0 || (size_t) idx >= batch->tokens.size() || pos < 0) return false;
+    batch->tokens[idx].logical_pos = pos;
+    return true;
+}
+
 bool llama_batch_ext_set_pos(llama_batch_ext * batch, int32_t idx, const llama_pos * pos) {
     return batch->set_token_pos(idx, pos);
 }
@@ -1547,6 +1571,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
         const llama_seq_id * sids = batch_inp.seq_id  ? batch_inp.seq_id[i]      : &default_seq_id;
 
         llama_batch_ext::token t;
+        if (batch_inp.logical_pos) t.logical_pos = batch_inp.logical_pos[i];
 
         // seq_ids
         for (int32_t s = 0; s < n_sid; ++s) {

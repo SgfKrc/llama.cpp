@@ -271,6 +271,9 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // Optional borrowed arrays; llama_batch_free does not free these.
+        llama_pos    *  logical_pos; // unique cache row IDs, independent of M-RoPE
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -850,6 +853,16 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // [QLH-KVMEM] out-of-tree sparse-KV adapter
+    //
+
+    // Process-global adapter controls. The adapter reads them when a llama_context builds its
+    // memory, so this must run before llama_init_from_model(); a later call only affects
+    // contexts created afterwards.
+    // Returns false when this build has no adapter compiled in (LLAMA_KVMEM=OFF).
+    LLAMA_API bool llama_kvmem_apply_params(int32_t budget, int32_t gen_reserve);
+
+    //
     // State / sessions
     //
 
@@ -1143,6 +1156,8 @@ extern "C" {
     // For M-RoPE models:
     //     - Embedding tokens must have n_pos_per_embd positions per token, in order [t, y, x, z]; t is also the KV cache position
     //     - Text token only requires one single position per token
+    LLAMA_API bool llama_batch_ext_set_logical_pos(struct llama_batch_ext * batch, int32_t idx, llama_pos pos);
+
     LLAMA_API bool llama_batch_ext_set_pos(
                                 struct llama_batch_ext * batch,
                                                int32_t   idx,

@@ -528,6 +528,15 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// [QLH-KVMEM] Process-global KVMem adapter controls. The adapter snapshots them when a
+// llama_context builds its memory, so common_init_result applies them before
+// llama_init_from_model().
+struct common_params_kvmem {
+    bool    enabled     = false; // --kvmem
+    int32_t budget      = 32768; // --kvmem-budget: sparse KV token budget, 0 = no sparsity
+    int32_t gen_reserve =  8192; // --kvmem-gen-reserve: tokens always kept for generation
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -621,6 +630,8 @@ struct common_params {
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
     struct common_params_diffusion   diffusion;
+
+    struct common_params_kvmem kvmem; // [QLH-KVMEM] adapter controls, see common_init_result
 
     struct common_params_model model;
 
@@ -1222,6 +1233,7 @@ struct common_batch {
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         int32_t      embd_row = -1; // see add_embd_row(), -1 if none
         int32_t      state_row = -1; // see set_embd_state_row(), -1 if none
+        llama_pos logical_pos = -1; // optional cache row cursor, separate from M-RoPE
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i

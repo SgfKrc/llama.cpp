@@ -1275,6 +1275,19 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // [QLH-KVMEM] The adapter replaces a context's memory with a sparse slot pool and reads its
+    // parameters when that memory is built, so they have to be in place before
+    // llama_init_from_model(). They are process-global, which is why every stage of a split
+    // chain re-applies the same values here rather than only the head.
+    if (params.kvmem.enabled) {
+        if (llama_kvmem_apply_params(params.kvmem.budget, params.kvmem.gen_reserve)) {
+            COM_INF("KVMem: budget=%d gen_reserve=%d (process-global, applied before context creation)\n",
+                    params.kvmem.budget, params.kvmem.gen_reserve);
+        } else {
+            COM_WRN("%s", "--kvmem requested, but this build has no KVMem adapter (LLAMA_KVMEM=OFF); ignoring\n");
+        }
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -2580,6 +2593,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
             llama_batch_ext_set_pos(res, idx, t.pos.data());
         }
         GGML_ASSERT(idx == i - off);
+        if (t.logical_pos >= 0) llama_batch_ext_set_logical_pos(res, idx, t.logical_pos);
 
         for (const llama_seq_id seq_id : t.seq_ids_extra) {
             if (!llama_batch_ext_add_seq(res, idx, seq_id)) {
