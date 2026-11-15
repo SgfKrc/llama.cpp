@@ -16,6 +16,18 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#endif
+
 namespace {
 
 // ClassLRU: one LRU list per frequency class, over the experts of a group of layers
@@ -316,6 +328,18 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// the OS page size: the driver pins pages, so the registered ranges must be page-aligned
+static size_t llama_moe_cache_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return (size_t) info.dwPageSize;
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (size_t) page : 4096;
+#endif
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -368,6 +392,8 @@ struct llama_moe_cache::impl {
 
     static constexpr int64_t max_batch = 32;
 
+    const llama_model & model;
+
     int32_t n_expert_used;
 
     stats stats_small; // up to 8 tokens per ubatch
@@ -399,8 +425,15 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    // a host range registered as pinned, with the backend call that unregisters it
+    struct pinned_range {
+        void * ptr;
+        void (*unregister)(void *);
+    };
+    std::vector<pinned_range> pinned;
+
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+            model(model), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -634,6 +667,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+
     }
 
     // the device that caches layer il
@@ -679,7 +713,146 @@ struct llama_moe_cache::impl {
         fwrite(ids.data(), sizeof(int32_t), ids.size(), trace);
     }
 
+    // The host experts of the mmap'd layers are pageable, so each device copy of a miss reads pageable memory, which
+    // measured slower than not caching at all. Register their pages as pinned, the pages stay file-backed.
+    // called from llama_context after sched_reserve(): the host expert tensors are no_alloc at
+    // construction time, their data pointer only exists once the model buffers are allocated.
+    void pin() {
+        // own gate: without it the default configuration walks the layers and logs. The CUDA backend tests the same
+        // variable with atoi in ggml_backend_cuda_register_host_buffer, so this test matches it.
+        const char * env_register = getenv("GGML_CUDA_REGISTER_HOST");
+        if (env_register == nullptr || atoi(env_register) == 0) {
+            return;
+        }
+
+        // Pinned pages count against the Windows shared GPU budget (about half of the RAM) and the driver makes the
+        // system unstable when too much is registered, so the cap must stay well below it.
+        size_t cap;
+        if (const char * env_pin = getenv("LLAMA_MOE_PIN_MIB"); env_pin != nullptr && *env_pin != '\0') {
+            const long mib = strtol(env_pin, nullptr, 10);
+            if (mib <= 0) {
+                LLAMA_LOG_INFO("%s: host experts stay pageable, LLAMA_MOE_PIN_MIB = %ld\n", __func__, mib);
+                return;
+            }
+            cap = (size_t) mib * 1024 * 1024;
+        } else {
+            size_t free = 0;
+            size_t total = 0;
+            const ggml_backend_dev_t dev_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (dev_cpu != nullptr) {
+                ggml_backend_dev_memory(dev_cpu, &free, &total);
+            }
+            cap = total > 0 ? total/4 : (size_t) 8*1024*1024*1024;
+        }
+
+        // The calls that pin host memory, and the host buffer type of each device. The llama library does not link
+        // the CUDA backend, so the calls are resolved by name. One backend is enough: the ranges are portable.
+        using register_t   = bool (*)(void *, size_t);
+        using unregister_t = void (*)(void *);
+        register_t   register_fn   = nullptr;
+        unregister_t unregister_fn = nullptr;
+        std::vector<ggml_backend_buffer_type_t> host_buft(devices.size(), nullptr);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+            if (dev == nullptr) {
+                continue;
+            }
+            host_buft[id] = ggml_backend_dev_host_buffer_type(dev);
+            if (register_fn != nullptr) {
+                continue;
+            }
+            const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const register_t   reg_fn   = (register_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+            const unregister_t unreg_fn = (unregister_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+            if (reg_fn != nullptr && unreg_fn != nullptr) {
+                register_fn   = reg_fn;
+                unregister_fn = unreg_fn;
+            }
+        }
+        if (register_fn == nullptr) {
+            LLAMA_LOG_WARN("%s: the GPU backend cannot pin host memory, the host experts stay pageable\n", __func__);
+            return;
+        }
+
+        // the host experts of the layers the cache copies from
+        struct range {
+            uintptr_t beg;
+            uintptr_t end;
+        };
+        std::vector<range> ranges;
+        size_t n_already = 0;
+        for (const group & g : groups) {
+            if (g.n_slots == 0) {
+                continue; // not cached, its experts are never copied
+            }
+            for (const int32_t il : g.layers) {
+                auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+                for (const ggml_tensor * t : experts) {
+                    if (t->data == nullptr || !llama_moe_cache_is_host_weight(t)) {
+                        continue;
+                    }
+                    // --load-mode none keeps the host experts in the pinned host buffer of the device already
+                    if (ggml_backend_buffer_get_type(t->buffer) == host_buft[g.id]) {
+                        n_already++;
+                        continue;
+                    }
+                    ranges.push_back({ (uintptr_t) t->data, (uintptr_t) t->data + ggml_nbytes(t) });
+                }
+            }
+        }
+        if (ranges.empty()) {
+            if (n_already > 0) {
+                LLAMA_LOG_INFO("%s: the %zu host expert tensors already sit in pinned host memory\n", __func__, n_already);
+            }
+            return;
+        }
+        std::sort(ranges.begin(), ranges.end(), [](const range & a, const range & b) { return a.beg < b.beg; });
+
+        // Merge the tensors that touch, then round out to whole pages: the driver pins pages, and a page shared by two
+        // tensors must be in one range, a second registration of that page fails.
+        const uintptr_t page = (uintptr_t) llama_moe_cache_page_size();
+        std::vector<range> merged;
+        for (const range & r : ranges) {
+            const uintptr_t beg = r.beg & ~(page - 1);
+            const uintptr_t end = (r.end + page - 1) & ~(page - 1);
+            if (!merged.empty() && beg <= merged.back().end) {
+                merged.back().end = std::max(merged.back().end, end);
+            } else {
+                merged.push_back({ beg, end });
+            }
+        }
+
+        size_t n_bytes   = 0;
+        size_t n_skipped = 0;
+        size_t n_refused = 0;
+        for (size_t i = 0; i < merged.size(); ++i) {
+            const size_t size = merged[i].end - merged[i].beg;
+            if (n_bytes + size > cap) {
+                n_skipped = merged.size() - i; // the rest stays pageable
+                break;
+            }
+            // cudaHostRegister locks the pages that are resident; an mmap range is demand-paged, so a
+            // large range can be rejected with out-of-memory before the driver ever faults it in.
+            for (uintptr_t off = 0; off < size; off += page) {
+                (void) *(volatile const char *) (merged[i].beg + off);
+            }
+            if (!register_fn((void *) merged[i].beg, size)) {
+                n_refused++; // the driver refused it, it stays pageable
+                continue;
+            }
+            pinned.push_back({ (void *) merged[i].beg, unregister_fn });
+            n_bytes += size;
+        }
+
+        LLAMA_LOG_INFO("%s: pinned %zu of %zu host expert ranges, %.2f MiB (cap %.2f MiB), %zu over the cap, %zu refused, %zu already pinned\n", __func__,
+            pinned.size(), merged.size(), n_bytes/1024.0/1024.0, cap/1024.0/1024.0, n_skipped, n_refused, n_already);
+    }
+
     ~impl() {
+        // the device copies read the pinned pages, so unregister while the backends are still alive
+        for (const pinned_range & p : pinned) {
+            p.unregister(p.ptr);
+        }
         log_stats();
         if (trace != nullptr) {
             fclose(trace);
@@ -880,6 +1053,10 @@ struct llama_moe_cache::impl {
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
     pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+}
+
+void llama_moe_cache::pin() {
+    pimpl->pin();
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
