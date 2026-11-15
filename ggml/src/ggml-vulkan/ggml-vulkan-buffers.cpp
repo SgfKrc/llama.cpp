@@ -284,7 +284,14 @@ void * ggml_vk_host_malloc(size_t size) {
 
     ggml_vk_instance_init();
 
-    if (vk_instance.multi_device) {
+    // Every device can be filtered out: GGML_VK_VISIBLE_DEVICES may name nothing (an empty string
+    // leaves device_indices empty and does not take the "no devices found" early return, which only
+    // runs when the variable is unset), and the fallback loop can find no non-CPU device. There
+    // ggml_vk_get_device(0) would read vk_instance.device_indices[0] out of bounds before it ever
+    // reached the bounds check inside. With no device there is nothing to make this allocation
+    // importable for, so it is plain system memory -- registered as portable so that host_free()
+    // and host_get() take exactly the branch they take for a single-heap iGPU below.
+    if (vk_instance.device_indices.empty()) {
         const size_t align      = std::max<size_t>(vk_instance.host_import_alignment, TENSOR_ALIGNMENT);
         const size_t alloc_size = (size + align - 1) / align * align;
 
@@ -293,8 +300,9 @@ void * ggml_vk_host_malloc(size_t size) {
             return nullptr;
         }
         vk_host_allocation entry;
-        entry.base = ptr;
-        entry.size = alloc_size;
+        entry.base     = ptr;
+        entry.size     = alloc_size;
+        entry.portable = true;
 
         std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
         vk_instance.host_allocations.push_back(std::move(entry));
@@ -302,6 +310,31 @@ void * ggml_vk_host_malloc(size_t size) {
     }
 
     vk_device dev0 = ggml_vk_get_device(0);
+
+    // A single-heap iGPU has no separate host pool: a Vulkan host buffer there is charged to
+    // the device heap, so CPU layers eat VRAM. Use system memory instead. There the GPU has no
+    // view of it, so a tensor in it is CPU-only and a copy has to stage it.
+    const bool portable = vk_instance.multi_device || dev0->host_visible_is_device_local;
+    if (portable) {
+        const size_t align      = std::max({vk_instance.host_import_alignment,
+                                            (size_t) dev0->properties.limits.minMemoryMapAlignment,
+                                            (size_t) TENSOR_ALIGNMENT});
+        const size_t alloc_size = (size + align - 1) / align * align;
+
+        void * ptr = portable_aligned_malloc(align, alloc_size);
+        if (ptr == nullptr) {
+            return nullptr;
+        }
+        vk_host_allocation entry;
+        entry.base     = ptr;
+        entry.size     = alloc_size;
+        entry.portable = true;
+
+        std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+        vk_instance.host_allocations.push_back(std::move(entry));
+        return ptr;
+    }
+
     vk_buffer buf;
     try {
         buf = ggml_vk_create_buffer(dev0, size,
@@ -348,7 +381,8 @@ void ggml_vk_host_free(void * ptr) {
     for (auto & view : entry.views) {
         ggml_vk_destroy_buffer(view);
     }
-    if (vk_instance.multi_device) {
+    // Not vk_instance.multi_device: a single-heap iGPU allocates through the same path.
+    if (entry.portable) {
         portable_aligned_free(entry.base);
     }
 }
@@ -367,6 +401,11 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
 
     if (entry.views[device->idx] == nullptr) {
         const uint32_t bit = 1u << device->idx;
+        // The gate below is not entry.portable. A single-heap iGPU is not multi_device,
+        // so it returns here and keeps the allocation as system memory: importing it
+        // would charge it to the device heap like a native allocation (measured
+        // heapUsage +276 MiB on Iris Xe) and defeat the point of the portable allocation. Under
+        // multi_device a portable allocation is imported when the driver allows it.
         if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
             return;
         }
