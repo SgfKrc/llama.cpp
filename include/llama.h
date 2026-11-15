@@ -365,6 +365,13 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // Load only source layers [split_layer_lo, split_layer_hi) and expose them as this model's local layers 0..N-1.
+        // A split context loads several ranges inside one process, so the range cannot come from LLAMA_LAYER_RANGE
+        // (process wide); that env var stays the fallback for one-process-per-stage entry points.
+        // Both -1 means the whole model, which is the only value that behaves as before.
+        int32_t split_layer_lo;
+        int32_t split_layer_hi;
     };
 
     struct llama_sampler_seq_config {
@@ -382,6 +389,10 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        // The most result rows one decode frame may answer (--split-verify-rows). Both ends of a split
+        // chain must agree on it: a tail sizes its logits buffer from it, and a head uses it to bound a
+        // verify frame. 0 = the default (17).
+        uint32_t split_verify_rows;
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
