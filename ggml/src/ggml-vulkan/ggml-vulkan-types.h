@@ -723,6 +723,7 @@ struct vk_device_struct {
     uint32_t shader_core_count;
     bool uma;
     bool rebar;
+    bool host_visible_is_device_local = false;
     bool prefer_host_memory;
     bool float_controls_rte_fp16;
     bool float_controls_denorm_preserve_fp16;
@@ -1375,6 +1376,7 @@ struct ggml_backend_vk_buffer_context {
 struct vk_host_allocation {
     void *    base = nullptr;
     size_t    size = 0;
+    bool      portable = false;  // base came from portable_aligned_malloc(), not from a Vulkan allocation
     vk_buffer views[GGML_VK_MAX_DEVICES];  // indexed by device->idx; null = not (yet) mapped here
 };
 

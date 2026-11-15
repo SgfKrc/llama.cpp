@@ -284,8 +284,16 @@ void * ggml_vk_host_malloc(size_t size) {
 
     ggml_vk_instance_init();
 
-    if (vk_instance.multi_device) {
-        const size_t align      = std::max<size_t>(vk_instance.host_import_alignment, TENSOR_ALIGNMENT);
+    vk_device dev0 = ggml_vk_get_device(0);
+
+    // A single-heap iGPU has no separate host pool: a Vulkan host buffer there is charged to
+    // the device heap, so CPU layers eat VRAM. Use system memory instead. There the GPU has no
+    // view of it, so a tensor in it is CPU-only and a copy has to stage it.
+    const bool portable = vk_instance.multi_device || dev0->host_visible_is_device_local;
+    if (portable) {
+        const size_t align      = std::max({vk_instance.host_import_alignment,
+                                            (size_t) dev0->properties.limits.minMemoryMapAlignment,
+                                            (size_t) TENSOR_ALIGNMENT});
         const size_t alloc_size = (size + align - 1) / align * align;
 
         void * ptr = portable_aligned_malloc(align, alloc_size);
@@ -293,15 +301,15 @@ void * ggml_vk_host_malloc(size_t size) {
             return nullptr;
         }
         vk_host_allocation entry;
-        entry.base = ptr;
-        entry.size = alloc_size;
+        entry.base     = ptr;
+        entry.size     = alloc_size;
+        entry.portable = true;
 
         std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
         vk_instance.host_allocations.push_back(std::move(entry));
         return ptr;
     }
 
-    vk_device dev0 = ggml_vk_get_device(0);
     vk_buffer buf;
     try {
         buf = ggml_vk_create_buffer(dev0, size,
@@ -348,7 +356,8 @@ void ggml_vk_host_free(void * ptr) {
     for (auto & view : entry.views) {
         ggml_vk_destroy_buffer(view);
     }
-    if (vk_instance.multi_device) {
+    // Not vk_instance.multi_device: a single-heap iGPU allocates through the same path.
+    if (entry.portable) {
         portable_aligned_free(entry.base);
     }
 }
@@ -367,6 +376,11 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
 
     if (entry.views[device->idx] == nullptr) {
         const uint32_t bit = 1u << device->idx;
+        // The gate below is not entry.portable. A single-heap iGPU is not multi_device,
+        // so it returns here and keeps the allocation as system memory: importing it
+        // would charge it to the device heap like a native allocation (measured
+        // heapUsage +276 MiB on Iris Xe) and defeat the point of the portable allocation. Under
+        // multi_device a portable allocation is imported when the driver allows it.
         if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
             return;
         }
@@ -712,8 +726,11 @@ static bool ggml_vk_buffer_host_read_direct(const vk_buffer & buf) {
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
-    // AMD UMA: uncached host-visible memory is write-combined, CPU reads are slow
-    const bool slow_host_read = buf->device->vendor_id == VK_VENDOR_ID_AMD &&
+    // UMA: uncached host-visible memory is write-combined, CPU reads are slow. Intel is
+    // affected as well as AMD (#31900), so only Nvidia keeps the direct path -- benchmarks
+    // there showed it wins (#32024). A decode step reads back ~600 KB of logits per token,
+    // which the direct path turns into milliseconds on Iris Xe.
+    const bool slow_host_read = buf->device->vendor_id != VK_VENDOR_ID_NVIDIA &&
                                 !(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
     return (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && buf->device->uma && !slow_host_read;
 }
