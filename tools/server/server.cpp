@@ -127,10 +127,46 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+            // A remote chain *can* drive several sequences now, but "auto" stays 1
+            // for it. Auto would mean 4 slots and kv_unified = true (the branch below), and a
+            // unified pool gives the head's slots the whole context while every stage cuts its own
+            // pool n_ctx / n_seq_max ways -- the two ends would disagree about the per-sequence
+            // capacity, which shows up as ST_NO_SPACE in the middle of a request. Multi-sequence on
+            // a remote chain is a deliberate configuration: -np N plus --no-kv-unified.
+            if (!params.split_remote.empty()) {
+                SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 1 (a remote split chain "
+                        "needs an explicit -np N together with --no-kv-unified to drive more than "
+                        "one sequence)\n");
+                params.n_parallel = 1;
+            } else {
+                SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
-            params.n_parallel = 4;
-            params.kv_unified = true;
+                params.n_parallel = 4;
+                params.kv_unified = true;
+            }
+        }
+
+        if (!params.split_remote.empty() && params.n_parallel > 1) {
+            // A remote chain supports -np N, and this is the one configuration it
+            // cannot carry. kv_unified gives the head's single sequence the whole KV pool
+            // (n_ctx_seq = n_ctx), while a stage cuts its pool n_ctx / n_seq_max ways; the two ends
+            // would then disagree about how many positions each sequence has, and the failure is a
+            // mid-request ST_NO_SPACE rather than anything legible at startup.
+            //
+            // Refusing instead of quietly turning kv_unified off: silently rewriting a flag the
+            // operator typed is how a configuration nobody chose ends up in a report. Say which flag
+            // to add and let them add it.
+            if (params.kv_unified) {
+                SRV_ERR("a remote split chain with -np %d needs --no-kv-unified: a unified KV pool "
+                        "gives this process's sequences the whole context, while every split-stage "
+                        "divides its own pool by --n-seq-max, so the two ends would disagree about "
+                        "the per-sequence capacity (the symptom is a failed request mid-decode, not "
+                        "a startup error).\n", params.n_parallel);
+                return false;
+            }
+            SRV_INF("remote split chain with n_parallel = %d: start every split-stage with "
+                    "--n-seq-max %d and --split-verify-rows %u (the same values as here)\n",
+                    params.n_parallel, params.n_parallel, params.split_verify_rows);
         }
     }
 

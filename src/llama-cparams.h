@@ -16,6 +16,11 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
+    // The frame's output-row bound, i.e. what --split-verify-rows says. On a tail
+    // it sizes n_outputs_max (a verify frame may mark that many rows as output); on a head it is the
+    // number the chain identity compares and the bound a verify frame is checked against. 0 means
+    // "not set" and is resolved to qlh_split::DEFAULT_SPLIT_VERIFY_ROWS in the constructor.
+    uint32_t split_verify_rows;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 

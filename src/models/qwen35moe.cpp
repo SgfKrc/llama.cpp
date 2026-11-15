@@ -171,6 +171,17 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // The hidden exit (t_layer_inp[n_layer]) needs every token row, but
+    // crop_before_nextn trims the last layer down to n_outputs rows. A caller that uses
+    // the layer_inp channel only takes the hidden and no logits, so n_outputs == 0 and
+    // the last layer is cropped to a [n_embd, 0] empty tensor -- which makes
+    // extract_layer_inputs' row_floats == n_embd assert fail right away. Skip the crop only
+    // when the slot is armed: skipping it unconditionally would leave inp_out_ids unused and
+    // its buffer unallocated, so llm_graph_input_out_ids::set_input would hit
+    // GGML_ASSERT(buffer) instead.
+    const bool qlh_keep_full_rows =
+        n_layer < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -191,7 +202,7 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
         }
 
-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids) && !qlh_keep_full_rows) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -223,7 +234,23 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
     }
     cur = inpL;
 
-    // post-norm hidden state feeds both the LM head and the MTP seed below
+    // Register the last layer's output as t_layer_inp[n_layer].
+    // The loop above only fills t_layer_inp[0..n_layer-1] (each entry is that layer's
+    // *input*). A relay segment's "layer n_layer input" is precisely this tensor, and
+    // DFlash's whole-head path needs it: without this entry, layer_inp[n_layer] stays
+    // null and llama_set_embeddings_layer_inp(n_layer) aborts in extract_layer_inputs.
+    // Falling back to the embeddings channel instead is NOT equivalent -- measured
+    // max|diff| 0.227 against layer_inp[32] on the same prompt, which is enough to
+    // poison the draft's eight-way concat.
+    res->t_layer_inp[n_layer] = cur;
+
+    // The crop was skipped so the hidden exits keep every token row. inp_out_ids
+    // needs a consumer or its buffer is never allocated, and on the relay path nothing below
+    // expands the norm chain, so expand the crop itself.
+    if (qlh_keep_full_rows && crop_before_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        ggml_build_forward_expand(gf, cur);
+    }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
@@ -237,10 +264,22 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
     res->t_embd = cur;
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // A relay segment has no use for logits; leaving t_logits null keeps the
+    // output projection (and its ~515 MB of weights) out of the graph entirely. A non-tail range
+    // never loads output.weight (llama_model_loader::needs_output), so only a range that reaches
+    // the source model's last layer can build the head.
+    const bool needs_logits = !(hparams.layer_hi >= 0 && hparams.layer_hi < hparams.n_layer_src);
+    if (needs_logits) {
+        // The crop above was skipped so the hidden exit keeps every row; the
+        // LM head still only needs the output rows.
+        if (qlh_keep_full_rows && inp_out_ids != nullptr && cur->ne[1] != inp_out_ids->ne[0]) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(

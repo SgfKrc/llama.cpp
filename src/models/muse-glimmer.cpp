@@ -86,7 +86,7 @@ llama_model_muse_glimmer::graph::graph(const llm_graph_params & params)
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // self-attention: attention output gate around SDPA (afmoe.cpp:147-191)
+        // self-attention: attention output gate around SDPA (same block as afmoe.cpp)
         {
             ggml_tensor * attn_inp = cur;  // save input for gate computation
 

@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-split-remote.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -14,6 +15,7 @@
 
 #include <array>
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -26,6 +28,11 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+
+// The aggregate memory view over a chain; defined in llama-memory-split.h. Only a
+// unique_ptr to it is held here, and the destructor of llama_context lives in the .cpp that
+// includes the definition, so a forward declaration is enough.
+struct llama_memory_split;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -161,7 +168,29 @@ struct llama_context {
                        ggml_status & ret);
 
     int encode(const llama_batch_ext & batch_inp);
+    // decode() dispatches: with split_stages empty it is exactly decode_plain(),
+    // which is the pre-existing whole-model path.
     int decode(const llama_batch_ext & batch_inp);
+    int decode_plain(const llama_batch_ext & batch_inp);
+    int decode_split(const llama_batch_ext & batch_inp);
+
+    // Borrowed continuation stages; see split_stages.
+    int  split_attach(llama_context ** stages, int32_t n);
+    int  split_attach_remote(const std::vector<std::string> & endpoints, std::string & err);
+    // Both carriers count: a chain can be local, remote, or (never both -- see split_attach)
+    // one or the other, and a caller asking how long the chain is means what decode drives.
+    int32_t split_n_stages() const { return (int32_t) (split_stages.size() + split_remotes.size()); }
+
+    // Whether the chain is still trustworthy, and why not. Defined in the .cpp: the
+    // answer lives in llama_memory_split, which is only forward-declared here. See
+    // llama_context_split_failed() in llama-ext.h for the contract.
+    bool         split_failed()  const;
+    const char * split_failure() const;
+
+    // The last state restore found a snapshot the stage no longer holds. Not a
+    // chain failure -- nothing was applied -- so it is answered separately. See
+    // llama_context_split_state_stale() in llama-ext.h.
+    bool         split_state_stale() const;
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -285,7 +314,240 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // The remote candidate channel. These are the three operations llama-ext.h
+    // exports; they live here because the state they touch (split_remotes, split_cand_*) is
+    // private, and because "does this context have a remote stage" must not be answered by
+    // inspecting a member from outside the class.
+    bool     split_has_remote() const { return !split_remotes.empty(); }
+
+    // Arms the next remote decode for one sequence. Safe for a local chain and a whole model: it
+    // just clears. seq_id is the sequence the request belongs to -- two slots of one llama-server
+    // have two samplers, so this cannot be a context-wide setting.
+    void     split_request_candidates(llama_seq_id seq_id, const qlh_split::cand_req * req,
+                                      const llama_logit_bias * biases, uint32_t n_bias,
+                                      const llama_token * hist, uint32_t n_hist);
+
+    // Candidates of the last remote decode for batch row `row`; see llama-ext.h for the contract.
+    uint32_t split_take_candidates(int32_t row, const llama_split_token_cand ** cands) const;
+
+    // The per-row verify channel, same shape as the two above. `on` arms the next
+    // remote decode for one sequence; a local chain and a whole model ignore it (there is no wire to
+    // spare), which is why the caller does not have to distinguish the chain kinds.
+    void        split_request_verify_rows(llama_seq_id seq_id, bool on);
+    // `row` is a *batch row of the frame that was decoded* (what get_logits_ith takes), not a
+    // position in the answer: the reply's row table is what maps it, so a frame whose verify rows
+    // start at row 4 answers correctly.
+    llama_token split_verified_token(int32_t row) const;
+
+    // The remote MTP draft. Same rule as the channels above -- a local chain and a
+    // whole model answer "no" and the caller keeps its own path, so nothing upstream has to know
+    // which kind of chain it is driving.
+    //
+    // `split_mtp_ready()` is a startup property (the tail reported a draft context in OP_HELLO);
+    // `split_mtp_draft()` is the per-round call. The latter runs one round trip, not k: the tail
+    // runs the recursive draft loop in its own memory, which is the only way the draft can be
+    // remote at all (draft i needs draft i-1's h, so the steps cannot be batched).
+    bool split_mtp_ready() const;
+
+    // Arms the next remote decode to answer with the h_nextn rows of the rows this sequence asked
+    // for. Ignored by a local chain and a whole model, like every other arming call here.
+    void     split_request_nextn_rows(llama_seq_id seq_id, bool on);
+
+    // h_nextn rows of the last remote decode, for the caller that feeds the draft. `rows` holds
+    // n_rows * n_embd floats and `row_ids` names the batch row of each of them, in the same order --
+    // a table instead of a single anchor row, because a frame can answer rows of several
+    // sequences. All are 0 when the last decode
+    // did not carry them.
+    uint32_t split_take_nextn(const float ** rows, const int32_t ** row_ids, uint32_t * n_embd) const;
+
+    // Runs one draft round on the remote tail. Returns the number of drafts written to `out`
+    // (0 when the chain cannot draft -- whole model, local chain, or a stage that lost its MTP
+    // context) and -1 on a transport failure, which the caller turns into "no drafts" as well.
+    int split_mtp_draft(const float * h, int32_t token, int32_t pos, uint32_t k,
+                        int32_t seq_id, int32_t * out, uint32_t * n_out);
+
+    // The layer-input tap channel. Unlike the three remote channels above this one is
+    // *not* armed per frame: which layers a draft model reads is a property of the chain, so the set
+    // is sticky and every decode asks for it until it is cleared. That is also what keeps the arming
+    // out of the server's per-frame path -- the speculative driver sets it once, from the draft
+    // model's own target_layers.
+    //
+    // Ignored by a local chain and by a whole model (both clear the set): a local chain reads the
+    // taps out of the context that owns them, which is the same process.
+    void split_set_layer_inp(const uint32_t * ids, uint32_t n);
+
+    // The taps the last remote decode answered: `n` blocks, each `n_rows` rows of `n_embd` floats and
+    // the source-layer id it belongs to. Only the ids some remote stage owned are here, so a caller
+    // must look its layers up by id rather than by position.
+    uint32_t split_take_layer_inp_n() const { return (uint32_t) split_answer.tap.size(); }
+    const float * split_take_layer_inp(uint32_t i, uint32_t * id, uint32_t * n_rows, uint32_t * n_embd) const;
+
 private:
+    // decode_split() is composed of these. They are members only because they reach
+    // into the chain (split_stages / split_remotes / split_cand_*); everything that needs nothing
+    // but the public context API stays a file-local helper in llama-context.cpp. Splitting it
+    // this way is what puts "admit, head, then remote-or-local" on one screen.
+    int  split_admit_batch(const llama_batch_ext & batch_inp);
+    int  split_self_heal(const llama_batch_ext & batch_inp);
+    int  split_drive_remote(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
+                            int32_t n_tok, int32_t n_embd);
+    int  split_drive_local(const llama_batch_ext & batch_inp, std::vector<float> & carrier,
+                           int32_t n_tok, int32_t n_embd);
+
+    // Is this context driving a chain? Spelled out once, because three spellings of
+    // it (split_stages, split_remotes, split_memory) had grown apart, and the third one is the
+    // authoritative one: split_memory is what get_memory() answers with, so a context whose view
+    // is gone is a whole-model context however the two lists read.
+    //
+    // The two attach paths install the view last and detach drops it first, so outside a
+    // construction this is exactly "a stage is attached". Inside one they differ for a moment:
+    // split_attach() assigns split_stages before it builds the view, and split_attach_remote()
+    // grows split_remotes before it builds one. In those two windows split_active() answers false
+    // while the list-based spelling (!stages.empty() || !remotes.empty()) answers true. No reader
+    // runs there (neither path calls back into decode()/get_logits() while it is assembling a
+    // chain), so from outside the two spellings are equivalent -- but this is the one place where
+    // "the lists are non-empty" and "the view exists" are not the same statement. Use
+    // split_has_remote() for the narrower question.
+    bool split_active() const { return split_memory != nullptr; }
+
+    // What the head fixes for every stage in a chain: the source depth, the
+    // vocabulary, the one width a hop carries, and the four numbers a multi-sequence chain has
+    // to agree on. The last four are what stage_id carries back; see llama-split-proto.h for why each
+    // one is a hard failure rather than a performance difference when the two ends disagree.
+    struct head_expect {
+        int32_t  n_layer_src = 0;
+        uint32_t n_vocab     = 0;
+        uint32_t n_embd      = 0;
+        // The chain identity. n_ctx_seq rather than n_ctx on purpose -- two ends
+        // with different n_ctx can still agree on the per-sequence capacity, and that is the number
+        // the computation depends on.
+        uint32_t n_seq_max    = 0;
+        uint32_t n_ctx_seq    = 0;
+        uint32_t n_rs_seq     = 0;
+        uint32_t n_verify_rows = 0;
+    };
+
+    // The head half of the chain check, shared by split_attach() and
+    // split_attach_remote(): the layer_inp exit, a proper prefix of the source model, one hop
+    // width. Fills `expect` on success and returns ""; on failure returns the reason (one line,
+    // no trailing newline) and leaves `expect` unusable.
+    // The two callers only differ in where that line goes (the log vs the `err` out-parameter).
+    //
+    // `expect` is an out-parameter on purpose: on both attach paths it can only be derived from the
+    // head itself, so filling it and checking the head against it belong in the same place, and the
+    // caller does not have to build an identity it would only be echoing. Splitting this into
+    // split_head_expect(head) + split_check_head(head, expect) would leave the comparison inside
+    // checking a value that was just copied from the same head -- true by construction, worth
+    // nothing. If the identity ever gets an external source (a config file, a supervisor), this
+    // becomes the seam: take `expect` as input and drop the filling.
+    static std::string split_check_head(const llama_context & head, head_expect & expect);
+
+    // One frame's answer from the remote chain: the five slots and the scalars that
+    // describe them, plus the two bit sets that record which channels were asked for and which
+    // "the tail cannot answer this" lines have been logged.
+    //
+    // The contract is "one frame, one answer":
+    //   - begin_frame() clears every slot. The remote path of decode_split() calls it once, before
+    //     anything can fail, so a frame that ends up returning hidden (or a stage that errors out)
+    //     answers null from get_logits_ith() instead of handing back the previous frame's logits.
+    //   - store_*() write their own slot and touch nothing else.
+    //
+    // The stores do not clear each other: the only rule is "begin_frame() before any store_*()",
+    // which the frame-start call already guarantees, so the stores can be written in any order
+    // (they still are, in the order the answer arrives). A store that reset every per-frame slot
+    // first would make the call order matter -- a store of the h_nextn rows or of the tap blocks
+    // before the logits/candidates store would have them wiped (measured, the stage answered 2048
+    // floats and the draft was told there were none).
+    struct split_tap_block {
+        uint32_t           id = 0;
+        std::vector<float> rows;
+    };
+
+    // One row's candidate answer. The channel is per row from this
+    // version on -- two sequences have two top_k values and two penalty windows, so the reply can
+    // carry two arrays -- and the row number is what keeps them addressable: the sampler asks for
+    // "the candidates of batch row r", never for "the candidates".
+    struct split_cand_block {
+        int32_t                            row = -1;
+        std::vector<qlh_split::token_cand> pairs;
+    };
+
+    // The candidate request state is per sequence, for the same
+    // reason the answer is: llama-server is one context with N slots, and two requests with
+    // different samplers each need their own cand_req, bias list and history window. The wire
+    // layer owns the shape (llama-split-remote.h), so this side does not define a second copy of it.
+    using split_cand_request = llama_split_cand_req;
+
+    struct split_frame_answer {
+        // The whole-row answer, one row per entry of `logit_rows`. A plain
+        // decode answers exactly one (the row the caller samples from); a
+        // multi-sequence frame or a whole-row fallback for a verify frame answers several, and the
+        // row numbers are what make them addressable -- a bare vector<float> of n * n_vocab could not
+        // say which batch row its third row was.
+        //
+        // The rows are the reply's table rows that were *not* flagged
+        // ROW_FLAG_VERIFY (see body_layout in llama-split-proto.h). With no verify row in the frame
+        // that is every table row.
+        std::vector<float>   logits;
+        std::vector<int32_t> logit_rows; // ascending batch rows; logits.size() == rows * n_vocab
+        uint32_t             n_vocab = 0;
+
+        // the candidate answers (sorted by descending logit), one block per answered row
+        std::vector<split_cand_block> cands;
+
+        // The per-row verify answer, one entry per row of
+        // `verify_rows` (the reply's row table, ascending). -1 is "no per-row answer for that row":
+        // it is a table row that was not flagged ROW_FLAG_VERIFY, and the caller reads it through
+        // whichever channel it did ask for. `verify_rows` is what turns the positional array back
+        // into "row r of my batch", because a frame's verify rows no longer
+        // start at row 0.
+        std::vector<int32_t> verify;
+        std::vector<int32_t> verify_rows;
+
+        // the h_nextn rows: [nextn_rows.size()][nextn_embd], in table order
+        std::vector<float>   nextn;
+        std::vector<int32_t> nextn_rows;
+        uint32_t             nextn_embd = 0;
+
+        // the layer-input taps: one block per answered source-layer id
+        std::vector<split_tap_block> tap;
+        uint32_t                     tap_embd = 0;
+        uint32_t                     tap_rows = 0;
+
+        // Channels armed for exactly one frame, per sequence. The request calls set a bit for their
+        // own seq; decode_split() reads the map and clears it before it can fail, so a failed frame
+        // cannot leave the next one asking for something the sampler did not plan for.
+        //
+        // A map and not a bit field -- arming is per request, and a
+        // context serves N requests. A frame's row belongs to one of them, and the row's flags are
+        // built from that sequence's entry alone.
+        enum : uint32_t {
+            ARMED_CANDS  = 1u << 0,
+            ARMED_VERIFY = 1u << 1,
+            ARMED_NEXTN  = 1u << 2,
+        };
+        std::map<llama_seq_id, uint32_t> armed;
+
+        // Channels whose "the tail cannot answer this" line has already been logged, so an
+        // operator can tell "the channel is off" from "this batch was too big" without a line per
+        // token. WARNED_TAP is cleared when the tap set is set: it names a property of the chain,
+        // not of the frame.
+        enum : uint32_t {
+            WARNED_VERIFY_ROWS = 1u << 0,
+            WARNED_NEXTN       = 1u << 1,
+            WARNED_TAP         = 1u << 2,
+            // A frame that mixed candidate rows with a row only the
+            // whole logits row can answer. One reply carries one output section, so the candidate
+            // channel falls back for that frame -- once per process is enough of a diagnosis.
+            WARNED_CANDS       = 1u << 3,
+        };
+        uint32_t warned = 0;
+
+        void begin_frame();
+        void store_cands(std::vector<split_cand_block> && c);
+        void store_logits(std::vector<float> && l, std::vector<int32_t> && rows, uint32_t vocab);
+    };
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -345,6 +607,47 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // Optional continuation stages. Empty means "this context runs the whole
+    // model", and that shape must keep behaving identically. When non-empty, decode() drives this
+    // context as the head and
+    // hands the hidden states to each stage in turn; the stages are borrowed, not owned.
+    // See the split_* comments in llama-context.cpp for the contracts each stage must meet.
+    std::vector<llama_context *> split_stages;
+
+    // Non-null iff the chain has stages (local or remote). It is what llama_get_memory()
+    // returns, so that llama-server's KV bookkeeping sees the whole chain rather than just the
+    // head -- for a remote chain the head is the only stage with a local memory object, which is
+    // exactly why the remote ones are dispatched from this view instead.
+    std::unique_ptr<llama_memory_split> split_memory;
+
+    // Remote stages. A chain is either all-local or local-head-plus-remote-tails;
+    // mixing both kinds in one chain is rejected rather than half-supported, because the two
+    // paths have genuinely different failure modes and a half-tested blend of them would be
+    // worse than either.
+    std::vector<std::unique_ptr<llama_split_remote>> split_remotes;
+
+    // One frame's answer from the remote chain, plus the per-frame request bits that
+    // go with it; see split_frame_answer above for the contract. Every channel in it is addressed
+    // by batch row: a remote tail answers one row per sequence it was asked
+    // about, and which rows those are is the reply's own row table.
+    split_frame_answer split_answer;
+
+    // The candidate channel requests, one per sequence. The driving side asks for
+    // candidates one decode at a time (llama_split_request_candidates in llama-ext.h), because
+    // whether the k candidates are enough is a property of *that* request's sampler chain --
+    // grammar, pre-sampling logprobs, top_k <= 0 all change it -- and the tail can only answer what
+    // it was asked. Kept here rather than in llama_split_remote because the decision is per request
+    // and the connection outlives it.
+    std::map<llama_seq_id, split_cand_request> split_cand_req;
+
+    // The layer-input tap channel. `split_tap_ids` is the set of *source-model*
+    // layer ids every remote decode asks for (empty for a whole model and for a local chain, where
+    // nothing has to cross a wire). It is a property of the chain, not of the frame, so it lives
+    // outside split_answer and survives begin_frame(); each stage answers the ids inside its own
+    // range, so one set covers a chain of any length. The answered blocks (and the row/width they
+    // were answered at) are per frame, so they are in split_answer.tap.
+    std::vector<uint32_t> split_tap_ids;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

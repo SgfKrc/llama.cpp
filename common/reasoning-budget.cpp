@@ -289,6 +289,30 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
     return &ctx->end_matcher.seqs[ctx->end_match];
 }
 
+bool common_reasoning_budget_rejects(const struct llama_sampler * smpl, llama_token token) {
+    if (!smpl) {
+        return false;
+    }
+
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+
+    // The two guards below are apply()'s guards, in the same order. Keeping them here (rather than
+    // calling apply on a one-element array) is what makes this a *read*: the masking code is
+    // stateless today, but the state machine around it is not, and a future apply() that consults
+    // or advances the state must not be able to change a check's answer.
+    if (ctx->state != REASONING_BUDGET_FORCING) {
+        // passthrough, exactly like apply()
+        return false;
+    }
+
+    if (ctx->force_pos >= ctx->forced_tokens.size()) {
+        // apply() bails out here too: the forced sequence is already emitted, nothing is masked
+        return false;
+    }
+
+    return ctx->forced_tokens[ctx->force_pos] != token;
+}
+
 bool common_reasoning_budget_force(struct llama_sampler * smpl) {
     if (!smpl) {
         return false;

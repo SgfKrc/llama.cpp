@@ -36,3 +36,32 @@ public:
 
     void read_string(std::string & str);
 };
+
+// Counts the bytes a state write would produce without producing them. Lives here rather than in
+// llama-context.cpp because the split memory needs it too: for a chain with remote stages the
+// head's share of the state has to be measured the same way the head would write it.
+class llama_io_write_dummy : public llama_io_write_i {
+public:
+    llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
+
+    void write(const void * /* src */, size_t size) override {
+        size_written += size;
+    }
+
+    void write_tensor(ggml_tensor * /* tensor */, size_t /* offset */, size_t size) override {
+        if (skip_tensors) {
+            return;
+        }
+
+        size_written += size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    const bool skip_tensors;
+
+    size_t size_written = 0;
+};
