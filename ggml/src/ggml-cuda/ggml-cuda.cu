@@ -6156,6 +6156,15 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err == cudaErrorNotSupported) {
+        // Windows WDDM rejects cudaHostRegisterReadOnly on both anonymous and file-backed pages
+        // ("operation not supported"), but accepts the same range without it. The read-only hint only
+        // lets the driver skip a copy; dropping it costs some of the benefit but keeps the page pinned.
+        // without ReadOnly the driver must pin the pages itself, and Portable adds a cross-device
+        // bookkeeping that this WDDM driver rejects with out-of-memory on file-backed ranges; with a
+        // single GPU the plain registration is enough.
+        err = cudaHostRegister(buffer, size, 0);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
