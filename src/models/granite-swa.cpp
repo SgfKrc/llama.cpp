@@ -11,15 +11,15 @@ void llama_model_granite_swa::load_arch_hparams(llama_model_loader & ml) {
 
     // MoE expert configuration
     ml.get_key(LLM_KV_EXPERT_COUNT,                hparams.n_expert, false);
-    ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT,    hparams.n_expert_used_arr, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_USED_COUNT,    hparams.n_expert_used_arr, hparams.n_layer_all, false);
 
      // iSWA configuration
-    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+    ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
 
     // Granite4 Vision uses array deepstack_mapping
-    ml.get_arr(LLM_KV_DEEPSTACK_MAPPING, hparams.deepstack_mapping_arr, false);
+    ml.get_arr_layer(LLM_KV_DEEPSTACK_MAPPING, hparams.deepstack_mapping_arr, hparams.n_layer_all, false);
 
     // Count the unique deepstack input indices
     std::unordered_set<uint32_t> unique_deepstack_idxs;
@@ -40,7 +40,7 @@ void llama_model_granite_swa::load_arch_hparams(llama_model_loader & ml) {
     }
 
     // Per-layer RoPE pattern (optional)
-    ml.get_arr(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, false);
+    ml.get_arr_layer(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer_all, false);
 
     switch (hparams.n_layer()) {
         case 32: type = LLM_TYPE_3B; break;

@@ -10,7 +10,7 @@ void llama_model_k2_horizon::load_arch_hparams(llama_model_loader & ml) {
     }
 
     if (hparams.n_expert > 0) {
-        ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+        ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
         ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead,   false);
         ml.get_key(LLM_KV_MOE_EVERY_N_LAYERS,                hparams.moe_every_n_layers,   false);
         ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared,      false);

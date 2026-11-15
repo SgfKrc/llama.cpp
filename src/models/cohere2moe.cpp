@@ -13,7 +13,7 @@ void llama_model_cohere2moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
     ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
@@ -29,7 +29,7 @@ void llama_model_cohere2moe::load_arch_hparams(llama_model_loader & ml) {
 
     // the dense prefix and the MTP layers use RoPE even if they are not SWA
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-        hparams.rope_pattern[il] = hparams.is_swa(il) || il < hparams.n_layer_dense_lead || il >= hparams.n_layer();
+        hparams.rope_pattern[il] = hparams.is_swa(il) || il + (uint32_t) hparams.layer_lo < hparams.n_layer_dense_lead || il >= hparams.n_layer();
     }
 
     hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;

@@ -13,7 +13,7 @@
 void llama_model_minimax_m3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
@@ -26,9 +26,9 @@ void llama_model_minimax_m3::load_arch_hparams(llama_model_loader & ml) {
 
     // BC for MiniMax-M3 GGUFs without indexer_types metadata: leading dense layers have no indexer
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        hparams.is_indexer_full_impl[il] = il >= hparams.n_layer_dense_lead;
+        hparams.is_indexer_full_impl[il] = il + (uint32_t) hparams.layer_lo >= hparams.n_layer_dense_lead;
     }
-    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
 
     msa_p = {
         /*.blk          =*/ (int) hparams.indexer_block_size,

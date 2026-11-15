@@ -5,11 +5,17 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama.h"
+#include "qlh-layer-range.h"
+#include "qlh-split-range.h"
+#include "qlh-weight-buft.h"
+#include "slim-arc-prefetch.h"
 
 #include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -533,6 +539,145 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
+    // A per-layer array in the file is indexed by *source* layer, while hparams keeps the model's
+    // local layers 0..n_local-1. Reading such an array with the plain readers is wrong twice
+    // over under a range load: get_key_or_arr rejects it (the file length is the source depth,
+    // not n_local) and get_arr copies the *first* source layers into the local slots, so a tail
+    // range silently applies layer 0's flags to its own layer 0. This reads the source array and
+    // keeps the exposed slice: local i is source layer_lo + i, and a local index past the range
+    // is the MTP block a tail range keeps, which the file stores at source layer n_layer_src.
+    template<typename T, size_t N_MAX>
+    bool llama_model_loader::get_arr_layer_impl(const std::string & key, std::array<T, N_MAX> & result,
+            uint32_t n_local, bool required, bool strict_len, bool allow_scalar) {
+        const int kid = gguf_find_key(metadata, key.c_str());
+
+        if (kid < 0) {
+            if (required) {
+                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+            }
+            return false;
+        }
+
+        if (gguf_get_kv_type(metadata, kid) != GGUF_TYPE_ARRAY) {
+            if (!allow_scalar) {
+                if (required) {
+                    throw std::runtime_error(format("array key not found in model: %s", key.c_str()));
+                }
+                return false;
+            }
+
+            // same fallback as get_key_or_arr: a single value repeated for every layer
+            T value;
+            if (!get_key(key, value, required)) {
+                return false;
+            }
+            if (n_local > N_MAX) {
+                throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n_local, (uint32_t) N_MAX, key.c_str()));
+            }
+            for (uint32_t i = 0; i < n_local; ++i) {
+                result[i] = value;
+            }
+            return true;
+        }
+
+        if (!layer_range_active()) {
+            // whole-model load: the file index is the local index, nothing to remap
+            return strict_len
+                ? get_key_or_arr(key, result, n_local, required)
+                : get_arr(key, result, required);
+        }
+
+        struct GGUFMeta::ArrayInfo arr_info =
+            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
+
+        bool type_ok = false;
+        switch (arr_info.gt) {
+            case GGUF_TYPE_BOOL:
+            case GGUF_TYPE_UINT32:
+            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value); break;
+            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
+            default:
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+        }
+        if (!type_ok) {
+            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
+        }
+
+        const uint32_t n_file = (uint32_t) arr_info.length;
+        // the file array covers the trunk (n_layer_src entries) or every block, MTP included
+        // (n_layer_src + MTP blocks): which one is a property of the architecture, so accept both
+        const uint32_t n_trunk = (uint32_t) n_layer_src;
+        const uint32_t n_block = n_trunk + (uint32_t) n_layer_nextn_src;
+
+        if (strict_len && n_file != n_trunk && n_file != n_block) {
+            throw std::runtime_error(format(
+                    "key %s has wrong array length; expected %u (trunk) or %u (all blocks), got %u",
+                    key.c_str(), n_trunk, n_block, n_file));
+        }
+
+        if (n_local > N_MAX) {
+            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n_local, (uint32_t) N_MAX, key.c_str()));
+        }
+
+        const uint32_t n_range   = (uint32_t) (layer_hi - layer_lo);
+        const int8_t * bool_data = arr_info.gt == GGUF_TYPE_BOOL ? (const int8_t *) arr_info.data : nullptr;
+
+        for (uint32_t i = 0; i < n_local; ++i) {
+            const uint32_t il_src = i < n_range ? (uint32_t) layer_lo + i : n_trunk + (i - n_range);
+
+            if (il_src >= n_file) {
+                // the file has no entry for this block (a short array, or a trunk-only array on a
+                // range that keeps the MTP block): leave the caller's default in place
+                continue;
+            }
+
+            if constexpr (std::is_same<T, std::string>::value) {
+                result[i] = gguf_get_arr_str(metadata, kid, il_src);
+            } else if (bool_data != nullptr) {
+                result[i] = static_cast<T>(bool_data[il_src] != 0);
+            } else {
+                result[i] = ((const T *) arr_info.data)[il_src];
+            }
+        }
+
+        return true;
+    }
+
+    // strict lengths, scalar broadcast: the shape of get_key_or_arr
+    template<typename T, size_t N_MAX>
+    bool llama_model_loader::get_key_or_arr_layer(const std::string & key, std::array<T, N_MAX> & result, uint32_t n_local, bool required) {
+        return get_arr_layer_impl(key, result, n_local, required, /*strict_len=*/true, /*allow_scalar=*/true);
+    }
+
+    template<typename T>
+    bool llama_model_loader::get_key_or_arr_layer(enum llm_kv kid, T & result, uint32_t n_local, bool required) {
+        return get_key_or_arr_layer(llm_kv(kid), result, n_local, required);
+    }
+
+    // lenient lengths: the shape of get_arr
+    template<typename T, size_t N_MAX>
+    bool llama_model_loader::get_arr_layer(const std::string & key, std::array<T, N_MAX> & result, uint32_t n_local, bool required) {
+        return get_arr_layer_impl(key, result, n_local, required, /*strict_len=*/false, /*allow_scalar=*/false);
+    }
+
+    template<typename T>
+    bool llama_model_loader::get_arr_layer(enum llm_kv kid, T & result, uint32_t n_local, bool required) {
+        return get_arr_layer(llm_kv(kid), result, n_local, required);
+    }
+
+    // the per-layer arrays hparams keeps: patterns and counts (uint32_t), clamp / xielu / scale
+    // arrays (float), deepstack and kv-source maps (int32_t)
+    template bool llama_model_loader::get_key_or_arr_layer<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, uint32_t n_local, bool required);
+    template bool llama_model_loader::get_key_or_arr_layer<std::array<float,    LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<float,    LLAMA_MAX_LAYERS> & result, uint32_t n_local, bool required);
+    template bool llama_model_loader::get_key_or_arr_layer<std::array<int32_t,  LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<int32_t,  LLAMA_MAX_LAYERS> & result, uint32_t n_local, bool required);
+
+    template bool llama_model_loader::get_arr_layer<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, uint32_t n_local, bool required);
+    template bool llama_model_loader::get_arr_layer<std::array<float,    LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<float,    LLAMA_MAX_LAYERS> & result, uint32_t n_local, bool required);
+    template bool llama_model_loader::get_arr_layer<std::array<int32_t,  LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<int32_t,  LLAMA_MAX_LAYERS> & result, uint32_t n_local, bool required);
+
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
@@ -546,7 +691,9 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        int32_t param_split_layer_lo,
+        int32_t param_split_layer_hi)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -560,6 +707,19 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+
+    // Resolve the weight buffer policy here, before anything is allocated: an
+    // invalid QLH_WEIGHT_BUFT must stop the load with the ordinary "error loading model"
+    // line, not surface in the middle of tensor creation. create_tensor() below reads the
+    // same function-local static, so this is also the only getenv() of the whole load.
+    // Unset (the default) prints nothing and changes nothing -- see qlh-weight-buft.h.
+    {
+        const auto & wbuf = qlh_weight_buft::from_env();
+        if (wbuf.explicitly_set) {
+            LLAMA_LOG_INFO("%s: QLH_WEIGHT_BUFT=%s: %s\n",
+                    __func__, wbuf.raw, qlh_weight_buft::policy_effect(wbuf.value));
+        }
+    }
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
@@ -801,6 +961,95 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // LLAMA_LAYER_RANGE=lo:hi -- expose source layers [lo, hi) as local layers 0..N-1.
+    // The metadata is already parsed here, so the override lands before load_hparams() reads it.
+    // The params win: a split context loads several ranges in one process, and an
+    // env var is process-wide. The env var stays as the fallback for stage-per-process runs.
+    //
+    // Format and validation are qlh_split::parse_range(), the parser --split-layer-range and
+    // --split-tail-range use; the variable's name is qlh_split::LAYER_RANGE_ENV. The two entry
+    // points therefore accept and reject the same strings, which they did not: sscanf() here
+    // accepted "0:20:30" and silently ignored "abc"/"20:0", and an ignored value is not a smaller
+    // range, it is the WHOLE model -- a head stage that answered every request with layers 0..23
+    // computed by one process, or a stage started on -1:-1. The argument parsers throw for the same
+    // input, so this throws too (llama_model_load_from_file turns it into "failed to load model").
+    {
+        int lo = param_split_layer_lo;
+        int hi = param_split_layer_hi;
+        if (!qlh_layer_range::active(lo, hi)) {
+            lo = 0;
+            hi = 0;
+            if (const char * lr = getenv(qlh_split::LAYER_RANGE_ENV)) {
+                if (!qlh_split::parse_range(lr, lo, hi)) {
+                    throw std::runtime_error(format(
+                            "invalid %s '%s': expected lo:hi with 0 <= lo < hi "
+                            "(the same rule --split-layer-range enforces)",
+                            qlh_split::LAYER_RANGE_ENV, lr));
+                }
+            }
+        }
+        if (lo >= 0 && hi > lo && !arch_name.empty()) {
+            layer_lo = lo;
+            layer_hi = hi;
+
+            llama_model_kv_override ov{};
+            ov.tag     = LLAMA_KV_OVERRIDE_TYPE_INT;
+
+            // The real layer counts, captured before the override lands: role inference needs
+            // n_layer_src to know whether hi is the model's last layer, and a tail range needs the
+            // original nextn to keep the MTP head.
+            char bc_key[256];
+            snprintf(bc_key, sizeof(bc_key), "%s.block_count", arch_name.c_str());
+            const int bc_idx = gguf_find_key(metadata, bc_key);
+            int32_t nextn_all = 0;
+            char nx_key[256];
+            snprintf(nx_key, sizeof(nx_key), "%s.nextn_predict_layers", arch_name.c_str());
+            const int nx_idx = gguf_find_key(metadata, nx_key);
+            if (nx_idx >= 0) {
+                nextn_all = (int32_t) gguf_get_val_u32(metadata, nx_idx);
+            }
+            if (bc_idx >= 0) {
+                // block_count counts the MTP layer too (Qwen3.6: 41 = 40 trunk + 1 nextn), so the
+                // trunk depth is block_count - nextn. Without subtracting, a tail range would look
+                // like a middle range and skip `output`.
+                n_layer_src = (int32_t) gguf_get_val_u32(metadata, bc_idx) - nextn_all;
+            }
+
+            // Only the tail range keeps the MTP head: it is the range whose last layer is the
+            // model's last layer, so blk.<n_layer_src>.nextn.* belongs to it. The local block count
+            // then includes the head, and get_weight() maps local n to source lo + n, which lands
+            // exactly on that block.
+            //
+            // "the range whose last layer is the model's last layer" *is* needs_output(), asked
+            // after n_layer_src was filled in above: the MTP block rides along with the same range
+            // that owns the output head, so the two cannot be derived separately here.
+            const int32_t nextn_keep = (needs_output() && nextn_all > 0) ? nextn_all : 0;
+            tail_keeps_mtp = nextn_keep > 0;
+
+            // Keep the source's own MTP count: the per-layer array readers need it to tell a
+            // trunk-only file array (n_layer_src entries) from a per-block one (n_layer_src +
+            // n_layer_nextn_src), since only the latter carries the MTP block's entry.
+            n_layer_nextn_src = nextn_all;
+
+            ov.val_i64 = (layer_hi - layer_lo) + nextn_keep;
+            snprintf(ov.key, sizeof(ov.key), "%s.block_count", arch_name.c_str());
+            kv_overrides[std::string(ov.key)] = ov;
+
+            ov.val_i64 = nextn_keep;
+            snprintf(ov.key, sizeof(ov.key), "%s.nextn_predict_layers", arch_name.c_str());
+            kv_overrides[std::string(ov.key)] = ov;
+
+            // Globals this range cannot use are made lazy instead of read (see create_tensor).
+            lazy.force = true;
+
+            LLAMA_LOG_INFO("%s: layers [%d, %d) of %d, block_count -> %d, nextn -> %d, "
+                    "globals: tok_embd=%s output=%s\n",
+                    __func__, (int) layer_lo, (int) layer_hi, (int) n_layer_src,
+                    (int) (layer_hi - layer_lo + nextn_keep), (int) nextn_keep,
+                    needs_tok_embd() ? "load" : "skip", needs_output() ? "load" : "skip");
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -921,7 +1170,14 @@ llama_model_loader::llama_model_loader(
 
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
-    this->load_mtp = load_mtp;
+    this->load_mtp = load_mtp || tail_keeps_mtp;
+    // DEBUG, not INFO: this is a derived flag that only ever changes between
+    // builds of the same chain (it is set once per model load), and every stage of a chain logs
+    // it, so at INFO it is pure noise in a server log. Ask for -lv 4 (or LLAMA_LOG_DEBUG) when
+    // You need to know whether a range kept the MTP head -- the layer-range line
+    // printed earlier in this ctor is what differs per load.
+    LLAMA_LOG_DEBUG("%s: load_mtp=%d (arg=%d, tail_keeps=%d)\n",
+            __func__, (int) this->load_mtp, (int) load_mtp, (int) tail_keeps_mtp);
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -933,6 +1189,22 @@ enum llm_arch llama_model_loader::get_arch() const {
 }
 
 const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
+    // Local blk.i is served from source blk.(i + layer_lo). The remap must come
+    // first: a plain lookup would hit the source's own blk.i, which for lo > 0 is the wrong layer.
+    if (layer_lo > 0 && strncmp(name, "blk.", 4) == 0) {
+        char * end = nullptr;
+        const long i = strtol(name + 4, &end, 10);
+        if (end != name + 4 && end != nullptr && *end == '.') {
+            char buf[256];
+            const int n = snprintf(buf, sizeof(buf), "blk.%ld%s", i + layer_lo, end);
+            if (n <= 0 || (size_t) n >= sizeof(buf)) {
+                return nullptr;
+            }
+            const auto pos = weights_map.find(std::string(buf));
+            return pos != weights_map.end() ? &pos->second : nullptr;
+        }
+    }
+
     auto pos = weights_map.find(name);
     if (pos != weights_map.end()) {
         return &pos->second;
@@ -1187,7 +1459,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (mode != LLAMA_LAZY_MODE_ON && !force && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1361,14 +1633,62 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer: it is not a separate memory pool
+        //
+        // Two cases share one fix. With mmap the host buffer only exists so tensors
+        // can borrow the mapping, and that copy costs more than it saves. Without mmap
+        // there is no mapping to borrow, so the buffer buys nothing -- yet on an
+        // integrated GPU it still lands in the one DEVICE_LOCAL heap the driver
+        // budgets for the device, so overflow meant to relieve VRAM pressure (an
+        // explicit CPU override, a layer that did not fit) consumes the same VRAM it
+        // was supposed to escape. Measured on an Iris Plus iGPU: --n-cpu-moe 8 moved
+        // 5093 MiB of experts from Vulkan0 into Vulkan_Host and freed zero bytes, and
+        // the model still failed to allocate a 512 KiB KV buffer. A discrete GPU's
+        // host buffer is pinned memory, so it keeps the old mmap-only behaviour.
+        //
+        // That reasoning is one side of a trade, and which side wins depends on
+        // the model, the context size and the machine, so the rewrite is now a policy
+        // (QLH_WEIGHT_BUFT, see qlh-weight-buft.h) instead of being unconditional:
+        //   - with the host buffer kept, pp512 on 9B dense was +20% and pp64 on 35B-A3B +56%,
+        //     at the price of the whole weight set counting against the device heap;
+        //   - that price is gone (a single-heap iGPU's host buffer is system memory now) and
+        //     the tensors that still prefer the host buffer are only ~545 MiB (9B) /
+        //     ~515 MiB (35B-A3B), so the same A/B measures within noise.
+        // Default `auto` = the code below unchanged: no log line, no allocation difference,
+        // byte-identical load output. Unset the variable and the load behaves as it did before.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
-            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (!cpu_dev) {
-                throw std::runtime_error("no CPU backend found");
+        if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+            const qlh_weight_buft::settings & wbuf = qlh_weight_buft::from_env();
+            switch (wbuf.value) {
+                case qlh_weight_buft::policy::AUTO:
+                    if (use_mmap || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                        if (!cpu_dev) {
+                            throw std::runtime_error("no CPU backend found");
+                        }
+                        buft = ggml_backend_dev_buffer_type(cpu_dev);
+                    }
+                    break;
+                case qlh_weight_buft::policy::HOST:
+                    // keep the device host buffer type (Vulkan_Host)
+                    break;
+                case qlh_weight_buft::policy::DEVICE: {
+                    // Force the device's own buffer type, but only for tensors it can
+                    // actually run: a tensor whose op the device cannot execute must not
+                    // be moved into device memory just because the policy asked for it.
+                    auto * dev_buft = ggml_backend_dev_buffer_type(buft_dev);
+                    if (weight_buft_supported(hparams, t_meta, op, dev_buft, buft_dev)) {
+                        buft = dev_buft;
+                    } else {
+                        static std::once_flag once;
+                        std::call_once(once, [&] {
+                            LLAMA_LOG_WARN("%s: QLH_WEIGHT_BUFT=device: %s does not support the op of tensor %s; "
+                                    "keeping the host buffer type for it (further occurrences are not logged)\n",
+                                    __func__, ggml_backend_dev_name(buft_dev), t_meta->name);
+                        });
+                    }
+                } break;
             }
-            buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
         if (buft != buft_list->front().second) {
@@ -1434,7 +1754,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    // A layer range leaves some global tensors provably unread: a middle segment
+    // takes hidden states in and never projects to vocabulary. Marking them lazy keeps the
+    // tensor object (the architecture indexes it) while leaving the weights on disk.
+    //
+    // Decided by tn.tensor, not by name: tied models create `output` as a duplicate of
+    // token_embd, so the name says token_embd while the tensor serves as the projection.
+    bool read_lazy = (flags & TENSOR_READ_LAZY) != 0;
+    if (!read_lazy && layer_range_active()) {
+        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD) {
+            const bool as_output_alias = (flags & TENSOR_DUPLICATED) != 0;
+            read_lazy = as_output_alias ? !needs_output() : !needs_tok_embd();
+        } else if (tn.tensor == LLM_TENSOR_OUTPUT) {
+            read_lazy = !needs_output();
+        }
+    }
+
+    if (read_lazy) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
@@ -1473,7 +1809,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
-    ggml_set_name(tensor, ggml_get_name(&t_meta));
+    // Name the local tensor after the requested (local) name, not after the source
+    // tensor: with a layer range the two differ, and get_weight()/get_mapping_ranges()/load_all_data()
+    // all re-resolve the tensor by name - a source name there would be remapped a second time.
+    ggml_set_name(tensor, tn.str().c_str());
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1538,6 +1877,36 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
         size_data += ggml_nbytes(it.second.tensor);
+    }
+
+    // SLIM-ARC prefetch: hand every weight's mmap extent to the layer-ahead scheduler.
+    // Each tensor lives at (mapping base + offset), and its name carries the layer index, so
+    // graph_compute can later ask for "everything in layers N+1..N+window" without knowing the
+    // architecture. Installed only when mmap actually backs the weights: with --no-mmap there
+    // is no mapping to advise and the scheduler would be idle.
+    // Enabled by default only when SLIM_ARC_PREFETCH is set, so an existing run keeps the
+    // exact upstream behaviour (and the extra thread pair) unless asked for.
+    if (use_mmap && !mappings.empty() && std::getenv("SLIM_ARC_PREFETCH") != nullptr) {
+        static slim_arc::prefetch_scheduler s_slim_arc_scheduler(2 /*n_threads*/, 3 /*window*/);
+        slim_arc::set_global_prefetch_scheduler(&s_slim_arc_scheduler);
+        size_t registered = 0;
+        for (const auto & it : weights_map) {
+            const auto & w = it.second;
+            if (w.idx >= mappings.size()) {
+                continue;
+            }
+            void * base = mappings[w.idx]->addr();
+            if (base == nullptr) {
+                continue;
+            }
+            void * tensor_addr = (uint8_t *) base + w.offs;
+            const int layer = slim_arc::tensor_layer_from_name(it.first.c_str());
+            s_slim_arc_scheduler.register_tensor(it.first.c_str(), tensor_addr,
+                                                 ggml_nbytes(w.tensor), layer);
+            ++registered;
+        }
+        LLAMA_LOG_INFO("%s: SLIM-ARC prefetch armed: %zu tensors over %zu mappings\n",
+                __func__, registered, mappings.size());
     }
 }
 
@@ -1795,6 +2164,17 @@ bool llama_model_loader::load_all_data(
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
+        // Classify the *file* tensor this row reads (see the members): a weight is
+        // "loaded" if any local tensor using it is a real load, "lazy" if all of them are.
+        if (lazy.has(cur)) {
+            if (weights_loaded.count(weight) == 0) {
+                weights_lazy.insert(weight);
+            }
+        } else {
+            weights_loaded.insert(weight);
+            weights_lazy.erase(weight);
+        }
+
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
@@ -1815,6 +2195,14 @@ bool llama_model_loader::load_all_data(
                 }));
             }
 
+            if (!buf_mmap && cur->data == nullptr) {
+                LLAMA_LOG_ERROR("%s: no buffer covers tensor '%s' (offs=%zu n_size=%zu bufs=%zu)\n",
+                        __func__, ggml_get_name(cur), weight->offs, n_size, bufs.size());
+                for (const auto & b : bufs) {
+                    LLAMA_LOG_ERROR("  buf base=%p size=%zu\n",
+                            (void *) ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b));
+                }
+            }
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
@@ -1955,6 +2343,38 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        // What a layer range saved, in bytes, three ways: loaded (read into a buffer
+        // or mapped and actually used), mapped lazily (address space only -- deliberately never
+        // faulted in, so no IO and no resident pages), and not created at all (layers another
+        // stage owns). The saving of a range is the last two.
+        //
+        // It cannot be measured against size_data. That field used to be accumulated over every
+        // tensor in the file, and the old comment here said so ("under a layer range size_done
+        // never reaches size_data"), but llama-model.cpp now recounts size_data over the tensors
+        // that were actually created -- exactly the set the loop above walks -- so size_done
+        // reaches it and their difference is always zero. n_bytes, the whole-file tensor total,
+        // is the number this line is about.
+        //
+        // Logged on the last call only: load_all_data() runs once per backend buffer, and an
+        // intermediate call has not read its share yet, which would read as "skipped".
+        {
+            const auto bytes_of = [](const std::set<const llama_tensor_weight *> & ws) {
+                size_t n = 0;
+                for (const auto * w : ws) {
+                    n += ggml_nbytes(w->tensor);
+                }
+                return n;
+            };
+            const double loaded_mib = (double) bytes_of(weights_loaded) / (1024.0 * 1024.0);
+            const double lazy_mib   = (double) bytes_of(weights_lazy)   / (1024.0 * 1024.0);
+            const double file_mib   = (double) n_bytes                  / (1024.0 * 1024.0);
+            const double skip_mib   = file_mib > loaded_mib + lazy_mib
+                                    ? file_mib - loaded_mib - lazy_mib : 0.0;
+            LLAMA_LOG_INFO("%s: loaded %.2f of %.2f MiB of tensor data in the file "
+                    "(%.2f MiB mapped lazily, %.2f MiB not created by this load)\n",
+                    __func__, loaded_mib, file_mib, lazy_mib, skip_mib);
+        }
+
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

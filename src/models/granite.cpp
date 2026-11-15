@@ -10,7 +10,7 @@ void llama_model_granite::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SCALE,             hparams.f_attention_scale, false);
 
     // Granite4 Vision uses array deepstack_mapping
-    ml.get_arr(LLM_KV_DEEPSTACK_MAPPING, hparams.deepstack_mapping_arr, false);
+    ml.get_arr_layer(LLM_KV_DEEPSTACK_MAPPING, hparams.deepstack_mapping_arr, hparams.n_layer_all, false);
 
     // Count the unique deepstack input indices
     std::unordered_set<uint32_t> unique_deepstack_idxs;

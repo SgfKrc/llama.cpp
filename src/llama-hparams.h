@@ -2,6 +2,10 @@
 
 #include "llama.h"
 
+// "Does this range cover the output head / the token embedding": the one definition, shared with
+// llama_model_loader (llama-model-loader.h) and with the pre-load VRAM estimate.
+#include "qlh-layer-range.h"
+
 #include <array>
 #include <bitset>
 #include <cassert>
@@ -82,6 +86,19 @@ struct llama_hparams {
     int32_t n_layer_src = 0;
     int32_t layer_lo    = 0;
     int32_t layer_hi    = -1;
+
+    // The same three questions the loader asks itself (src/qlh-layer-range.h is the definition;
+    // llama_model_loader and this struct both delegate to it). They live here because the answers
+    // are needed after the load, from model.hparams: the attach check that tells a relay from a
+    // tail, and llama_model_has_output() / llama_model_has_tok_embd() below.
+    bool layer_range_active() const { return qlh_layer_range::active(layer_lo, layer_hi); }
+    bool needs_tok_embd()     const { return qlh_layer_range::needs_tok_embd(layer_lo, layer_hi); }
+    bool needs_output()       const { return qlh_layer_range::needs_output(layer_lo, layer_hi, n_layer_src); }
+
+    // The source model's NextN/MTP block count, which the loader reads before it overrides
+    // nextn_predict_layers (only a tail range keeps the MTP head locally). Needed to compare a
+    // file array's length: per-block arrays carry n_layer_src + n_layer_nextn_src entries.
+    int32_t n_layer_nextn_src = 0;
 
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
@@ -564,6 +581,13 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // File-side layer counts. A GGUF per-layer array is indexed by *source* layer, so checking
+    // "does the file carry one entry per layer" must compare against these, not against the local
+    // n_layer()/n_layer_all a range load exposes. A whole-model load has n_layer_src = 0 and both
+    // are the ordinary values.
+    uint32_t n_layer_file() const { return n_layer_src > 0 ? (uint32_t) n_layer_src : n_layer(); }
+    uint32_t n_block_file() const { return n_layer_src > 0 ? (uint32_t) n_layer_src + (uint32_t) n_layer_nextn_src : n_layer_all; }
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

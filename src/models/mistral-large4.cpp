@@ -4,7 +4,7 @@
 #include "llama-kv-cache-dsa.h"
 
 void llama_model_mistral_large4::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,        hparams.f_norm_eps); // eps for the indexer layer norms
 
@@ -27,13 +27,28 @@ void llama_model_mistral_large4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
 
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 1);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
     if (!hparams.is_indexer_full(0)) {
         throw std::runtime_error("the first layer must have a full indexer");
     }
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_ROPE_PATTERN,     hparams.rope_pattern,   hparams.n_layer(), false);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_KV_SOURCE_MAP,    hparams.kv_source_impl, hparams.n_layer(), false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_ROPE_PATTERN,     hparams.rope_pattern,   hparams.n_layer(), false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_KV_SOURCE_MAP,    hparams.kv_source_impl, hparams.n_layer(), false);
+    if (ml.layer_range_active()) {
+        // kv_source_impl holds layer *ids*, and the slice above kept them as source ids. Translate
+        // them to local ids; a source layer below the range cannot be served, because this segment
+        // does not hold its KV cache.
+        const uint32_t lo = (uint32_t) ml.layer_lo;
+        const uint32_t hi = (uint32_t) ml.layer_hi;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.kv_source_impl[il] < lo || hparams.kv_source_impl[il] >= hi) {
+                throw std::runtime_error(format(
+                        "layer %u reads the KV of source layer %u, which is outside the loaded layer range [%u, %u)",
+                        il, hparams.kv_source_impl[il], lo, hi));
+            }
+            hparams.kv_source_impl[il] -= lo;
+        }
+    }
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         const uint32_t il_src = hparams.kv_source(il);
         if (il_src > il || !hparams.has_kv(il_src) || hparams.has_rope(il_src) != hparams.has_rope(il)) {

@@ -9,11 +9,11 @@ void llama_model_minimax_01::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_embd_head_la = hparams.n_embd_head_k_full;
 
     // Mark recurrent layers (lightning attention layers).
-    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
+    if (!ml.get_key_or_arr_layer(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 8;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1 + (uint32_t) hparams.layer_lo) % full_attn_interval != 0);
         }
     }
 

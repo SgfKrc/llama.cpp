@@ -2,7 +2,7 @@
 
 void llama_model_llama4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,   hparams.n_moe_layer_step);
 
     const bool found_swa = ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
@@ -24,7 +24,7 @@ void llama_model_llama4::load_arch_hparams(llama_model_loader & ml) {
     }
 
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-        hparams.rope_pattern[il] = (il + 1) % hparams.n_no_rope_layer_step != 0;
+        hparams.rope_pattern[il] = (il + 1 + (uint32_t) hparams.layer_lo) % hparams.n_no_rope_layer_step != 0;
     }
 
     switch (hparams.n_expert) {

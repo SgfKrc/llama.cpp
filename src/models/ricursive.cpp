@@ -4,7 +4,7 @@ void llama_model_ricursive::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_EMBEDDING_SCALE,             hparams.f_embedding_scale, false);
     // optional: absent or 0 means no clamp (the reference tests `if clamp_threshold:`); a scalar applies to every layer
-    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP, hparams.swiglu_clamp, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_SWIGLU_CLAMP, hparams.swiglu_clamp, hparams.n_layer_all, false);
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!std::isfinite(hparams.swiglu_clamp[il]) || hparams.swiglu_clamp[il] < 0.0f) {
             throw std::runtime_error(format("ricursive: swiglu_clamp for layer %u must be finite and non-negative, got %g", il, hparams.swiglu_clamp[il]));
@@ -21,12 +21,12 @@ void llama_model_ricursive::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("ricursive: sliding_window must be > 0");
     }
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    if (ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
+    if (ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all, false)) {
         // load_swa_pattern only bounds the array by LLAMA_MAX_LAYERS: a short one would leave the last layers dense and without RoPE
         uint32_t n_entries = 0;
         ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_entries);
-        if (n_entries != hparams.n_layer()) {
-            throw std::runtime_error(format("ricursive: sliding_window_pattern has %u entries, expected %u", n_entries, hparams.n_layer()));
+        if (n_entries != hparams.n_layer_file()) {
+            throw std::runtime_error(format("ricursive: sliding_window_pattern has %u entries, expected %u", n_entries, hparams.n_layer_file()));
         }
     } else {
         // default: every 5th layer is global (RicursiveConfig layer_types: full attention iff i % 5 == 4)
@@ -38,7 +38,7 @@ void llama_model_ricursive::load_arch_hparams(llama_model_loader & ml) {
 
     // RoPE exactly on the SWA layers; rope_pattern is optional because the first published GGUFs do not carry it
     hparams.rope_pattern = hparams.is_swa_impl;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer(), false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer(), false);
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (hparams.has_rope(il) != hparams.is_swa(il)) {
             throw std::runtime_error(format("ricursive: layer %u has %s but %s", il,

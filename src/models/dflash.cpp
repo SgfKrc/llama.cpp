@@ -74,12 +74,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         // optional interleaved sliding-window attention with per-layer pattern array.
         // DFlash has a single rope, so the SWA rope == main rope.
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+        ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     }
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer(), false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer(), false);
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -206,7 +206,25 @@ llama_model_dflash::graph<true>::graph(const llm_graph_params & params) : llm_gr
 // target features of an injection batch: host embd rows, or rows of the target's layer input device buffer
 static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp) {
     if (g.ubatch.embd_row) {
+        // The batch says "read rows of ctx_other's layer input device buffer", and the graph resolves
+        // layer_inp_src from the same predicate the batch builder asked (llama_context::supports_embd_row).
+        // If it does not hold, the two disagreed about this frame -- a logic error, so the assert below
+        // stays. This line only says which of the two facts failed: no buffer at all, or one whose width
+        // is not the decoder's whole encoder input (a split chain fills only the layers it computes).
+        if (g.layer_inp_src == nullptr || g.layer_inp_src->ne[0] != n_embd_inp) {
+            // Direct stderr, not LLAMA_LOG_ERROR, on purpose: common's logger is asynchronous (it queues
+            // to a writer thread) and drops the last line when the process aborts right after -- measured:
+            // the same text via LLAMA_LOG_ERROR never reached the server log, this fprintf + fflush did.
+            fprintf(stderr, "%s: embd-row batch but the layer input device buffer %s (%d cols, decoder expects %d)\n",
+                    __func__,
+                    g.layer_inp_src ? "is too narrow" : "is missing",
+                    g.layer_inp_src ? (int) g.layer_inp_src->ne[0] : -1,
+                    (int) n_embd_inp);
+            fflush(stderr);
+        }
         GGML_ASSERT(g.layer_inp_src != nullptr && g.layer_inp_src->ne[0] == n_embd_inp);
+        // This is the contract assert: embd-row batch vs layer input device buffer width. The
+        // diagnostic above is only the breadcrumb for when it trips.
 
         inp.embd_rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, g.n_tokens);
         ggml_set_input(inp.embd_rows);

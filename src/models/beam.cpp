@@ -3,7 +3,7 @@
 void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm);
@@ -13,7 +13,7 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
         hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
     }
-    if (hparams.n_layer_dense_lead > hparams.n_layer()) {
+    if (hparams.n_layer_dense_lead > hparams.n_layer_file()) {
         throw std::runtime_error("beam: leading_dense_block_count exceeds the layer count");
     }
 
@@ -21,10 +21,10 @@ void llama_model_beam::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // masked iff p1 - p0 >= n_swa
     uint32_t n_pattern = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern);
-    if (hparams.n_swa == 0 || n_pattern != hparams.n_layer_all) {
+    if (hparams.n_swa == 0 || n_pattern != hparams.n_block_file()) {
         throw std::runtime_error("beam: requires a positive sliding window and a sliding window pattern for each layer");
     }
-    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+    ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
     if (!hparams.is_swa_any()) {
         throw std::runtime_error("beam: sliding window pattern has no sliding window layer");
     }

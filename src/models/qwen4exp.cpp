@@ -24,7 +24,7 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 }
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
@@ -59,7 +59,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
     // QSA pools the indexer keys of blocks of compress_ratio cells, one block size for the whole model
     hparams.indexer_kpool = 0;
@@ -96,65 +96,73 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error(format("%s lists %u layers, but only one PLE layer is supported",
                                             ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
         }
-        for (uint32_t il : ple_layers) {
-            if (il >= hparams.n_layer_all) {
-                throw std::runtime_error(format("PLE layer %u is out of range", il));
+        // the id is a *source* layer. A range load exposes only its own layers, and a segment
+        // whose layers do not include it has no PLE module at all.
+        const uint32_t lo = hparams.layer_lo > 0 ? (uint32_t) hparams.layer_lo : 0;
+        const uint32_t hi = hparams.layer_hi >= 0 ? (uint32_t) hparams.layer_hi : hparams.n_block_file();
+
+        const uint32_t il_ple = ple_layers[0];
+        if (il_ple >= hparams.n_block_file()) {
+            throw std::runtime_error(format("PLE layer %u is out of range", il_ple));
+        }
+
+        if (il_ple >= lo && il_ple < hi) {
+            hparams.is_ple_impl.set(il_ple - lo);
+
+            ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
+            ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.ple_heads_per_ngram);
+            ml.get_key(LLM_KV_PLE_CONV_KERNEL,     hparams.ple_conv_kernel);
+            ml.get_key(LLM_KV_PLE_EOS_TOKEN_ID,    hparams.ple_eos_token_id);
+            // optional: files written before this key fall back to the EOS token
+            ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
+            ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+            qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,             hparams.ple_conv_kernel);
+            qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
+
+            hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+            hparams.ple_head_dim = hparams.n_embd_per_layer;
+            hparams.ple_embd_token = hparams.ple_image_token_id != 0
+                ? (llama_token) hparams.ple_image_token_id
+                : (llama_token) hparams.ple_eos_token_id;
+            if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
+                throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
             }
-            hparams.is_ple_impl.set(il);
-        }
-
-        ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
-        ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.ple_heads_per_ngram);
-        ml.get_key(LLM_KV_PLE_CONV_KERNEL,     hparams.ple_conv_kernel);
-        ml.get_key(LLM_KV_PLE_EOS_TOKEN_ID,    hparams.ple_eos_token_id);
-        // optional: files written before this key fall back to the EOS token
-        ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
-        ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
-        qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,             hparams.ple_conv_kernel);
-        qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
-
-        hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
-        hparams.ple_head_dim = hparams.n_embd_per_layer;
-        hparams.ple_embd_token = hparams.ple_image_token_id != 0
-            ? (llama_token) hparams.ple_image_token_id
-            : (llama_token) hparams.ple_eos_token_id;
-        if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
-            throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
-        }
-        if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
-            throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
-        }
-
-        qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
-        qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
-        qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_n_heads);
-
-        ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
-
-        // the file stores the head ranges as uint64, so read at that width and narrow to the int32 the gather uses
-        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
-        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
-        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            if (head_vocab_sizes[h] == 0 ||
-                head_offsets[h]     > INT32_MAX ||
-                head_vocab_sizes[h] > INT32_MAX ||
-                head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
-                throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+            if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+                throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
             }
-            hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
-            hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+
+            qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
+            qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
+            qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_n_heads);
+
+            ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
+
+            // the file stores the head ranges as uint64, so read at that width and narrow to the int32 the gather uses
+            std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
+            std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
+            ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
+            ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                if (head_vocab_sizes[h] == 0 ||
+                    head_offsets[h]     > INT32_MAX ||
+                    head_vocab_sizes[h] > INT32_MAX ||
+                    head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
+                    throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+                }
+                hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
+                hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+            }
         }
     }
 
+
     // linear attention everywhere except every full_attention_interval-th layer
-    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
+    if (!ml.get_key_or_arr_layer(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
         qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1 + (uint32_t) hparams.layer_lo) % full_attn_interval != 0);
         }
     }
 

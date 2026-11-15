@@ -8,6 +8,8 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
+#include "qlh-layer-placement.h"
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
@@ -1597,9 +1599,25 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
+
+    // Carry the loader's view of the *source* model into the model: the range it
+    // exposed and the trunk depth it read before overriding block_count. Both are needed to
+    // check that a chain's stages tile one model (llama_split_attach) and to tell a relay
+    // stage from the tail without guessing from the local layer count.
+    if (ml.layer_range_active()) {
+        // Same name on both sides on purpose, and it is not an alias to itself: ml.n_layer_src is
+        // the source model's trunk depth (read before block_count was overridden by the range),
+        // hparams.n_layer_src is where the model exposes it to the chain checks. hparams.n_layer_all
+        // is the *local* block count and must not be substituted here.
+        hparams.n_layer_src       = ml.n_layer_src;
+        hparams.n_layer_nextn_src = ml.n_layer_nextn_src;
+        hparams.layer_lo          = ml.layer_lo;
+        hparams.layer_hi          = ml.layer_hi;
+    }
+
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
-    ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 
@@ -1663,8 +1681,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
     std::fill(hparams.swiglu_clamp.begin(),       hparams.swiglu_clamp.end(),       0.0f);
 
-    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
 
     // Populate deepstack_mapping_arr - initialized to -1 (no deepstack)
     std::fill(hparams.deepstack_mapping_arr.begin(), hparams.deepstack_mapping_arr.end(), -1);
@@ -1672,7 +1690,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // n_head_kv is optional, default to n_head
     hparams.n_head_kv_arr = hparams.n_head_arr;
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
+    ml.get_key_or_arr_layer(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
 
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
@@ -1895,15 +1913,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // The placement itself -- i_gpu_start / act_gpu_layers / offload_output, the range lift and
+    // why the output slot is decided separately -- lives in qlh_placement (src/qlh-layer-placement.h).
+    // The VRAM budget (src/qlh-vram-budget.h) predicts this same assignment before the model is
+    // loaded, and a second copy of the rules here is exactly how that prediction silently stops
+    // predicting: a budget that exists to catch a silent spill must be fed the loader's own answer,
+    // not a duplicate of it.
+    const qlh_placement::layer_placement placement = qlh_placement::compute(
+            n_gpu_layers, n_layer_all, ml.layer_range_active(), !devices.empty());
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
-        if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+        const bool on_gpu = placement.on_gpu(il);
+        if (!on_gpu) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        // The multi-device split ratio must stay in [0, 1). A range load can put the
+        // output slot on the GPU with il - i_gpu_start == act_gpu_layers (one *past* the last
+        // repeating layer), and 1.0 makes upper_bound return end() -- devices.at() then throws
+        // "invalid vector subscript" during load. Clamping to the last allocated layer gives the
+        // output slot the same device the last offloaded block got, which is what a single-device
+        // split does anyway and what the whole-model path already did for N <= n_layer_all.
+        const float ratio = placement.act_gpu_layers > 0
+            ? float(std::min(il - placement.i_gpu_start, placement.act_gpu_layers - 1)) / placement.act_gpu_layers
+            : 0.0f;
+        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), ratio) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -2113,7 +2147,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         post_arch_tensors(ml);
     }
 
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(ml.layer_range_active());
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
@@ -2164,7 +2198,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_prec_policy(ml);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // With a layer range the rest of the file is never read: prefetching all of it
+    // would pull the whole (e.g. 20 GiB) model into the page cache for a 4-layer slice.
+    ml.init_mappings(!ml.layer_range_active(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
+
+
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2273,19 +2311,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
-
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
+        // Report what actually landed on the GPU, computed from the same placement the assignment
+        // used (qlh_placement), so a range printout says "8 of 33" for a head given -ngl 8 instead
+        // of the whole-model "8/33" that would hide which 8 blocks those are. The whole-model
+        // numbers are unchanged.
+        const int n_repeating = placement.n_repeating_on_gpu();
+        if (placement.offload_output) {
             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
         const int max_backend_supported_layers = n_layer_all + 1;
         const int max_offloadable_layers       = n_layer_all + 1;
 
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU (blocks [%d, %d) of this %s)\n", __func__,
+                n_repeating + (placement.offload_output ? 1 : 0), max_backend_supported_layers,
+                placement.i_gpu_start, placement.i_gpu_start + n_repeating,
+                ml.layer_range_active() ? "range" : "model");
     }
 
     // print memory requirements per buffer type
@@ -2307,6 +2349,59 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
         });
     }
+
+    // Prefetch only what stays in host memory.
+    //
+    // Tensors uploaded to VRAM are read once and never again, so pulling their pages in is
+    // waste -- and it competes with the host-resident layers that must stay. Measured on a
+    // 32-layer range with 12 layers offloaded: prefetching everything read 17195 MiB, only
+    // 6.55 GiB stayed resident, and decode ran at 3.7 s/step.
+    if (ml.layer_range_active() && ml.use_mmap) {
+        const char * rp = getenv("LLAMA_RANGE_PREFETCH");
+        if (rp == nullptr || atoi(rp) != 0) {
+            size_t prefetched = 0;
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                void * addr = ml.mappings.at(idx)->addr();
+                llama_memory_ranges mr;
+                for (auto & [ctx_i, bufs_i] : ctx_bufs) {
+                    if (bufs_i.empty() || !ggml_backend_buffer_is_host(bufs_i[0])) {
+                        continue;   // this context's tensors live in VRAM
+                    }
+                    for (auto * cur = ggml_get_first_tensor(ctx_i); cur != nullptr;
+                         cur = ggml_get_next_tensor(ctx_i, cur)) {
+                        const auto * w = ml.get_weight(ggml_get_name(cur));
+                        if (w == nullptr || w->idx != idx) {
+                            continue;
+                        }
+                        mr.push_back({ (const char *) addr + w->offs, ggml_nbytes(cur) });
+                        prefetched += ggml_nbytes(cur);
+                    }
+                }
+                llama_prefetch(std::move(mr));
+            }
+            LLAMA_LOG_INFO("%s: prefetched %.2f MiB of host-resident layers [%d, %d)\n",
+                    __func__, (double) prefetched / (1024.0 * 1024.0),
+                    (int) ml.layer_lo, (int) ml.layer_hi);
+        }
+    }
+
+
+    // size_data was accumulated over every tensor in the file, but a partial load
+    // creates only some of them -- so size_done could never reach it and load_all_data's
+    // "last call" branch never ran: mmap fragments outside the used ranges were never
+    // unmapped and progress_callback(1.0) was skipped. Recount over what was actually
+    // created, which is what the loop below will read.
+    if (ml.layer_range_active()) {
+        size_t real_size_data = 0;
+        for (const auto & [name, t] : tensors_by_name) {
+            real_size_data += ggml_nbytes(t);
+        }
+        LLAMA_LOG_INFO("%s: size_data %.2f MiB (file total %.2f MiB) for %zu created tensors\n",
+                __func__, (double) real_size_data / (1024.0 * 1024.0),
+                (double) ml.size_data / (1024.0 * 1024.0), tensors_by_name.size());
+        ml.size_data = real_size_data;
+    }
+
 
     // load tensor data
     for (auto & [ctx, bufs] : ctx_bufs) {
@@ -2710,8 +2805,9 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_gpu_layers() const {
-    // note: plus 1 for the "output" layer
-    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+    // the "-1 means all" sentinel is part of the placement rules (src/qlh-layer-placement.h);
+    // the VRAM budget resolves the raw -ngl value through the same function.
+    return (uint32_t) qlh_placement::resolve_n_gpu_layers(params.n_gpu_layers, hparams.n_layer_all);
 }
 
 llama_split_mode llama_model::split_mode() const {
@@ -3762,6 +3858,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.split_layer_lo              =*/ -1,
+        /*.split_layer_hi              =*/ -1,
     };
 
     return result;
@@ -3785,6 +3883,12 @@ int32_t llama_model_n_embd(const llama_model * model) {
 
 int32_t llama_model_n_embd_inp(const llama_model * model) {
     return model->hparams.n_embd_inp();
+}
+
+// DFlash/EAGLE3 draft graphs read this width (target_layers * n_embd),
+// not n_embd_inp or n_embd_out. See the declaration in llama.h for why it is exported.
+int32_t llama_model_n_embd_inp_enc(const llama_model * model) {
+    return model->hparams.n_embd_inp_enc();
 }
 
 int32_t llama_model_n_embd_out(const llama_model * model) {
@@ -3813,6 +3917,39 @@ llama_dflash_variant llama_model_dflash_variant(const llama_model * model) {
     }
 
     return LLAMA_DFLASH_VARIANT_NONE;
+}
+
+// 0 for a whole-model load: there is no source range, so there is no depth to report.
+int32_t llama_model_n_layer_src(const llama_model * model) {
+    return model->hparams.n_layer_src;
+}
+
+// The range the loader actually applied. hparams is where the loader records it
+// (llama-model.cpp, "hparams.layer_hi = ml.layer_hi"), and that is the one place both entry
+// points converge: llama_model_params::split_layer_lo/hi and the LLAMA_LAYER_RANGE fallback.
+bool llama_model_layer_range(const llama_model * model, int32_t * lo, int32_t * hi) {
+    const auto & hp = model->hparams;
+    if (hp.layer_hi < 0) {
+        return false;
+    }
+    if (lo != nullptr) {
+        *lo = hp.layer_lo;
+    }
+    if (hi != nullptr) {
+        *hi = hp.layer_hi;
+    }
+    return true;
+}
+
+// The loader's own predicates, asked of a loaded model (src/qlh-layer-range.h is the definition;
+// hparams delegated to it at load time). Read through here rather than from the hparams fields at
+// each call site: the fields are the loader's output, the predicate is the rule.
+bool llama_model_has_output(const llama_model * model) {
+    return model->hparams.needs_output();
+}
+
+bool llama_model_has_tok_embd(const llama_model * model) {
+    return model->hparams.needs_tok_embd();
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
@@ -4337,7 +4474,7 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
 }
 
 void llama_model_base::load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first) {
-    if (ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
+    if (ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all, false)) {
         return;
     }
 
