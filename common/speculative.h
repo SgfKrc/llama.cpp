@@ -3,6 +3,24 @@
 #include "llama.h"
 #include "common.h"
 
+// The three environment variables of the chain draft routes, named once.
+//
+// Why here: they are the interface between tools/server and this layer -- the server decides the
+// per-request catch-up mode and writes it through the environment (there is deliberately no API
+// slot for it), and both sides then read the same three names. Written as literals they were
+// already falling apart: QLH_CHAIN_DRAFT_CATCHUP appeared in this file *and* in
+// server-context.cpp, and QLH_CHAIN_DRAFT_KEEP_KV was getenv()d inline in a function here while a
+// comment two functions up said it was read "the same way" as the catch-up variable. A typo in one
+// of them is a route that silently never turns on.
+namespace common_speculative_env {
+// The manual override, 0/1/2 (unset = adaptive).
+inline constexpr const char * CATCHUP      = "QLH_CHAIN_DRAFT_CATCHUP";
+// The per-request mode the server picked, written only when CATCHUP is unset.
+inline constexpr const char * CATCHUP_AUTO = "QLH_CHAIN_DRAFT_CATCHUP_AUTO";
+// Opt-out of the keep-KV chain route (0 or empty = off; unset = default on).
+inline constexpr const char * KEEP_KV      = "QLH_CHAIN_DRAFT_KEEP_KV";
+} // namespace common_speculative_env
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -22,6 +40,11 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
+
+// true when a DFlash-family draft type reads the trunk's layer-input taps, so its target context
+// must be the head. One definition, asked by both the server (to pick ctx_spec_tgt) and
+// common_speculative_init (to decide which implementations to build).
+bool common_speculative_type_needs_layer_inp(common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
@@ -101,6 +124,22 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// Parse a chain catch-up mode from an environment variable: 0/1/2, or -1 when the
+// variable is unset (an empty value counts as an explicit 0).
+//
+// One implementation, deliberately exported rather than file-local: the server asks this to decide
+// whether the user set the override at all -- it only writes QLH_CHAIN_DRAFT_CATCHUP_AUTO when
+// this returns -1 -- and the speculative layer asks it to read that value back. Two readers of one
+// variable must not disagree about what "unset" means, or "the adaptive default" silently becomes
+// "off" (or the other way round) on the one path nobody tests.
+int common_speculative_catchup_mode_read(const char * name);
+
+// True when an implementation keeps its own draft KV across rounds (the keep-KV chain
+// route, QLH_CHAIN_DRAFT_KEEP_KV). The server must then skip its per-round trim of the draft KV
+// after draft(): the rows of the round that was just made are the history this route exists for,
+// and trimming there is indistinguishable from not having the route at all.
+bool common_speculative_keeps_draft_kv(const common_speculative * spec);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
