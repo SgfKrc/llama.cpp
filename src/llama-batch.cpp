@@ -180,18 +180,18 @@ bool llama_batch_allocr::init(
     // token entry: [p, p, p, 0] (M-RoPE text position)
     // embd entry:  tokens[i].pos as-is
     //
+    // The rule itself is llama_batch_expand_pos() in src/llama-batch.h. A split chain feeds its
+    // later stages embedding entries, which are NOT expanded here, so decode_split() calls the
+    // same function to expand them before they go on the wire or into a local hop. Keep both on
+    // that one function -- a chain that expands on one side only diverges silently (position 0 is
+    // identical either way, so a one-token test passes).
+    //
 
     pos.resize((size_t) n_tok*n_pos_per_embd);
     for (int32_t i = 0; i < n_tok; ++i) {
         const auto & tok = batch_inp.tokens[i];
-        const bool expand = tok.id != LLAMA_TOKEN_NULL;
         for (uint32_t j = 0; j < n_pos_per_embd; ++j) {
-            llama_pos p = tok.pos[j];
-            if (expand) {
-                // expand [p] to [p, p, p, 0] for M-RoPE
-                p = j < 3 ? tok.pos[0] : 0;
-            }
-            pos[(size_t) j*n_tok + i] = p;
+            pos[(size_t) j*n_tok + i] = llama_batch_expand_pos(tok, j);
         }
     }
 

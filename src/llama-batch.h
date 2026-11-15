@@ -161,6 +161,25 @@ struct llama_batch_ext {
     bool set_decision_group(int32_t idx, int32_t group);
 };
 
+// The M-RoPE position-expansion rule for one batch entry, section j.
+//
+// A *token* entry carries a single position, and it is expanded to [p, p, p, 0]; an *embedding*
+// entry keeps the sections its caller wrote. Everything that needs "the position this row's graph
+// actually used" must ask here, because the two callers disagree perfectly silently otherwise:
+// llama_batch_allocr::init() builds the head's flat pos array from it, and a split chain's
+// continuation stages -- which are fed embeddings, never expanded by the allocator -- have to
+// expand them themselves before they go on the wire or into a local hop. Position 0 comes out
+// identical either way, so a divergence passes every one-token test.
+//
+// The GGML_MROPE_SECTIONS bound lives here too, so both callers abort on a section count the rule
+// does not describe instead of one of them writing past its buffer.
+static inline llama_pos llama_batch_expand_pos(const llama_batch_ext::token & tok, uint32_t j) {
+    GGML_ASSERT(j < GGML_MROPE_SECTIONS);
+
+    const bool expand = tok.id != LLAMA_TOKEN_NULL;
+    return expand ? (j < 3 ? tok.pos[0] : 0) : tok.pos[j];
+}
+
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
