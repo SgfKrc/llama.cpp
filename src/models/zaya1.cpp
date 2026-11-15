@@ -5,7 +5,7 @@ void llama_model_zaya1::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
     ml.get_key(LLM_KV_ROUTER_HIDDEN_SIZE,          hparams.n_router_hidden);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
 
     if (hparams.ssm_d_conv != 2) {
         throw std::runtime_error("zaya1: only ssm.conv_kernel == 2 is supported");

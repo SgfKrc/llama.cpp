@@ -6,7 +6,7 @@ void llama_model_clover_moe::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("Clover requires equal key and value head sizes");
     }
 
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT, hparams.n_expert_shared);
     if (hparams.n_expert_shared > 0) {
         ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
@@ -19,14 +19,14 @@ void llama_model_clover_moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
+    if (!ml.get_key_or_arr_layer(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         if (full_attn_interval == 0) {
             throw std::runtime_error("Clover requires a positive full attention interval");
         }
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.is_recr_impl[i] = ((i + 1) % full_attn_interval != 0);
+            hparams.is_recr_impl[i] = ((i + 1 + (uint32_t) hparams.layer_lo) % full_attn_interval != 0);
         }
     }
 

@@ -12,19 +12,19 @@ void llama_model_zonos3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
+    if (!ml.get_key_or_arr_layer(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 0;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         if (full_attn_interval == 0) {
             throw std::runtime_error("zonos3: full_attention_interval must be > 0");
         }
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.is_recr_impl[i] = (i + 1) % full_attn_interval != 0;
+            hparams.is_recr_impl[i] = (i + 1 + (uint32_t) hparams.layer_lo) % full_attn_interval != 0;
         }
     }
 
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_MOE_LATENT_SIZE, hparams.moe_latent_size);
 
     // the router picks the top-k of logits + bias, then takes a softmax over the picked logits

@@ -18,14 +18,39 @@ void llama_model_limite::load_arch_hparams(llama_model_loader & ml) {
     std::fill(hparams.mudd_tap_idx.begin(), hparams.mudd_tap_idx.end(), -1);
     ml.get_key(LLM_KV_MUDD_TAP_COUNT, hparams.n_mudd_taps, false);
     if (hparams.n_mudd_taps > 0) {
-        // reject metadata where n_layer * n_mudd_taps would index past mudd_tap_idx
-        if (hparams.n_mudd_taps > LLAMA_MAX_LAYERS || (uint64_t) hparams.n_layer() * hparams.n_mudd_taps > LLAMA_MAX_LAYERS) {
+        // The array is [source layer][tap] back to back and a range load reads the source rows of
+        // its own layers, so bound the *source* row count, not the local one.
+        const uint32_t lo = hparams.layer_lo > 0 ? (uint32_t) hparams.layer_lo : 0;
+        if (hparams.n_mudd_taps > LLAMA_MAX_LAYERS || (uint64_t) (lo + hparams.n_layer()) * hparams.n_mudd_taps > LLAMA_MAX_LAYERS) {
             throw std::runtime_error(format(
                 "invalid limite mudd config: n_layer (%u) * n_mudd_taps (%u) exceeds LLAMA_MAX_LAYERS (%d)",
-                hparams.n_layer(), hparams.n_mudd_taps, LLAMA_MAX_LAYERS));
+                lo + hparams.n_layer(), hparams.n_mudd_taps, LLAMA_MAX_LAYERS));
         }
         ml.get_key(LLM_KV_MUDD_FEED_FORWARD_LENGTH, hparams.n_mudd_ff);
         ml.get_arr(LLM_KV_MUDD_TAP_INDICES,         hparams.mudd_tap_idx);
+
+        if (ml.layer_range_active()) {
+            // each tap is a *source* layer id; translate it into the local id, and reject a tap on
+            // a layer this segment does not hold -- the mixing needs that layer's activation
+            const uint32_t n_taps = hparams.n_mudd_taps;
+            std::array<int32_t, LLAMA_MAX_LAYERS> sliced;
+            sliced.fill(-1);
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                for (uint32_t t = 0; t < n_taps; ++t) {
+                    const int32_t tap = hparams.mudd_tap_idx[(lo + il)*n_taps + t];
+                    if (tap < 0) {
+                        continue;
+                    }
+                    if ((uint32_t) tap < lo || (uint32_t) tap >= (uint32_t) ml.layer_hi) {
+                        throw std::runtime_error(format(
+                            "layer %u MUDD tap reads source layer %d, which is outside the loaded layer range [%u, %u)",
+                            il, tap, lo, (uint32_t) ml.layer_hi));
+                    }
+                    sliced[il*n_taps + t] = tap - (int32_t) lo;
+                }
+            }
+            hparams.mudd_tap_idx = sliced;
+        }
     }
 
     switch (hparams.n_layer()) {

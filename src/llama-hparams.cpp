@@ -5,14 +5,20 @@
 #include <algorithm>
 #include <cassert>
 
+// The patterns below count *source* layers: global_attn_every_n_layers starts at the model's
+// first layer, so a range load has to evaluate the rule at source index layer_lo + il. Using the
+// local il alone shifts the sliding/full (or recurrent/full) alternation by layer_lo, which is
+// silent: the model still runs, with the wrong attention type on many layers.
 void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
+    const uint32_t lo = layer_lo > 0 ? (uint32_t) layer_lo : 0;
+
     if (dense_first) {
         for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_swa_impl[il] = n_pattern == 0 || (il % n_pattern != 0);
+            is_swa_impl[il] = n_pattern == 0 || ((lo + il) % n_pattern != 0);
         }
     } else {
         for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_swa_impl[il] = n_pattern == 0 || (il % n_pattern < (n_pattern - 1));
+            is_swa_impl[il] = n_pattern == 0 || ((lo + il) % n_pattern < (n_pattern - 1));
         }
     }
 
@@ -22,13 +28,15 @@ void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
 }
 
 void llama_hparams::set_recr_pattern(uint32_t n_pattern, bool dense_first) {
+    const uint32_t lo = layer_lo > 0 ? (uint32_t) layer_lo : 0;
+
     if (dense_first) {
         for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_recr_impl[il] = n_pattern == 0 || (il % n_pattern != 0);
+            is_recr_impl[il] = n_pattern == 0 || ((lo + il) % n_pattern != 0);
         }
     } else {
         for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_recr_impl[il] = n_pattern == 0 || (il % n_pattern < (n_pattern - 1));
+            is_recr_impl[il] = n_pattern == 0 || ((lo + il) % n_pattern < (n_pattern - 1));
         }
     }
 

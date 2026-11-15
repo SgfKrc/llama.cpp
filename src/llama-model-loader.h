@@ -7,6 +7,9 @@
 #include "llama-hparams.h"
 #include "llama-mmap.h"
 
+// The one definition of "which globals this range reads" (see needs_output() below).
+#include "qlh-layer-range.h"
+
 #include "ggml-cpp.h"
 
 #include <cstddef>
@@ -69,6 +72,39 @@ struct llama_model_loader {
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
 
+    // Load source layers [layer_lo, layer_hi) and expose them as local layers 0..N-1.
+    // Local blk.i is served from source blk.(i + layer_lo); block_count is overridden to hi-lo
+    // and nextn_predict_layers to 0 at metadata level (see the constructor).
+    int32_t layer_lo = 0;
+    int32_t layer_hi = -1;
+
+    // The source model's trunk depth, read before block_count is overridden.
+    // Needed to tell a tail segment (hi == total) from a middle one.
+    //
+    // Named n_layer_src, NOT n_layer_all: llama_hparams has an n_layer_all of its own and it
+    // means the opposite thing for a range load -- the *local* block count (hi - lo, plus the
+    // MTP block when this is the tail). Two fields with the same name and opposite meanings is
+    // how "does this range reach the end of the model" gets answered with the wrong number.
+    int32_t n_layer_src = 0;
+
+    // The source model's NextN/MTP block count, read before nextn_predict_layers is overridden
+    // (only a tail range keeps it). Together with n_layer_src it tells the per-layer array
+    // readers how long the *file* array is: trunk-only arrays hold n_layer_src entries,
+    // per-block arrays n_layer_src + n_layer_nextn_src.
+    int32_t n_layer_nextn_src = 0;
+
+    bool layer_range_active() const { return qlh_layer_range::active(layer_lo, layer_hi); }
+
+    // Which globals this range actually reads; non-range loads keep both.
+    //
+    // Delegated, not defined: "does this range cover the output head / the token embedding" is
+    // asked by six call sites outside this class (the relay check in llama-context.cpp, the
+    // truncated-model refusal in common/common.cpp, the VRAM estimate, split-stage's role check),
+    // and src/qlh-layer-range.h is the one answer they all read. See the header for why the
+    // question moved out of here.
+    bool needs_tok_embd() const { return qlh_layer_range::needs_tok_embd(layer_lo, layer_hi); }
+    bool needs_output()   const { return qlh_layer_range::needs_output(layer_lo, layer_hi, n_layer_src); }
+
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
@@ -82,11 +118,21 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // Set when the active layer range ends at the model's last layer and the file
+    // carries a NextN/MTP head. The range override forces load_mtp=false upstream, so the tail
+    // range re-enables it here rather than relying on a constructor argument it cannot change.
+    bool tail_keeps_mtp = false;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+
+        // Ignore the AUTO size threshold in add(). Set when a layer range makes a
+        // global tensor provably unread; those are ~0.5 GiB, well under the 4 GiB default, so
+        // the size heuristic would otherwise refuse to make them lazy.
+        bool force = false;
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
@@ -136,6 +182,17 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+
+    // The file tensors this load takes, keyed by the weight they resolve to, for the
+    // "skipped" log. size_done cannot stand in for them: it counts *created* tensors, and a tied
+    // model creates token_embd twice (the embedding and its output alias) from one file range, so
+    // subtracting it from the file total would subtract that range twice. And a tensor can be
+    // created yet never read: under a layer range the globals this stage cannot use are mapped
+    // lazily, which costs address space but no IO and no resident pages, so it belongs in neither
+    // "loaded" nor "skipped".
+    std::set<const llama_tensor_weight *> weights_loaded; // read into a buffer, or mapped and used
+    std::set<const llama_tensor_weight *> weights_lazy;   // mapped but deliberately never faulted
+
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -181,7 +238,9 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        int32_t param_split_layer_lo = -1,
+        int32_t param_split_layer_hi = -1);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -213,6 +272,35 @@ struct llama_model_loader {
     bool get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required = true);
 
     bool get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required = true);
+
+    // Per-layer arrays: one entry per *source* layer in the file.
+    //
+    // A range load exposes source layers [layer_lo, layer_hi) as local layers 0..n-1, so the
+    // plain readers above cannot be used for these arrays: the strict form throws because the
+    // file length is the source depth, and the lenient form loads the first layers' entries into
+    // every local slot (silent misalignment). These read the source array and keep only the
+    // slice this model exposes. `n_local` is the length the model expects -- hparams.n_layer()
+    // for a trunk-indexed array, hparams.n_layer_all for a per-block one -- and decides where the
+    // MTP block of a tail range lands. A whole-model load is forwarded to the plain readers and
+    // behaves exactly as before.
+    template<typename T, size_t N_MAX>
+    bool get_key_or_arr_layer(const std::string & key, std::array<T, N_MAX> & result, uint32_t n_local, bool required = true);
+
+    template<typename T>
+    bool get_key_or_arr_layer(enum llm_kv kid, T & result, uint32_t n_local, bool required = true);
+
+    template<typename T, size_t N_MAX>
+    bool get_arr_layer(const std::string & key, std::array<T, N_MAX> & result, uint32_t n_local, bool required = true);
+
+    template<typename T>
+    bool get_arr_layer(enum llm_kv kid, T & result, uint32_t n_local, bool required = true);
+
+    // internal: shared body of the two readers above. strict_len mirrors get_key_or_arr's length
+    // check, allow_scalar its "one value repeated n times" fallback; get_arr_layer passes
+    // false/false and so keeps get_arr's leniency for files that write a short array.
+    template<typename T, size_t N_MAX>
+    bool get_arr_layer_impl(const std::string & key, std::array<T, N_MAX> & result,
+            uint32_t n_local, bool required, bool strict_len, bool allow_scalar);
 
     std::string get_arch_name() const;
 

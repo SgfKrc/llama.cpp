@@ -2,7 +2,7 @@
 
 void llama_model_maion_coder::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         hparams.n_moe_layer_step);
     ml.get_key(LLM_KV_MOE_LATENT_SIZE,                   hparams.moe_latent_size);
 
@@ -13,10 +13,10 @@ void llama_model_maion_coder::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
     uint32_t n_swa_layers = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_swa_layers);
-    if (hparams.n_swa == 0 || n_swa_layers != hparams.n_layer_all) {
+    if (hparams.n_swa == 0 || n_swa_layers != hparams.n_block_file()) {
         throw std::runtime_error("maion-coder requires a positive sliding window and a sliding window pattern for each layer");
     }
-    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+    ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
     hparams.rope_pattern = hparams.is_swa_impl;
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;

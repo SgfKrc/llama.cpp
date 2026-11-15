@@ -35,6 +35,24 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     ml.get_arr(LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS, idx_src);
 
     const uint32_t n_layer = hparams.n_layer();
+
+    if (ml.layer_range_active()) {
+        // both lists hold *source* layer ids; keep the ones this segment exposes and turn them
+        // into local ids. A source layer outside the range is simply not part of this segment.
+        const uint32_t lo = (uint32_t) ml.layer_lo;
+        const uint32_t hi = (uint32_t) ml.layer_hi;
+        const auto remap = [&](std::vector<uint32_t> & v) {
+            std::vector<uint32_t> out;
+            for (const uint32_t il : v) {
+                if (il >= lo && il < hi) {
+                    out.push_back(il - lo);
+                }
+            }
+            v.swap(out);
+        };
+        remap(kv_src);
+        remap(idx_src);
+    }
     const auto out_of_range = [&](const std::vector<uint32_t> & v) {
         return std::any_of(v.begin(), v.end(), [&](uint32_t il) { return il >= n_layer; });
     };
@@ -66,6 +84,19 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     }
 
     ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_cand_src, false);
+    if (hparams.dsv41_cand_src >= 0 && ml.layer_range_active()) {
+        // the id is a *source* layer; a segment that does not expose it has no such layer to read,
+        // so the candidate shortcut is simply unavailable here rather than wrong
+        const uint32_t lo = (uint32_t) ml.layer_lo;
+        const uint32_t hi = (uint32_t) ml.layer_hi;
+        if ((uint32_t) hparams.dsv41_cand_src >= lo && (uint32_t) hparams.dsv41_cand_src < hi) {
+            hparams.dsv41_cand_src -= (int32_t) lo;
+        } else {
+            LLAMA_LOG_WARN("%s: candidate source layer %d is outside the loaded layer range [%u, %u); "
+                    "the indexer candidate shortcut is disabled\n", __func__, hparams.dsv41_cand_src, lo, hi);
+            hparams.dsv41_cand_src = -1;
+        }
+    }
     if (hparams.dsv41_cand_src >= 0) {
         ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.dsv41_cand_topk_blocks);
         ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.dsv41_cand_block_size);
@@ -84,6 +115,25 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     // Engram: the PLE n-gram hash of qwen4exp with one set of hash constants per Engram layer, stored back to back
     std::vector<uint32_t> e_layers;
     ml.get_arr(LLM_KV_PLE_LAYERS, e_layers, false);
+
+    // A range load exposes only some of the Engram layers. The ids in the file are source layer
+    // ids and every per-module array is laid out module by module, so keep the surviving modules
+    // (and remember which ones they are) and translate the ids to local layers.
+    std::vector<uint32_t> ple_keep;
+    if (!e_layers.empty() && ml.layer_range_active()) {
+        const uint32_t lo = (uint32_t) ml.layer_lo;
+        const uint32_t hi = (uint32_t) ml.layer_hi;
+        std::vector<uint32_t> kept;
+        ple_keep.reserve(e_layers.size());
+        for (size_t e = 0; e < e_layers.size(); ++e) {
+            if (e_layers[e] >= lo && e_layers[e] < hi) {
+                kept.push_back(e_layers[e] - lo);
+                ple_keep.push_back((uint32_t) e);
+            }
+        }
+        e_layers.swap(kept);
+    }
+
     if (!e_layers.empty()) {
         std::vector<uint64_t> mult;
         std::vector<uint64_t> offsets;
@@ -100,6 +150,20 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         const size_t n_e    = e_layers.size();
         const size_t n_gram = hparams.ple_ngram_size;
         const size_t n_cols = n_gram >= 2 ? (n_gram - 1)*hparams.ple_heads_per_ngram : 0;
+
+        if (ml.layer_range_active()) {
+            std::vector<uint64_t> mult_keep;
+            std::vector<uint64_t> offsets_keep;
+            std::vector<uint64_t> primes_keep;
+            for (const uint32_t e : ple_keep) {
+                mult_keep.insert(mult_keep.end(),       mult.begin()    + e*n_gram, mult.begin()    + (e + 1)*n_gram);
+                offsets_keep.insert(offsets_keep.end(), offsets.begin() + e*n_cols, offsets.begin() + (e + 1)*n_cols);
+                primes_keep.insert(primes_keep.end(),   primes.begin()  + e*n_cols, primes.begin()  + (e + 1)*n_cols);
+            }
+            mult.swap(mult_keep);
+            offsets.swap(offsets_keep);
+            primes.swap(primes_keep);
+        }
         if (n_cols == 0 || hparams.ple_head_dim == 0 ||
                 mult.size() != n_e*n_gram || primes.size() != n_e*n_cols || offsets.size() != n_e*n_cols ||
                 mult.size() > LLAMA_MAX_PLE_NGRAM || primes.size() > LLAMA_MAX_PLE_HEADS ||

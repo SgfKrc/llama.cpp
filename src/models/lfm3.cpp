@@ -10,7 +10,7 @@ void llama_model_lfm3::load_arch_hparams(llama_model_loader & ml) {
     }
 
     // LFM3 always mixes full and sliding window attention layers
-    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+    ml.get_arr_layer(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
     if (!hparams.is_swa_any()) {
         throw std::runtime_error("LFM3 requires sliding window attention layers");
     }

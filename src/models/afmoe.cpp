@@ -3,7 +3,7 @@
 void llama_model_afmoe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    ml.get_key_or_arr_layer(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
@@ -24,7 +24,7 @@ void llama_model_afmoe::load_arch_hparams(llama_model_loader & ml) {
     }
 
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-        hparams.rope_pattern[il] = (il + 1) % hparams.n_no_rope_layer_step != 0;
+        hparams.rope_pattern[il] = (il + 1 + (uint32_t) hparams.layer_lo) % hparams.n_no_rope_layer_step != 0;
     }
 
     // Default to sigmoid if not set
