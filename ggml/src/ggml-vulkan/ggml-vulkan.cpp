@@ -4562,6 +4562,26 @@ static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
 
 static void ggml_vk_device_start_keepalive(vk_device& device);
 
+// True when every HOST_VISIBLE memory type also lives in a DEVICE_LOCAL heap: a single-heap
+// iGPU, where a Vulkan host buffer is charged to the same heap as the weights.
+static bool ggml_vk_host_visible_is_device_local(const vk::PhysicalDevice & physical_device) {
+    const vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
+    bool any_host_visible = false;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        const vk::MemoryType & t = mem_props.memoryTypes[i];
+        if (!(t.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+            continue;
+        }
+        any_host_visible = true;
+        const bool type_local = bool(t.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+        const bool heap_local = bool(mem_props.memoryHeaps[t.heapIndex].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+        if (!type_local && !heap_local) {
+            return false;
+        }
+    }
+    return any_host_visible;
+}
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -4812,6 +4832,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         device->rebar = ggml_vk_has_rebar(device->physical_device);
+        device->host_visible_is_device_local = ggml_vk_host_visible_is_device_local(device->physical_device);
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -5612,6 +5633,18 @@ vk_device ggml_vk_get_device(size_t idx) {
     return vk_instance.devices[idx];
 }
 
+// Default minimum batch size at which offloading an op to the GPU is worth it.
+//
+// Offloading an op to an iGPU pays only when the batch is large enough to fill the
+// EUs: on Iris Xe pp32 is 26% slower with offload on, while pp64 is 28% faster.
+// The old default of 32 sits in the middle of that crossover, so iGPUs get 64 -
+// the only value that keeps pp32 on the CPU while still offloading pp64.
+// Discrete GPUs gain from offload at every batch size tested and keep 32.
+// Measured on Iris Xe only; other iGPUs are unverified.
+static int ggml_vk_op_offload_min_batch_default(bool is_integrated_gpu) {
+    return is_integrated_gpu ? 64 : 32;
+}
+
 static void ggml_vk_print_gpu_info(size_t idx) {
     GGML_ASSERT(idx < vk_instance.device_indices.size());
     size_t dev_num = vk_instance.device_indices[idx];
@@ -5819,6 +5852,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
     const bool rebar = ggml_vk_has_rebar(physical_device);
+    const bool single_heap = ggml_vk_host_visible_is_device_local(physical_device);
 
     integer_dot_product = integer_dot_product
                        && (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated ||
@@ -5870,8 +5904,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
 #endif
 
     std::string device_name = props2.properties.deviceName.data();
-    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | rebar: %d | fp16: %s | bf16: %d | fp4: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
-              idx, device_name.c_str(), driver_props.driverName.data(), uma, rebar, fp16_str, bf16, fp4, subgroup_size,
+    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | rebar: %d | single heap: %d | fp16: %s | bf16: %d | fp4: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+              idx, device_name.c_str(), driver_props.driverName.data(), uma, rebar, single_heap, fp16_str, bf16, fp4, subgroup_size,
               props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
 
     if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
@@ -6432,6 +6466,13 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
+        // Only a Vulkan device buffer has a view the GPU can bind. A host tensor lands
+        // here when its memory cannot be imported (single-heap iGPU, ggml_vk_host_malloc);
+        // staging would copy it on every dispatch, so refuse and name the cause.
+        if (!ggml_backend_buffer_is_vk(tensor->buffer)) {
+            GGML_ABORT("ggml_vulkan: %s: tensor %s is in %s, which the GPU cannot read\n",
+                ctx->device->name.c_str(), tensor->name, ggml_backend_buffer_name(tensor->buffer));
+        }
         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
         buffer = buf_ctx->dev_buffer;
         offset = vk_tensor_offset(tensor) + tensor->view_offs;
@@ -7520,6 +7561,15 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return true;
         }
     case VK_VENDOR_ID_INTEL:
+        // MMVQ is a win for Q2/Q3 on Iris Xe (XE1): q2_K mat-vec 6.5 -> 33.0 GB/s, a
+        // 35B-A3B MoE decode 10.7 -> ~16 t/s. Q6_K is slower there (41.2 -> 35.1 GB/s
+        // on a 9B dense model), so only Q2/Q3 are let through.
+        if (device->architecture == vk_device_architecture::INTEL_XE1) {
+            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K) {
+                return true;
+            }
+        }
+
         if (device->architecture == vk_device_architecture::INTEL_XE2) {
             if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
                 return true;
@@ -16656,6 +16706,21 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
 static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
     UNUSED(params);
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+
+    // Log the effective op_offload threshold once per device. This is the only place it is
+    // logged: ggml_vk_print_gpu_info() runs while the backend registers during process
+    // start, before the log system is ready, so a line there is dropped.
+    {
+        static std::mutex log_mutex;
+        static std::set<int> logged_devices;
+        std::lock_guard<std::mutex> lock(log_mutex);
+        if (logged_devices.insert(ctx->device).second) {
+            const char * min_batch_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+            GGML_LOG_DEBUG("ggml_vulkan: %s: op_offload min batch = %d (%s)\n", ctx->description.c_str(), ctx->op_offload_min_batch_size,
+                      min_batch_env ? "GGML_OP_OFFLOAD_MIN_BATCH" : (ctx->is_integrated_gpu ? "iGPU default" : "dGPU default"));
+        }
+    }
+
     return ggml_backend_vk_init(ctx->device);
 }
 
@@ -17486,7 +17551,7 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
         static std::mutex mutex;
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
-            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            const char * min_batch_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
             for (int i = 0; i < ggml_backend_vk_get_device_count(); i++) {
                 ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
                 char desc[256];
@@ -17496,7 +17561,9 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
                 ctx->description = desc;
                 ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
                 ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
-                ctx->op_offload_min_batch_size = min_batch_size;
+                ctx->op_offload_min_batch_size = min_batch_env
+                    ? atoi(min_batch_env)
+                    : ggml_vk_op_offload_min_batch_default(ctx->is_integrated_gpu);
                 devices.push_back(new ggml_backend_device {
                     /* .iface   = */ ggml_backend_vk_device_i,
                     /* .reg     = */ reg,
