@@ -357,6 +357,48 @@ struct common_params_speculative_draft {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // In a split chain only the tail segment's model carries the NextN/MTP
+    // layers: the head loads [0, layer_hi) with nextn_keep = 0. So the MTP draft context is
+    // built from the tail's model, and the h_nextn rows the draft consumes come from the
+    // tail's context. Non-null here means "chain mode". Deliberately kept in common -- this
+    // wires two contexts of the same process, it is not something the public API should see.
+    llama_context * ctx_tail = nullptr;
+
+    // The same chain, but its tail is another process. `ctx_tail` is null (there
+    // is no tail context here), `ctx_dft` is null (the draft head runs in the stage), and both the
+    // h_nextn rows and the drafts come over the wire (llama_context_split_mtp_draft,
+    // common/speculative.cpp). The flag exists so that "ctx_dft is null" can never be read as a
+    // half-initialized setup: it is set only for a remote tail whose handshake reported a working
+    // MTP context, and it is what makes the draft implementation take the remote branch.
+    bool ctx_tail_remote = false;
+
+    // Which part of a split chain this drafter sits on -- the single definition of
+    // "chain / local tail / remote tail", decided once from the two fields above and read by both
+    // draft implementations in common/speculative.cpp.
+    //
+    // Two spellings of one rule is how a split chain drifts behaviour, and the paths that drift are
+    // the ones no test covers. A new chain shape extends this enum; it must not add another
+    // predicate at a call site.
+    //
+    // The two fields are exclusive by construction on the server side (ctx_tail_remote is only set
+    // when ctx_tail is null). If a library caller sets both, the remote tail wins, and MTP's ctor
+    // asserts on the conflict.
+    enum class chain_kind {
+        WHOLE,       // no chain: the target context is the whole model
+        LOCAL_TAIL,  // the tail segment is a context in this process (ctx_tail)
+        REMOTE_TAIL, // the tail segment is another process (ctx_tail_remote): no tail context here
+    };
+
+    chain_kind kind() const {
+        return ctx_tail_remote ? chain_kind::REMOTE_TAIL
+             : ctx_tail        ? chain_kind::LOCAL_TAIL
+                               : chain_kind::WHOLE;
+    }
+
+    bool is_whole()       const { return kind() == chain_kind::WHOLE; }
+    bool is_local_tail()  const { return kind() == chain_kind::LOCAL_TAIL; }
+    bool is_remote_tail() const { return kind() == chain_kind::REMOTE_TAIL; }
+
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
@@ -424,7 +466,25 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // n_max + 1, not n_max -- one full verify frame, not just its rejected tail.
+        //
+        // The recurrent memory removes at most n_rs_seq positions in one seq_rm
+        // (llama-memory-recurrent.cpp: rollback <= n_rs_seq). A verify round decodes n_draft + 1
+        // rows, and two paths rewind it:
+        //   - partial acceptance removes the rejected tail: n_draft + 1 - accepted <= n_draft
+        //     positions, which n_max already covered;
+        //   - a frame the grammar rejects is abandoned *whole* (common/sampling.h,
+        //     common_sampler_sample_and_accept_n): n_draft + 1 positions, one more than n_max.
+        // Without the +1 that second rollback is refused by the recurrent memory and, on a local
+        // context with no checkpoint to fall back to, takes the process down (measured: a grammar
+        // request on a split chain, first verify frame, GGML_ABORT inside common_context_seq_rm).
+        //
+        // The cost is one extra snapshot row per layer per sequence, and one more token of the
+        // ubatch that must stay together (llama-memory-recurrent.cpp, [TAG_RECURRENT_ROLLBACK_SPLITS]).
+        // Cheap enough to be unconditional: a grammar request is exactly the case that can be
+        // abandoned after its rows are decoded, and "can this chain rewind a frame" must not
+        // depend on the request.
+        return needs_rs_seq ? draft.n_max + 1 : 0u;
     }
 };
 
@@ -499,6 +559,61 @@ struct common_params {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    // Load only source layers [lo, hi) as this model's local layers 0..N-1.
+    // -1/-1 means the whole model. Distinct from n_gpu_layers, which only moves layers
+    // between devices; this one never reads the rest of the file.
+    int32_t split_layer_lo     = -1;
+    int32_t split_layer_hi     = -1;
+
+    // Optional tail stage: load [split_tail_lo, split_tail_hi) as a second
+    // context and attach it to the main one. -1 disables it.
+    int32_t split_tail_lo      = -1;
+    int32_t split_tail_hi      = -1;
+
+    // Set only when llama-server loads a --split-tail-range as a stage of a chain
+    // it is itself building. It is what tells common_init_from_params() that "a range that does
+    // not start at layer 0" is legitimate here, and a misconfiguration everywhere else.
+    //
+    // Why a flag instead of a deduction: server-context.cpp builds the tail by copying
+    // params_base and overwriting split_layer_lo/hi with --split-tail-range, so the tail's
+    // common_params is field-for-field identical to what a user gets by typing
+    // `--split-layer-range 20:24` on its own -- and that one must be refused, because it has no
+    // head and serves tokens from a model missing its first 20 layers. Not a CLI option: it
+    // describes how this process came to hold the range, not a choice the user makes.
+    bool split_range_is_stage = false;
+
+    // Recurrent-state snapshots to request on every stage of a split chain.
+    //
+    // 0 is a supported value for a local chain: llama-server then restores a context checkpoint
+    // instead of truncating the KV, and a chain's checkpoint covers every stage. A remote stage
+    // process must be > 0 -- the seq_rm from a slot reuse arrives over the wire and there is no
+    // checkpoint out there, so a stage with no snapshot can only refuse (split-stage refuses to
+    // start without --rs-seq for that reason). Non-zero keeps the ordinary derivation from the
+    // speculative config as a floor.
+    uint32_t split_rs_seq      = 0;
+
+    // The most result rows one decode frame may answer (--split-verify-rows).
+    //
+    // 0 is "not given": the number every end of a chain defaults to lives in the split protocol
+    // (qlh_split::DEFAULT_SPLIT_VERIFY_ROWS, src/llama-split-proto.h) and is resolved where it is
+    // used -- llama_context's constructor on cparams.split_verify_rows for the context itself,
+    // common_split_verify_rows() for everything that has to talk about it before a context exists.
+    // Repeating the number here is how the flag and the stage it talks to drift apart.
+    //
+    // It is a *chain identity* number, not a tuning knob: a tail sizes its logits node from it (and
+    // that buffer cannot grow after the context exists), so both ends must agree -- the identity
+    // handshake compares it and refuses at attach time with both numbers in the message. The default
+    // is the same on both ends, which is what keeps "no flags at all" working.
+    //
+    // A multi-sequence chain needs it >= n_seq_max * (draft.n_max + 1), because every sequence may be
+    // in the middle of a k + 1 row verify block at once. The head checks that at startup and refuses
+    // with the three numbers (current, needed, and which of the two flags to change).
+    uint32_t split_verify_rows = 0;
+
+    // Remote stages, in chain order: the head runs here, every entry is a
+    // split-stage process over host:port. One option per stage (--split-remote is repeatable);
+    // mutually exclusive with split_tail_lo, because a chain is either all local or all remote.
+    std::vector<std::string> split_remote;
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
@@ -607,6 +722,11 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    // Whether --op-offload / --no-op-offload was given explicitly. The default
+    // a split stage runs with is decided after parsing (src/qlh-split-defaults.h), so the flags
+    // have to be distinguishable from "not given" -- otherwise applying the stage default would
+    // silently overwrite an operator's --op-offload.
+    bool no_op_offload_explicit = false;
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
@@ -1041,6 +1161,37 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
+// --split-verify-rows as the context will use it.
+//
+// common_params holds the 0 sentinel ("not given"); the number every end of a chain defaults to is
+// qlh_split::DEFAULT_SPLIT_VERIFY_ROWS (src/llama-split-proto.h), and llama_context's constructor
+// performs exactly this resolution on cparams.split_verify_rows. Everything that has to talk about
+// the row bound *before* a context exists -- the startup warning, the help text, the value echoed
+// to the operator for the stage command line -- resolves it here, so "no flag" cannot mean one
+// number in the context and another in the log.
+uint32_t common_split_verify_rows(uint32_t verify_rows);
+
+// The largest draft block one *sequence* may carry on a split chain, given the chain's row bound.
+//
+// A verify frame is sum(k_i + 1) over the verifying sequences plus one row per plain decode, and
+// the tail bounds the *frame*, not the block: with n_seq_max sequences able to be mid-verify at
+// once, the largest k any one of them may draft is n_verify_rows / n_seq_max - 1. Using
+// n_verify_rows - 1 would let every sequence draft a block that no single frame could carry
+// together, and the failure would show up per request instead of at startup.
+//
+// One implementation for every reader (the startup warning in common.cpp, llama-server's per-slot
+// cap and its startup advice), so the cap the log reports and the cap a slot enforces cannot
+// disagree. verify_rows may be the 0 sentinel and is resolved here. The result is floored at 0: a
+// bound too small to give one row per sequence means "no drafts", never a negative block.
+int32_t common_split_draft_cap(uint32_t verify_rows, int64_t n_seq_max);
+
+// How many threads the *head* context of this params set will actually be built with, i.e. the
+// value common_context_params_to_llama() puts in cparams.n_threads (see the split-chain note
+// there). A local chain runs two ggml thread pools in one process, so the head takes only half of
+// -t; whoever budgets the tail stage, or logs how the threads were divided, must ask here rather
+// than re-deriving "head threads" from -t -- otherwise the printed split and the pools disagree.
+int32_t common_context_n_threads_head(const struct common_params & params);
+
 // apply --fit to mparams and cparams, no-op if params.fit_params is false
 void common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);
 
@@ -1098,8 +1249,17 @@ struct common_memory {
 
     void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
 
-    // aborts execution on failure
-    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // False when the removal did not complete (see common_context_seq_rm).
+    //
+    // Callers that trim a *part* of the sequence must check it. After a false the memory still
+    // holds rows that prompt.tokens no longer has, so every following token would be computed
+    // from state nobody owns -- and the two halves of the server (n_past bookkeeping and the KV)
+    // silently disagree from then on. The safe reactions are "discard the cache and re-process
+    // the prompt" and "fail this request"; carrying on is never one of them.
+    //
+    // A whole-sequence removal (p0 = -1) is a clear, not a trim: no memory type can refuse it in
+    // practice, and a caller that finds it refusing has nothing left to fall back to.
+    bool seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };
@@ -1362,12 +1522,17 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    void update_tgt(
+    // Returns false when the state could not be captured into data_tgt/data_dft --
+    // for a split chain, because a stage's checkpoint changed size between the size query and
+    // the save. A false means "this checkpoint does not exist": data_* are cleared, and the
+    // caller must drop it rather than keep it, because load_tgt()/load_dft() treat an empty blob
+    // as "nothing to restore" and report success.
+    bool update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void update_dft(
+    bool update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);

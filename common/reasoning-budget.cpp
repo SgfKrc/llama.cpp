@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -164,23 +165,41 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
     }
 }
 
-static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
-    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
-
+// The one answer to "is a token forced right now, and which one?".
+//
+// apply() and rejects() both ask this exactly once per call, and neither re-derives the
+// conditions on its own. That is the whole point: rejects() is the per-row verify channel's only
+// guard for whether argmax can be trusted (src/llama-ext.h), so if apply() ever tightens or
+// relaxes when masking starts (e.g. masking during FORCING), the two must move together by
+// construction instead of by a comment promising they will.
+//
+// Read-only: it consults state and force_pos but advances neither, which is what lets rejects()
+// answer without touching the state machine.
+static std::optional<llama_token> common_reasoning_budget_forced_token(const common_reasoning_budget_ctx * ctx) {
     if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
-        return;
+        // passthrough - nothing is masked
+        return std::nullopt;
     }
 
     if (ctx->force_pos >= ctx->forced_tokens.size()) {
+        // the forced sequence is already emitted, nothing is masked
+        return std::nullopt;
+    }
+
+    return ctx->forced_tokens[ctx->force_pos];
+}
+
+static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+
+    const std::optional<llama_token> forced = common_reasoning_budget_forced_token(ctx);
+    if (!forced) {
         return;
     }
 
-    const llama_token forced = ctx->forced_tokens[ctx->force_pos];
-
     // set all logits to -inf except the forced token
     for (size_t i = 0; i < cur_p->size; i++) {
-        if (cur_p->data[i].id != forced) {
+        if (cur_p->data[i].id != *forced) {
             cur_p->data[i].logit = -INFINITY;
         }
     }
@@ -287,6 +306,19 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
     }
 
     return &ctx->end_matcher.seqs[ctx->end_match];
+}
+
+bool common_reasoning_budget_rejects(const struct llama_sampler * smpl, llama_token token) {
+    if (!smpl) {
+        return false;
+    }
+
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+
+    // Ask the same question apply() asks, in the same place, so the two cannot silently disagree:
+    // this is the per-row verify channel's only guard for whether argmax can be trusted.
+    const std::optional<llama_token> forced = common_reasoning_budget_forced_token(ctx);
+    return forced.has_value() && *forced != token;
 }
 
 bool common_reasoning_budget_force(struct llama_sampler * smpl) {
