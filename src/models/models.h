@@ -2744,6 +2744,13 @@ struct llama_model_qwen35 : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        // k0v4: the chip layers' matvecs read the sparse store instead of dense matrices.
+        // `slot` is the matrix' position inside a layer (the CHIP_SLOT_* constants in qwen35.cpp)
+        // and `rows` its output row count, which the CSR store does not carry.
+        bool          chip_sparse_layer(int il) const;
+        ggml_tensor * build_chip_mm(ggml_tensor * x, int il, int slot, int64_t rows);
+        ggml_tensor * build_chip_ffn(ggml_tensor * cur, int il);
     };
 
     struct graph_mtp : public llm_graph_context {

@@ -1114,9 +1114,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+
+    "CHIP_SPARSE_MM",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1229,9 +1231,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+
+    "chip_sparse_mm(base,row_ptr,col,w,x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6197,6 +6201,55 @@ struct ggml_tensor * ggml_sleep(
 
     result->op     = GGML_OP_SLEEP;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_chip_sparse_mm
+
+// The op takes the whole store and a matrix index instead of a pre-offset row_ptr view: mat_base
+// lives on the same backend as the rest of the store, and a host-side read of it would be wrong (or
+// impossible) once `-ot 'chip_sparse\.=CUDA0'` has put the store on a device.
+struct ggml_tensor * ggml_chip_sparse_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mat_base,
+        struct ggml_tensor  * row_ptr,
+        struct ggml_tensor  * col,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * x,
+        int32_t               mat,
+        int64_t               rows) {
+    GGML_ASSERT(mat_base->type == GGML_TYPE_I32);
+    GGML_ASSERT(row_ptr->type  == GGML_TYPE_I32);
+    GGML_ASSERT(col->type      == GGML_TYPE_I16);
+    GGML_ASSERT(w->type        == GGML_TYPE_BF16);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(col->ne[0] == w->ne[0]);
+    GGML_ASSERT(mat >= 0 && mat + 1 < mat_base->ne[0]);
+    GGML_ASSERT(rows > 0);
+    GGML_ASSERT(x->ne[0] > 0 && x->ne[1] > 0);
+    // ne[], not ggml_n_dims(): the loader's placeholder is a 1x1 F32 tensor, which ggml_n_dims()
+    // reports as one-dimensional.
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(mat_base->ne[1] == 1 && row_ptr->ne[1] == 1 &&
+                col->ne[1] == 1 && w->ne[1] == 1);
+    GGML_ASSERT(ggml_is_contiguous(mat_base) && ggml_is_contiguous(row_ptr) &&
+                ggml_is_contiguous(col) && ggml_is_contiguous(w) && ggml_is_contiguous(x));
+    // The loader hands this op a dummy store while it decides where a tensor may live
+    // (llama-model-loader.cpp), so the store's own extent is checked only where it is knowable:
+    // mat_base must cover `mat`, and the CSR arrays must agree on nnz.
+    GGML_ASSERT(mat_base->ne[0] >= 2);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, x->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, mat);
+
+    result->op     = GGML_OP_CHIP_SPARSE_MM;
+    result->src[0] = mat_base;
+    result->src[1] = row_ptr;
+    result->src[2] = col;
+    result->src[3] = w;
+    result->src[4] = x;
 
     return result;
 }

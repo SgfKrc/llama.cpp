@@ -5,6 +5,34 @@
 #include "gguf.h"
 
 #include <cinttypes>
+#include <cstdlib>
+
+// k0v4: the chip layers' matvecs read the sparse store instead of dense matrices -----------------
+//
+// The store holds six matrices per layer, concatenated layer by layer, in exactly this order (C's
+// _s4a/export_sparse.py writes it, and the kernel picks a matrix by `il * 6 + slot`):
+enum chip_sparse_slot : int {
+    CHIP_SLOT_FFN_GATE       = 0,
+    CHIP_SLOT_FFN_UP         = 1,
+    CHIP_SLOT_FFN_DOWN       = 2,
+    CHIP_SLOT_ATTN_QKV_GATE  = 3,
+    CHIP_SLOT_SSM_OUT        = 4,
+    CHIP_SLOT_SSM_BETA_ALPHA = 5,
+    CHIP_SLOT_COUNT          = 6,
+};
+
+// The escape hatch for the bit-exact comparison: one build, one file, two graphs -- the sparse
+// matvecs by default and the dense ones with LLAMA_CHIP_SPARSE=0. Comparing those two rules out
+// every other explanation (a different build, a different checkpoint, a different thread count) for
+// a value that moved.
+static bool chip_sparse_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("LLAMA_CHIP_SPARSE");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return enabled;
+}
+
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -260,6 +288,14 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+    // k0v4: how many leading layers the store describes. Six matrices per layer is the layout C's
+    // export writes (ffn_gate, ffn_up, ffn_down, attn_qkv_gate, ssm_out, ssm_beta_alpha -- the order
+    // matters, see the CHIP_SLOT_* constants below), and the count comes from the store rather than
+    // from a constant so that a regenerated (or short) store does not need a rebuilt loader.
+    const int n_chip_sparse_layers = chip_sparse_mat_cols
+        ? (int) (chip_sparse_mat_cols->ne[0] / 6)
+        : 0;
+
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         if (chip_emb) {
@@ -274,6 +310,19 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
+
+        // k0v4: a layer the sparse store covers does not need its six bf16 matrices in the file --
+        // the graph asks ggml_chip_sparse_mm for them (build_chip_mm below) and the dense tensors
+        // are gone. TENSOR_NOT_REQUIRED is what lets one loader serve both a sparse checkpoint and
+        // the older dense ones: the pointer stays null and the dense path is taken.
+        //
+        // ml.layer_lo + il, not il: a range load exposes source layers [layer_lo, layer_hi) as
+        // local 0..n-1, and the store only ever describes source layers 0..12. With plain `il` the
+        // tail segment (layer_lo = 14) would treat its local 0..12 as chip layers and run source
+        // layers 14..26 through blk.0..12's sparse matrices -- measured: the 4166-token c-crc32
+        // relay chain fell to 22/4166 while the whole-model pass stayed correct.
+        const bool chip_sparse = ml.layer_lo + il < n_chip_sparse_layers;
+        const int  chip_flags  = chip_sparse ? TENSOR_NOT_REQUIRED : 0;
 
         // Calculate dimensions from hyperparameters
         const int64_t head_k_dim = hparams.ssm_d_state;
@@ -298,7 +347,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
-            const int separate_flags = flags & TENSOR_SKIP ? flags | TENSOR_NOT_REQUIRED : flags;
+            const int separate_flags = (flags & TENSOR_SKIP) || chip_sparse ? flags | TENSOR_NOT_REQUIRED : flags;
             layer.wqkv_z = create_tensor(tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", il), { n_embd, key_dim * 2 + value_dim * 2 }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
             if (!layer.wqkv_z) {
                 layer.wqkv      = create_tensor(tn(LLM_TENSOR_ATTN_QKV,  "weight", il), { n_embd, key_dim * 2 + value_dim }, separate_flags);
@@ -313,12 +362,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
                 layer.ssm_alpha = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "weight", il), { n_embd, n_v_heads }, separate_flags);
             }
             layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
-            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
+            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags | chip_flags);
         }
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags | chip_flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags | chip_flags);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags | chip_flags);
     };
 
     auto load_block_mtp = [&](int il) {
@@ -521,8 +570,18 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    if (model.layers[il].wqkv_z) {
-        ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+    // k0v4: a chip layer's joint QKV+gate projection comes from the sparse store; the dense tensor
+    // is not in the file at all for such a layer.
+    ggml_tensor * qkvz = nullptr;
+    if (chip_sparse_layer(il)) {
+        const int64_t key_dim   = hparams.ssm_d_state * hparams.ssm_n_group;
+        const int64_t value_dim = hparams.ssm_d_state * hparams.ssm_dt_rank;
+        qkvz = build_chip_mm(input, il, CHIP_SLOT_ATTN_QKV_GATE, key_dim * 2 + value_dim * 2);
+    } else if (model.layers[il].wqkv_z) {
+        qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+    }
+
+    if (qkvz) {
         cb(qkvz, "linear_attn_qkvz", il);
 
         const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
@@ -654,8 +713,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * beta  = nullptr;
     ggml_tensor * alpha = nullptr;
-    if (model.layers[il].ssm_beta_alpha_cat) {
-        ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+    // k0v4: the concatenated beta/alpha projection is one of the six sparse matrices.
+    ggml_tensor * ba = nullptr;
+    if (chip_sparse_layer(il)) {
+        ba = build_chip_mm(cur, il, CHIP_SLOT_SSM_BETA_ALPHA, num_v_heads * 2);
+    } else if (model.layers[il].ssm_beta_alpha_cat) {
+        ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+    }
+    if (ba) {
         cb(ba, "beta_alpha", il);
 
         beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
@@ -760,7 +825,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(final_output, "final_output", il);
 
     // Output projection
-    cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    if (chip_sparse_layer(il)) {
+        cur = build_chip_mm(final_output, il, CHIP_SLOT_SSM_OUT, hparams.n_embd);
+    } else {
+        cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    }
     cb(cur, "linear_attn_out", il);
 
     return cur;
@@ -770,6 +839,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
 
+    // k0v4: the three FFN matrices of a chip layer are sparse, so build_ffn's three build_lora_mm
+    // calls are replaced by build_chip_mm with the same swiglu in between.
+    if (chip_sparse_layer(il)) {
+        cur = build_chip_ffn(cur, il);
+        cb(cur, "ffn_out", il);
+        return cur;
+    }
+
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
         model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
@@ -777,6 +854,73 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
         NULL,
         LLM_FFN_SILU, LLM_FFN_PAR, il);
     cb(cur, "ffn_out", il);
+
+    return cur;
+}
+
+bool llama_model_qwen35::graph::chip_sparse_layer(const int il) const {
+    if (!chip_sparse_enabled()) {
+        return false;
+    }
+    // llm_graph_context::model is typed as the base class; the store lives on qwen35's model.
+    const auto & qm = static_cast<const llama_model_qwen35 &>(model);
+    if (qm.chip_sparse_mat_base == nullptr || qm.chip_sparse_mat_cols == nullptr ||
+        qm.chip_sparse_row_ptr  == nullptr || qm.chip_sparse_col      == nullptr ||
+        qm.chip_sparse_w        == nullptr) {
+        return false;
+    }
+    // The store describes source layers 0..n-1, and `il` is a local index inside this segment
+    // (hparams.layer_lo + il is the source layer), so a tail segment's local 0 must not read
+    // blk.0's matrices.
+    const int64_t src_il = (int64_t) hparams.layer_lo + il;
+    return src_il >= 0 &&
+           src_il * CHIP_SLOT_COUNT + (CHIP_SLOT_COUNT - 1) < qm.chip_sparse_mat_cols->ne[0];
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_chip_mm(
+        ggml_tensor * x, const int il, const int slot, const int64_t rows) {
+    const auto & qm = static_cast<const llama_model_qwen35 &>(model);
+    GGML_ASSERT(qm.chip_sparse_mat_base && qm.chip_sparse_row_ptr && qm.chip_sparse_mat_cols &&
+                qm.chip_sparse_col && qm.chip_sparse_w);
+    GGML_ASSERT(slot >= 0 && slot < CHIP_SLOT_COUNT);
+
+    // No prec_policy / lora / *_s here: the dense path this replaces is a plain mul_mat on a bf16
+    // weight (llama_prec_policy only fires for the A4-quantized tensor list, which this checkpoint
+    // does not have, and the chip layers carry no adapter and no scale tensor).
+    const int64_t src_il = (int64_t) hparams.layer_lo + il;
+    return ggml_chip_sparse_mm(ctx0,
+            qm.chip_sparse_mat_base, qm.chip_sparse_row_ptr,
+            qm.chip_sparse_col,      qm.chip_sparse_w,
+            x, (int32_t) (src_il * CHIP_SLOT_COUNT + slot), rows);
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_chip_ffn(ggml_tensor * cur, const int il) {
+    // Mirrors llm_graph_context::build_ffn for LLM_FFN_SILU + LLM_FFN_PAR with no bias, no
+    // activation scale and no lora: up first, then the gate, then swiglu, then down. The tensor
+    // names are the ones build_ffn uses, so a debug callback or a graph dump reads the same either
+    // way.
+    ggml_tensor * up = build_chip_mm(cur, il, CHIP_SLOT_FFN_UP, hparams.n_ff());
+    cb(up, "ffn_up", il);
+
+    ggml_tensor * gate = build_chip_mm(cur, il, CHIP_SLOT_FFN_GATE, hparams.n_ff());
+    cb(gate, "ffn_gate", il);
+
+    const float limit = hparams.swiglu_clamp_shexp[il];
+    constexpr float eps = 1e-6f;
+    if (limit > eps) {
+        // build_ffn's clamped spelling for a non-DeepSeek arch; qwen35 never sets a limit today, so
+        // this only matters if a future checkpoint starts to.
+        ggml_tensor * up_clamped = ggml_clamp(ctx0, up, -limit, limit);
+        ggml_tensor * gate_act   = ggml_silu(ctx0, gate);
+        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+        cur = ggml_mul(ctx0, gate_act, up_clamped);
+    } else {
+        cur = ggml_swiglu_split(ctx0, gate, up);
+    }
+    cb(cur, "ffn_swiglu", il);
+
+    cur = build_chip_mm(cur, il, CHIP_SLOT_FFN_DOWN, hparams.n_embd);
+    cb(cur, "ffn_down", il);
 
     return cur;
 }

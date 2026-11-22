@@ -431,6 +431,10 @@ extern "C" {
 
         GGML_OP_SLEEP,
 
+        // k0v4: a chip layer's matvec whose weight is stored as a per-matrix CSR block in the five
+        // flat chip_sparse.* tensors instead of as a dense matrix. See ggml_chip_sparse_mm().
+        GGML_OP_CHIP_SPARSE_MM,
+
         GGML_OP_COUNT,
     };
 
@@ -2600,6 +2604,34 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // wait after this tensor has executed, return value is simply a full view of this tensor
             int32_t               us); // amount of time to wait in microseconds
+
+    // k0v4: sparse matvec for the chip layers (CSR, bf16 weights, one row per output element).
+    //
+    // Five flat 1-D tensors describe 78 matrices concatenated back to back (K0V4-SPARSE-FORMAT.md):
+    //   mat_base I32[n_mat+1]  mat_base[m] = matrix m's first row inside row_ptr  (mat_base[m+1] for
+    //                                       m = n_mat-1 is the last matrix' first row, i.e.
+    //                                       row_ptr[mat_base[n_mat-1]] == nnz)
+    //   row_ptr  I32[rows_total+1]  CSR row starts, global
+    //   col      I16[nnz]           column indices, ascending inside a row
+    //   w        BF16[nnz]          bf16 weight bit patterns, verbatim
+    //
+    // The reduction is *not* free-form: it reproduces the dense path's tree exactly, so the result is
+    // bit-identical to ggml_mul_mat() on the same weights. Which tree depends on the batch size,
+    // because the dense path itself changes with it (ggml_vec_dot_bf16, 32 accumulators indexed by
+    // k%32, one rounding per mul and per add, for n_tokens == 1; tinyBLAS' 8-lane FMA tree via
+    // llamafile_sgemm, for n_tokens > 1 on the CPU).
+    //
+    // x is F32 like a mul_mat operand; it is converted to bf16 (round-to-nearest-even) exactly as the
+    // dense path converts src1 before its dot product. Output is F32 [rows, x->ne[1]].
+    GGML_API struct ggml_tensor * ggml_chip_sparse_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mat_base,  // I32 [n_mat + 1]
+            struct ggml_tensor  * row_ptr,   // I32 [rows_total + 1]
+            struct ggml_tensor  * col,       // I16 [nnz]
+            struct ggml_tensor  * w,         // BF16 [nnz]
+            struct ggml_tensor  * x,         // F32 [K, n_tokens]
+            int32_t               mat,       // matrix index into mat_base (0 .. n_mat-1)
+            int64_t               rows);     // this matrix' output row count
 
     // loss function
 

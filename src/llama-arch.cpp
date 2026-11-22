@@ -952,11 +952,25 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // do the norms on the first layer (not the input layer)
     {LLM_TENSOR_TOKEN_EMBD_PROJ,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_OUTPUT,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
-    // k0v4 chip sparse store. GGML_OP_MUL_MAT, not GGML_OP_NONE: the loader treats GGML_OP_NONE as
-    // "unused tensor" and skips the payload (llama-model-loader.cpp, the `info.op == GGML_OP_NONE`
-    // branch), so the 8.13 MiB would never reach a buffer. LLM_TENSOR_LAYER_OUTPUT is the layer
-    // class without a block index, which is what a name without %d requires (the loader aborts if
-    // such a tensor is created with bid != -1).
+    // k0v4 chip sparse store. Not GGML_OP_NONE: the loader treats that as "unused tensor" and skips
+    // the payload (llama-model-loader.cpp, the `info.op == GGML_OP_NONE` branch), so the 8.13 MiB
+    // would never reach a buffer. LLM_TENSOR_LAYER_OUTPUT is the layer class without a block index,
+    // which is what a name without %d requires (the loader aborts if such a tensor is created with
+    // bid != -1).
+    //
+    // GGML_OP_MUL_MAT, not GGML_OP_CHIP_SPARSE_MM: the op recorded here is what the *loader* asks
+    // the backends about (weight_buft_supported() builds a dummy op from it and calls
+    // ggml_backend_dev_supports_op()). Naming the sparse op there looked like the way to get the
+    // whole store onto one device, but it is wrong twice over: the probe's dummy has no data, so a
+    // repackable CPU buffer type answers "yes" for the I16/I32 members (measured: a 3451 MiB
+    // CPU_REPACK buffer and a segfault while loading), and the store has nothing to repack anyway.
+    // Under MUL_MAT the probe is the honest one it has always been: false for I16/I32, so
+    // row_ptr/col stay in CPU_Mapped, and true for BF16, so w is offloaded on its own.
+    //
+    // Getting all five onto one device is a *placement* question, and it has an existing answer:
+    // `-ot 'chip_sparse\.=CUDA0'` (verified in _k0v4/REPORT.md §5.2, +5.06 MiB on the card). The
+    // graph's GGML_OP_CHIP_SPARSE_MM then runs wherever its operands are; with the CPU default all
+    // five are in CPU_Mapped and the op runs on the CPU.
     {LLM_TENSOR_CHIP_SPARSE_MAT_BASE,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CHIP_SPARSE_MAT_COLS,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CHIP_SPARSE_ROW_PTR,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},

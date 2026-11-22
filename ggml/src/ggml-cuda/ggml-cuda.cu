@@ -13,6 +13,7 @@
 #include "ggml-cuda/batch-copy.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
+#include "ggml-cuda/chip-sparse.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
@@ -3160,6 +3161,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_CHIP_SPARSE_MM:
+            ggml_cuda_chip_sparse_mm(ctx, dst);
             break;
         default:
             return false;
@@ -6835,6 +6839,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_CHIP_SPARSE_MM:
+            // The kernel reads the store as raw uint32/uint16 and the activations as F32; no tensor
+            // type has to be quantized or converted, so the only requirement is that all six
+            // operands are on this device (which the scheduler arranges from the buffer of src[0]).
+            return op->src[0] && op->src[1] && op->src[2] && op->src[3] && op->src[4] &&
+                   op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[2]->type == GGML_TYPE_I16 && op->src[3]->type == GGML_TYPE_BF16 &&
+                   op->src[4]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SLEEP:
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             return false;

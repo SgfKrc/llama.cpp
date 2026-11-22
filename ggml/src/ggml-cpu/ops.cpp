@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 
 // ggml_compute_forward_dup
 
@@ -12529,3 +12530,175 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// k0v4: sparse matvec for the chip layers --------------------------------------------------------
+//
+// dst->src[0..4] are mat_base / row_ptr / col / w / x and op_params[0] is the matrix index. The
+// store is a per-matrix CSR block: mat_base[mat] is the matrix' first row inside the *global*
+// row_ptr, so the row pointer segment is row_ptr + mat_base[mat] and its values are global indices
+// into the global col / w arrays (K0V4-SPARSE-FORMAT.md §2, as corrected in _k0v4/REPORT.md §1.3).
+//
+// The kernel has to reproduce the dense path's rounding exactly, so it visits a row's non-zero
+// columns in ascending order -- which is the order the dense loop visits them -- and folds the
+// partial sums with the same tree. The dense tree is not a free choice: the dense path itself picks
+// one by batch size, and this fork reaches a different one for each.
+//
+//   n_tokens == 1 -> ggml_vec_dot_bf16 (its AVX2/AVX branch): 32 accumulators indexed by k%32,
+//                    folded by C[j] = (c1[j]+c3[j]) + (c2[j]+c4[j]), then hsum(hi+lo), movehl,
+//                    movehdup. One rounding per multiply and per add (no FMA).
+//
+//   n_tokens  > 1 -> llamafile_sgemm's tinyBLAS, which is reachable here because this fork sets
+//                    ggml_get_type_traits_cpu(BF16).vec_dot_type = BF16: src1 is converted to bf16,
+//                    Btype == BF16 matches the tinyBLAS case, and n >= 2 skips the "only for
+//                    prompt processing" early-out. tinyBLAS accumulates 8 float lanes indexed by
+//                    k%8 with FMA (madd() is _mm256_fmadd_ps; __FMA__ is #defined for MSVC by
+//                    ggml-cpu-impl.h) and folds them with the same hsum.
+//
+// Skipping a zero is exact in both trees: acc (+)= 0*x is the identity on a finite acc, and
+// +0 + -0 == +0 keeps a zero row's +0. fmaf() is correctly rounded for every ggml-cpu variant
+// (hardware FMA where the variant has it, the CRT otherwise), so the 8-lane tree does not depend on
+// which variant the host picked.
+
+#pragma fp_contract(off)
+
+// ggml_vec_dot_bf16's horizontal fold over 32 accumulators (k % 32 lanes).
+static inline float ggml_chip_reduce32(const float * acc) {
+    float c[8];
+    for (int j = 0; j < 8; ++j) {
+        c[j] = (acc[j] + acc[16 + j]) + (acc[8 + j] + acc[24 + j]);
+    }
+    const float g0 = c[0] + c[4];
+    const float g1 = c[1] + c[5];
+    const float g2 = c[2] + c[6];
+    const float g3 = c[3] + c[7];
+    return (g0 + g2) + (g1 + g3);
+}
+
+// tinyBLAS' hsum: (lo+hi) as 128-bit halves, then movehl, then movehdup.
+static inline float ggml_chip_reduce8(const float * a) {
+    const float g0 = a[0] + a[4];
+    const float g1 = a[1] + a[5];
+    const float g2 = a[2] + a[6];
+    const float g3 = a[3] + a[7];
+    return (g0 + g2) + (g1 + g3);
+}
+
+static float ggml_chip_dot_row(
+        const uint32_t * rp,
+        const uint16_t * col,
+        const uint16_t * w,
+        const uint16_t * xb,
+        uint32_t         r,
+        bool             fma_tree) {
+    const uint32_t b = rp[r];
+    const uint32_t e = rp[r + 1];
+
+    if (fma_tree) {
+        // No nnz fast paths here: they would have to be spelled per lane pattern (two non-zeros in
+        // the same lane are one FMA, in different lanes two multiplications and an add), and this
+        // path only runs for prompt processing, where the rows are not the bottleneck.
+        float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t j = b; j < e; ++j) {
+            const uint32_t k = col[j];
+            const uint32_t l = k & 7u;
+            acc[l] = fmaf(GGML_BF16_TO_FP32(ggml_bf16_t { w[j] }),
+                          GGML_BF16_TO_FP32(ggml_bf16_t { xb[k] }), acc[l]);
+        }
+        return ggml_chip_reduce8(acc);
+    }
+
+    // Closed forms of the 32-lane tree for the shapes 80.7% of the rows have (C's sparse_probe.cpp):
+    // zero lanes reduce to +0, one non-zero lane is the product itself and the tree only adds +0 to
+    // it (which also turns a -0 product into +0), and two lanes add once / one lane adds twice,
+    // where IEEE addition's commutativity makes the tree order irrelevant.
+    const uint32_t n = e - b;
+    if (n == 0) {
+        return 0.0f;
+    }
+    if (n == 1) {
+        const uint32_t k = col[b];
+        const float t = GGML_BF16_TO_FP32(ggml_bf16_t { w[b] }) *
+                        GGML_BF16_TO_FP32(ggml_bf16_t { xb[k] });
+        return t + 0.0f;
+    }
+    if (n == 2) {
+        const uint32_t k0 = col[b];
+        const uint32_t k1 = col[b + 1];
+        const float t0 = GGML_BF16_TO_FP32(ggml_bf16_t { w[b] })     *
+                         GGML_BF16_TO_FP32(ggml_bf16_t { xb[k0] });
+        const float t1 = GGML_BF16_TO_FP32(ggml_bf16_t { w[b + 1] }) *
+                         GGML_BF16_TO_FP32(ggml_bf16_t { xb[k1] });
+        return t0 + t1;
+    }
+
+    float acc[32] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    };
+    for (uint32_t j = b; j < e; ++j) {
+        const uint32_t k = col[j];
+        const float t = GGML_BF16_TO_FP32(ggml_bf16_t { w[j] }) *
+                        GGML_BF16_TO_FP32(ggml_bf16_t { xb[k] });
+        acc[k & 31u] = acc[k & 31u] + t;
+    }
+    return ggml_chip_reduce32(acc);
+}
+
+void ggml_compute_forward_chip_sparse_mm(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * t_base = dst->src[0];
+    const ggml_tensor * t_rp   = dst->src[1];
+    const ggml_tensor * t_col  = dst->src[2];
+    const ggml_tensor * t_w    = dst->src[3];
+    const ggml_tensor * x      = dst->src[4];
+
+    GGML_ASSERT(t_base && t_rp && t_col && t_w && x);
+    GGML_ASSERT(t_base->type == GGML_TYPE_I32 && t_rp->type == GGML_TYPE_I32);
+    GGML_ASSERT(t_col->type == GGML_TYPE_I16 && t_w->type == GGML_TYPE_BF16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int32_t mat = ggml_get_op_params_i32(dst, 0);
+
+    const uint32_t * mat_base = (const uint32_t *) t_base->data;
+    const uint32_t * row_ptr  = (const uint32_t *) t_rp->data;
+    const uint16_t * col      = (const uint16_t *) t_col->data;
+    const uint16_t * w        = (const uint16_t *) t_w->data;
+
+    const uint32_t rp0 = mat_base[mat];
+    const uint32_t * rp = row_ptr + rp0;
+
+    const int64_t rows = dst->ne[0];
+    const int64_t nt   = dst->ne[1];
+    const int64_t K    = x->ne[0];
+
+    GGML_ASSERT(rp[rows] <= (uint32_t) t_w->ne[0]);
+
+    // The dense path converts src1 to bf16 once and then dots bf16 x bf16; converting per token here
+    // is the same values (GGML_FP32_TO_BF16 is the same conversion ggml_fp32_to_bf16_row uses).
+    uint16_t * xb = (uint16_t *) std::malloc((size_t) K * sizeof(uint16_t));
+    GGML_ASSERT(xb != nullptr);
+
+    const int            ith      = params->ith;
+    const int            nth      = params->nth;
+    const bool           fma_tree = nt > 1;
+
+    for (int64_t t = 0; t < nt; ++t) {
+        const float * x_row = (const float *) ((const char *) x->data + t * x->nb[1]);
+        for (int64_t k = 0; k < K; ++k) {
+            xb[k] = GGML_FP32_TO_BF16(x_row[k]).bits;
+        }
+        float * y_row = (float *) ((char *) dst->data + t * dst->nb[1]);
+        for (int64_t r = ith; r < rows; r += nth) {
+            y_row[r] = ggml_chip_dot_row(rp, col, w, xb, (uint32_t) r, fma_tree);
+        }
+    }
+
+    std::free(xb);
+}
+
+#pragma fp_contract(on)
