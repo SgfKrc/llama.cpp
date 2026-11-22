@@ -2751,6 +2751,20 @@ struct llama_model_qwen35 : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // k0v4: the CSR image of the 13 chip layers' six big matrices, as five flat 1-D tensors
+    // (K0V4-SPARSE-FORMAT.md §2). They stay nullptr on any checkpoint that does not carry them,
+    // which is why every consumer has to test for null rather than for the architecture.
+    //   mat_base I32 [n_mat + 1]  per-matrix first row in row_ptr, last = n_rows
+    //   mat_cols I32 [n_mat]      per-matrix input width K
+    //   row_ptr  I32 [n_rows + 1] global CSR row pointer (last = nnz)
+    //   col      I16 [nnz]        column index, ascending inside a row
+    //   w        BF16[nnz]        bf16 bit pattern, verbatim
+    ggml_tensor * chip_sparse_mat_base = nullptr;
+    ggml_tensor * chip_sparse_mat_cols = nullptr;
+    ggml_tensor * chip_sparse_row_ptr  = nullptr;
+    ggml_tensor * chip_sparse_col      = nullptr;
+    ggml_tensor * chip_sparse_w        = nullptr;
 };
 
 // Qwen3.5 backbone evaluated without memory, with a joint decision head on top of its hidden states

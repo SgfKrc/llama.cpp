@@ -931,6 +931,13 @@ enum llm_tensor {
     LLM_TENSOR_ROUTER_OUT,
     LLM_TENSOR_ATTN_V_GATE,
     LLM_TENSOR_ATTN_V_EXPS,
+    // k0v4: the 13 chip layers' sparse store as five flat 1-D tensors, see K0V4-SPARSE-FORMAT.md.
+    // Fixed names (no %d): the 78 matrices are covered by mat_base/mat_cols, not by 78 tensor ids.
+    LLM_TENSOR_CHIP_SPARSE_MAT_BASE,
+    LLM_TENSOR_CHIP_SPARSE_MAT_COLS,
+    LLM_TENSOR_CHIP_SPARSE_ROW_PTR,
+    LLM_TENSOR_CHIP_SPARSE_COL,
+    LLM_TENSOR_CHIP_SPARSE_W,
 };
 
 

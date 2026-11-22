@@ -183,6 +183,83 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
     cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
 
+    // k0v4: the chip layers' sparse store, five flat 1-D tensors (K0V4-SPARSE-FORMAT.md §2).
+    //
+    // They have to be *created*, not merely read: llama_model_loader counts what it created, and a
+    // full (non-partial) load throws "wrong number of tensors; expected N, got N-5" for any tensor
+    // in the file that no create_tensor() claimed. That is also why they cannot be smuggled in as
+    // kv: kv has no shape and no backend buffer, and this path is what gives the kernel a device
+    // pointer (`-ot 'chip_sparse\.=CUDA0'`).
+    //
+    // The lengths come from the file, like token_embd's and output's row counts above: mat_base,
+    // row_ptr, col and w are sized by the circuit layout (78 matrices / 520000 rows / 1611555
+    // non-zeros today), so hard-coding them here would make a data regeneration a loader rebuild.
+    // TENSOR_NOT_REQUIRED keeps every checkpoint without the store on the unchanged path: the
+    // pointers stay null and nothing in the dense graph reads them.
+    //
+    // Nothing in the graph consumes them yet -- the sparse matvec (GGML_OP_CHIP_SPARSE_MM) and the
+    // five build_lora_mm substitutions are a separate change (_s4a/REPORT.md §7) -- so this load
+    // leaves the dense chip weights in place and changes no number.
+    {
+        static const llm_tensor chip_tensor_ids[5] = {
+            LLM_TENSOR_CHIP_SPARSE_MAT_BASE, LLM_TENSOR_CHIP_SPARSE_MAT_COLS,
+            LLM_TENSOR_CHIP_SPARSE_ROW_PTR,  LLM_TENSOR_CHIP_SPARSE_COL,
+            LLM_TENSOR_CHIP_SPARSE_W,
+        };
+        // Fill locals first and only publish all five at the end: a half-filled store must never be
+        // visible to a consumer, and a member that was never written must never be mistaken for
+        // "present" (the first version tested the members directly and rejected every checkpoint
+        // without a store, because the test could not tell "not created" from "not there").
+        ggml_tensor * chip_got[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+        int64_t chip_bytes = 0;
+        for (int i = 0; i < 5; ++i) {
+            const auto tn_chip = tn(chip_tensor_ids[i]);
+            // a 1-D tensor: ne[0] is its length, and the file is the authority on that
+            const struct ggml_tensor * meta = ml.get_tensor_meta(tn_chip.str().c_str());
+            if (meta == nullptr) {
+                continue;   // not a k0v4 checkpoint -- leave the slot null
+            }
+            if (meta->ne[1] != 1) {
+                throw std::runtime_error(format(
+                        "qwen35: %s must be a flat 1-D tensor, the file stores %" PRId64
+                        " rows", tn_chip.str().c_str(), meta->ne[1]));
+            }
+            chip_got[i] = create_tensor(ml, tn_chip, { meta->ne[0] }, TENSOR_NOT_REQUIRED);
+            if (chip_got[i] != nullptr) {
+                chip_bytes += ggml_nbytes(chip_got[i]);
+            }
+        }
+        int n_chip = 0;
+        for (int i = 0; i < 5; ++i) {
+            n_chip += chip_got[i] != nullptr;
+        }
+        if (n_chip == 5) {
+            chip_sparse_mat_base = chip_got[0];
+            chip_sparse_mat_cols = chip_got[1];
+            chip_sparse_row_ptr  = chip_got[2];
+            chip_sparse_col      = chip_got[3];
+            chip_sparse_w        = chip_got[4];
+            // 78 matrices; mat_base has n_mat + 1 entries (the last one is the last matrix' first
+            // row, so row_ptr[mat_base.back()] == nnz), mat_cols has n_mat.
+            LLAMA_LOG_INFO("%s: chip sparse store: %" PRId64 " matrices, %" PRId64
+                    " rows + 1 pointers, %" PRId64 " non-zeros, %" PRId64 " B = %.3f MiB "
+                    "(loaded, not consumed by the dense graph)\n",
+                    __func__, chip_sparse_mat_cols->ne[0], chip_sparse_row_ptr->ne[0] - 1,
+                    chip_sparse_col->ne[0], chip_bytes, chip_bytes / (double) (1 << 20));
+        } else if (n_chip != 0) {
+            // Half a store is worse than none: a consumer would read col/w through a row_ptr (or
+            // mat_cols) that describes some other layout, and the CSR indices are the one thing a
+            // wrong guess cannot survive.
+            std::string got;
+            for (int i = 0; i < 5; ++i) {
+                got += std::string(chip_got[i] ? " +" : " -") + tn(chip_tensor_ids[i]).str();
+            }
+            throw std::runtime_error(format(
+                    "qwen35: the chip sparse store is incomplete (mat_base/mat_cols/row_ptr/col/w "
+                    "must all be present):%s", got.c_str()));
+        }
+    }
+
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         if (chip_emb) {

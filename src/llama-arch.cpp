@@ -537,6 +537,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_OUTPUT_RES_QUERY,                       "output_res_query" },
     { LLM_TENSOR_ROPE_FREQS,                             "rope_freqs" },
     { LLM_TENSOR_HRM_Z_L_INIT,                           "hrm.z_l_init" },
+    // k0v4 chip sparse store: fixed names, no %d -- 78 matrices are described by mat_base/mat_cols
+    { LLM_TENSOR_CHIP_SPARSE_MAT_BASE,                   "chip_sparse.mat_base" },
+    { LLM_TENSOR_CHIP_SPARSE_MAT_COLS,                   "chip_sparse.mat_cols" },
+    { LLM_TENSOR_CHIP_SPARSE_ROW_PTR,                    "chip_sparse.row_ptr" },
+    { LLM_TENSOR_CHIP_SPARSE_COL,                        "chip_sparse.col" },
+    { LLM_TENSOR_CHIP_SPARSE_W,                          "chip_sparse.w" },
     { LLM_TENSOR_ATTN_NORM,                              "blk.%d.attn_norm" },
     { LLM_TENSOR_ATTN_Q,                                 "blk.%d.attn_q" },
     { LLM_TENSOR_ATTN_K,                                 "blk.%d.attn_k" },
@@ -946,6 +952,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // do the norms on the first layer (not the input layer)
     {LLM_TENSOR_TOKEN_EMBD_PROJ,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_OUTPUT,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    // k0v4 chip sparse store. GGML_OP_MUL_MAT, not GGML_OP_NONE: the loader treats GGML_OP_NONE as
+    // "unused tensor" and skips the payload (llama-model-loader.cpp, the `info.op == GGML_OP_NONE`
+    // branch), so the 8.13 MiB would never reach a buffer. LLM_TENSOR_LAYER_OUTPUT is the layer
+    // class without a block index, which is what a name without %d requires (the loader aborts if
+    // such a tensor is created with bid != -1).
+    {LLM_TENSOR_CHIP_SPARSE_MAT_BASE,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CHIP_SPARSE_MAT_COLS,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CHIP_SPARSE_ROW_PTR,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CHIP_SPARSE_COL,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CHIP_SPARSE_W,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS_OUT,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS_NORM,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
