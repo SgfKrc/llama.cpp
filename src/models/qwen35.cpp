@@ -292,9 +292,18 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     // export writes (ffn_gate, ffn_up, ffn_down, attn_qkv_gate, ssm_out, ssm_beta_alpha -- the order
     // matters, see the CHIP_SLOT_* constants below), and the count comes from the store rather than
     // from a constant so that a regenerated (or short) store does not need a rebuilt loader.
+    //
+    // k0v5/A+: the store covers 14 layers (blk.0..13), not 13. blk.13 -- the chip segment's last
+    // layer -- is 10-30x sparser than the others (4,203 non-zeros in 202,899,456 weights), and
+    // leaving it dense cost 1.8 ms of the chip step (387.1 MiB of bf16 re-read every token). No
+    // code change selected that layer: `_s4a/export_sparse.py` now sweeps range(14), so this count
+    // comes out 14 and the predicate below covers source layer 13 by itself. A 13-layer store (the
+    // first k0v5, k0v4) still loads and keeps blk.13 dense -- that is what the escape hatch is for.
     const int n_chip_sparse_layers = chip_sparse_mat_cols
         ? (int) (chip_sparse_mat_cols->ne[0] / 6)
         : 0;
+    LLAMA_LOG_INFO("%s: the chip sparse store covers source layers 0..%d\n",
+            __func__, n_chip_sparse_layers - 1);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
@@ -872,8 +881,12 @@ bool llama_model_qwen35::graph::chip_sparse_layer(const int il) const {
     // The store describes source layers 0..n-1, and `il` is a local index inside this segment
     // (hparams.layer_lo + il is the source layer), so a tail segment's local 0 must not read
     // blk.0's matrices.
+    //
+    // The second bound is not redundant with the store's own length: a store longer than the
+    // checkpoint (an export run against the wrong file) must leave the dense path in place
+    // instead of asking the kernel for a matrix the model does not have.
     const int64_t src_il = (int64_t) hparams.layer_lo + il;
-    return src_il >= 0 &&
+    return src_il >= 0 && src_il < (int64_t) hparams.n_layer_all &&
            src_il * CHIP_SLOT_COUNT + (CHIP_SLOT_COUNT - 1) < qm.chip_sparse_mat_cols->ne[0];
 }
 
