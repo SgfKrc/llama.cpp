@@ -8,6 +8,8 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-memory-split.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -18,6 +20,7 @@
 #include "slim-arc-prefetch.h"
 
 #include <algorithm>
+#include <typeinfo>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -6464,13 +6467,28 @@ bool llama_set_ssm_state(llama_context * ctx, uint32_t il, const float * data, u
         LLAMA_LOG_ERROR("%s: null argument\n", __func__);
         return false;
     }
-    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
-    if (hybrid == nullptr) {
-        LLAMA_LOG_ERROR("%s: the context's memory is not hybrid, no recurrent state to set\n", __func__);
+    // Two shapes of memory can own the recurrent state, and which one a context gets depends on its
+    // layer range, not on the model: a segment whose layers are all gated-delta-net (the chip range
+    // 0:14 is exactly that) is backed by llama_memory_recurrent alone, while the whole model and
+    // any segment containing a full-attention block get llama_memory_hybrid. Requiring hybrid
+    // rejected every all-recurrent segment -- which is the one every circuit-trace check runs on.
+    // llama_memory_hybrid_iswa is NOT a subclass of llama_memory_hybrid (both derive from
+    // llama_memory_i), so a plain dynamic_cast to hybrid silently misses an SWA model.
+    llama_memory_recurrent * recr = nullptr;
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        recr = hybrid->get_mem_recr();
+    } else if (auto * iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        recr = iswa->get_mem_recr();
+    } else {
+        recr = dynamic_cast<llama_memory_recurrent *>(mem);
+    }
+    if (recr == nullptr) {
+        LLAMA_LOG_ERROR("%s: the context's memory (%s) has no recurrent state to set\n",
+                __func__, mem == nullptr ? "null" : typeid(*mem).name());
         return false;
     }
-    auto * recr = hybrid->get_mem_recr();
-    if (recr == nullptr || !recr->set_init_state(il, data, n)) {
+    if (!recr->set_init_state(il, data, n)) {
         LLAMA_LOG_ERROR("%s: layer %u rejected the state (%u values)\n", __func__, il, n);
         return false;
     }
