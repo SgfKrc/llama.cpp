@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -522,6 +524,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         head = 0;
     }
 
+    // the injected state is spent as soon as the cell carries a real sequence
+    if (init_cell >= 0 && (size_t) init_cell < size && cells[init_cell].pos >= 0) {
+        init_cell = -1;
+    }
+
     // For recurrent state architectures (like Mamba or RWKV),
     // each cache cell can store the state for a whole sequence.
     // A slot should be always be contiguous.
@@ -701,10 +708,56 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
 
+        // A caller-provided initial state (llama_set_ssm_state) replaces the zero state for the
+        // first batch of a brand-new sequence: the cell keeps the injected S and the graph's
+        // zero-fill is skipped for this batch only (get_rs_z() answers -1 while init_pending).
+        bool use_init = false;
+        if (init_pending && n_seqs == 1) {
+            const int32_t cell_id = min;
+            if (cells[cell_id].src < 0) {  // brand-new seq: nothing to copy the state from
+                for (uint32_t il = 0; il < (uint32_t) std::min(s_l.size(), init_s.size()); ++il) {
+                    ggml_tensor * s = s_l[il];
+                    if (s == nullptr || s->buffer == nullptr || init_s[il].empty()) {
+                        continue;
+                    }
+                    if (s->type != GGML_TYPE_F32 || (size_t) s->ne[0] != init_s[il].size()) {
+                        LLAMA_LOG_ERROR("%s: layer %u: cannot take an initial state (type %s, "
+                                        "n_embd_s %" PRId64 " vs %zu values)\n", __func__, il,
+                                        ggml_type_name(s->type), s->ne[0], init_s[il].size());
+                        return false;
+                    }
+                    const size_t row = ggml_row_size(s->type, s->ne[0]);
+                    ggml_backend_tensor_set(s, init_s[il].data(), (size_t) cell_id * row, row);
+                }
+                // Skipping the graph's zero fill also skips it for the conv state (r_l) and any
+                // PLE history (p_l), which share the same rs_zero: they are zero in this case, so
+                // clear the cell here.
+                for (uint32_t il = 0; il < (uint32_t) r_l.size(); ++il) {
+                    for (ggml_tensor * t : { r_l[il], il < p_l.size() ? p_l[il] : nullptr }) {
+                        if (t == nullptr || t->buffer == nullptr) {
+                            continue;
+                        }
+                        const size_t row = ggml_row_size(t->type, t->ne[0]);
+                        std::vector<char> zeros(row, 0);
+                        ggml_backend_tensor_set(t, zeros.data(), (size_t) cell_id * row, row);
+                    }
+                }
+                use_init = true;
+                init_pending = false;
+                init_cell = cell_id;
+                LLAMA_LOG_INFO("%s: layer 0..%zu: initial state taken by cell %d\n", __func__,
+                               init_s.size(), cell_id);
+            }
+        }
+
         for (int i = min; i <= max; ++i) {
             if (cells[i].src < 0) {
-                GGML_ASSERT(rs_z >= 0);
-                cells[i].src0 = rs_z;
+                if (use_init && i == min) {
+                    cells[i].src0 = i;  // read back the injected state, do not copy from the zero state
+                } else {
+                    GGML_ASSERT(rs_z >= 0);
+                    cells[i].src0 = rs_z;
+                }
             } else {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
                 // and still make these values available when setting the inputs
@@ -726,6 +779,34 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
+    return true;
+}
+
+bool llama_memory_recurrent::copy_state(uint32_t il, int32_t cell, float * out, size_t n) const {
+    if (il >= s_l.size() || s_l[il] == nullptr || out == nullptr || cell < 0) {
+        return false;
+    }
+    const ggml_tensor * s = s_l[il];
+    if (s->buffer == nullptr || s->type != GGML_TYPE_F32 || (size_t) s->ne[0] != n) {
+        return false;
+    }
+    ggml_backend_tensor_get(s, out, (size_t) cell * ggml_row_size(s->type, s->ne[0]),
+                            ggml_row_size(s->type, s->ne[0]));
+    return true;
+}
+
+bool llama_memory_recurrent::set_init_state(uint32_t il, const float * data, size_t n) {
+    if (il >= s_l.size() || s_l[il] == nullptr || data == nullptr) {
+        return false;
+    }
+    if (s_l[il]->type != GGML_TYPE_F32 || (size_t) s_l[il]->ne[0] != n) {
+        return false;
+    }
+    if (init_s.size() < s_l.size()) {
+        init_s.resize(s_l.size());
+    }
+    init_s[il].assign(data, data + n);
+    init_pending = true;
     return true;
 }
 
@@ -1341,7 +1422,15 @@ uint32_t llama_memory_recurrent_context::get_head() const {
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
-    return is_full ? 0 : mem->rs_z;
+    if (is_full) {
+        return 0;
+    }
+    if (mem->init_cell >= 0 && mem->rs_z == mem->init_cell) {
+        // rs_z is the cell holding the state this decode starts from: it was injected by
+        // llama_set_ssm_state(), so it must not be zero-filled
+        return -1;
+    }
+    return mem->rs_z;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {

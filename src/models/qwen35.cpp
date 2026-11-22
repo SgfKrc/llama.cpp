@@ -46,7 +46,22 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    {
+        // A split head stores only the rows the model can actually emit. The reference
+        // implementation samples text positions with argmax(logits[:v0]), v0 = 248320 of 642496,
+        // so the 394176 circuit-token rows are unreachable from a text position -- storing them
+        // costs a 5.52 GiB bf16 matvec read on every token and buys nothing. The row count comes
+        // from the file, not from n_vocab: a tied (or full) checkpoint still creates the usual
+        // { n_embd, n_vocab } tensor here, so this load path is unchanged for it.
+        //
+        // The graph pads the narrower result back to n_vocab (llama_model_qwen35::graph::graph),
+        // because the context and the samplers index logits by n_vocab regardless.
+        int64_t n_vocab_out = n_vocab;
+        if (const struct ggml_tensor * t = ml.get_tensor_meta(tn(LLM_TENSOR_OUTPUT, "weight").str().c_str())) {
+            n_vocab_out = t->ne[1];
+        }
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
+    }
 
     // optional projection of the embeddings output
     cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
@@ -285,6 +300,15 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
         }
         cur = build_lora_mm(model.output, cur, model.output_s);
+
+        // A split head (see load_arch_tensors) is narrower than the vocabulary: it holds only the
+        // rows a text position can emit. Everything downstream -- output_reserve(), get_logits_ith(),
+        // the samplers -- strides logits by hparams.n_vocab, so pad the missing tail rows with 0
+        // here. The padding rows are the rows the split dropped, so no reachable logit changes; a
+        // full head does not pad at all (ne[1] == n_vocab), which keeps the tied path bit-identical.
+        if (model.output->ne[1] < model.vocab.n_tokens()) {
+            cur = ggml_pad(ctx0, cur, model.vocab.n_tokens(), cur->ne[1], cur->ne[2], cur->ne[3]);
+        }
 
         cb(cur, "result_output", -1);
         res->t_logits = cur;

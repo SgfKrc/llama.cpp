@@ -267,6 +267,13 @@ bool llm_graph_input_batch_idxs::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
+    // No rope node reads positions when the layer range has no attention layer (the chip segment:
+    // source layers 0..13 are all gated-delta-net), so the scheduler leaves `pos` without a buffer
+    // and writing it trips GGML_ASSERT(buf != NULL) in ggml_backend_tensor_set(). Unobservable,
+    // nothing consumes it -- skip.
+    if (pos != nullptr && pos->buffer == nullptr) {
+        return;
+    }
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1243,11 +1250,25 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // A layer range that contains no attention layer at all builds no KV consumer -- e.g. the chip
+    // segment (source layers 0..13) is 14 gated-delta-net layers and nothing else. The scheduler
+    // then never allocates self_k_idxs / self_v_idxs, and writing them dies in
+    // ggml_backend_buffer_get_type()'s GGML_ASSERT(buffer). Nothing in the graph can read the
+    // values (there is no attention node), so skipping the write is the whole fix; the null
+    // buffer is the signal that there is nobody to write for. Same test as the mask just below,
+    // and the same one llm_graph_input_mem_hybrid_k::set_input() uses for its mask.
+    if (inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs->buffer) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
 
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
-    mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    // or if the range has no attention layer at all -- see the k/v_idxs guard above
+    if (inp_attn->self_attn_mask.raw == nullptr || inp_attn->self_attn_mask.raw->buffer) {
+        mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2831,6 +2852,16 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         ggml_set_input(inp->tokens);
         res->t_inp_tokens = inp->tokens;
 
+        // Known gap #1 (not A+B): this stays F32, while the token path hands the first layer the token
+        // embedding's type (bf16 for a quantised checkpoint). The two activation types take different
+        // quantised matmul kernels, so a relay segment fed raw hidden does not reproduce a whole-model
+        // pass bit for bit -- measured on range 14:46 fed the whole model's layer-14 hidden: src14 (the
+        // first Q4_K layer) already differs by 2.4e-4 on the 2560 circuit dims, growing to 1.9e+00 by
+        // the head. Fixing it needs the input tensor itself to be bf16, and a graph-side cast or a bf16
+        // input tensor both make ggml_backend_sched fail to assign a backend
+        // (ggml-backend.cpp:1711, *cur_backend_id != -1), so that repair belongs in the scheduler and
+        // is left out of this change. Nothing here affects A (chip segment, token input) or B (the
+        // split head), see _m4ab/REPORT.md 7.1.
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
         cb(inp->embd, "inp_embd", -1);
         ggml_set_input(inp->embd);
@@ -2851,14 +2882,25 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         // tensor is null there. The GET_ROWS below is forced into the graph by
         // ggml_build_forward_order regardless of which branch `idx` later selects, so it
         // cannot stay unconditional. Such a segment only ever arrives as raw hidden.
-        if (tok_embd != nullptr) {
+        //
+        // The question is the loader's (src/qlh-layer-range.h needs_tok_embd()), not `tok_embd !=
+        // nullptr`: a range that starts at 14 keeps the tensor object -- the architecture indexes it
+        // and llama_model_qwen35::graph::graph calls build_inp_embd(model.tok_embd) unconditionally --
+        // but its rows were never read, it is a lazy placeholder. Building GET_ROWS on it gathers with
+        // inp->tokens, which an embd batch never sets (llm_graph_input_embd::set_input writes them only
+        // when ubatch->token is non-null), so the gather indexes with uninitialised row ids: measured
+        // on the text segment (range 14:46, embd input) two runs of the same command produced different
+        // logits (argmax 69811 vs 148466), i.e. out-of-bounds reads into a reused compute buffer.
+        const bool has_tok_rows = tok_embd != nullptr && hparams.needs_tok_embd();
+
+        if (has_tok_rows) {
             embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
             ggml_build_forward_order(gf, embd0);
         }
 
         embd1 = inp->embd;
 
-        if (has_mixed) {
+        if (has_mixed && has_tok_rows) {
             embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
@@ -2912,7 +2954,15 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     if (embd0 == nullptr) {
         // No token path exists (relay segment): the hidden input is the only
         // one, so there is nothing to select between.
-        GGML_ASSERT(!ubatch.token && "a context with no token embedding received tokens");
+        //
+        // No `!ubatch.token` assert: a reserve graph is built from
+        // llama_batch_allocr::ubatch_reserve(), whose dummy ubatch always carries a non-null token
+        // pointer (its rows are never read -- the reserve graph only needs the topology), so the
+        // pointer says nothing about what a real batch will carry. What makes this branch safe is
+        // the model, not the batch: the loader did not read token_embd rows for this range, so no
+        // token id could be resolved anyway. A real token batch reaching this segment is a caller
+        // bug that surfaces as garbage output, and the one place that can check it is the chain
+        // that builds the hop (llama_context::decode_split feeds raw hidden).
         cur = embd1;
     } else {
         // token embeddings path (ubatch.token != nullptr)

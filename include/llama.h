@@ -1210,6 +1210,16 @@ extern "C" {
     // Row r holds the token at batch index r, layers in ascending layer id order.
     LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
 
+    // Set the initial recurrent (SSM) state of layer `il`, for the first batch of a brand-new
+    // sequence: that decode starts from `data` instead of the zero state. `data` holds
+    // n_embd_s() floats of the layer's state tensor (its s_l layout); `n` must match. Consumed once
+    // by the next decode that begins a new sequence. Returns false when the layer has no recurrent
+    // state, the size does not match, or the context's memory is not hybrid.
+    LLAMA_API bool llama_set_ssm_state(struct llama_context * ctx, uint32_t il, const float * data, uint32_t n);
+
+    // Copy the recurrent (SSM) state of layer `il`, cell `cell`, out to `out` (n_embd_s floats).
+    LLAMA_API bool llama_get_ssm_state(struct llama_context * ctx, uint32_t il, int32_t cell, float * out, uint32_t n);
+
     // Whether decode accepts entries added with llama_batch_ext_add_embd_row()
     // (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
     LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);

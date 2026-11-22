@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory-split.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -6444,6 +6445,37 @@ bool llama_supports_embd_row(const llama_context * ctx) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_get_ssm_state(llama_context * ctx, uint32_t il, int32_t cell, float * out, uint32_t n) {
+    if (ctx == nullptr || out == nullptr) {
+        return false;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    if (hybrid == nullptr) {
+        return false;
+    }
+    auto * recr = hybrid->get_mem_recr();
+    return recr != nullptr && recr->copy_state(il, cell, out, n);
+}
+
+bool llama_set_ssm_state(llama_context * ctx, uint32_t il, const float * data, uint32_t n) {
+    if (ctx == nullptr || data == nullptr) {
+        LLAMA_LOG_ERROR("%s: null argument\n", __func__);
+        return false;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    if (hybrid == nullptr) {
+        LLAMA_LOG_ERROR("%s: the context's memory is not hybrid, no recurrent state to set\n", __func__);
+        return false;
+    }
+    auto * recr = hybrid->get_mem_recr();
+    if (recr == nullptr || !recr->set_init_state(il, data, n)) {
+        LLAMA_LOG_ERROR("%s: layer %u rejected the state (%u values)\n", __func__, il, n);
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: layer %u: %u floats stored as the initial state\n", __func__, il, n);
+    return true;
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

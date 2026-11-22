@@ -85,6 +85,23 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    // A caller-provided initial S state (llama_set_ssm_state) for the first batch of a brand-new
+    // sequence: one entry per layer, each hparams.n_embd_s() floats in the layout of s_l. find_slot()
+    // writes it into the cell that batch lands on and get_rs_z() then answers -1 for exactly one
+    // batch, so the graph's zero-fill does not overwrite it. Consumed once (init_pending -> false).
+    std::vector<std::vector<float>> init_s;
+    bool init_pending = false;
+    // the cell that holds the injected state; -1 once a real sequence has taken it over
+    int32_t init_cell = -1;
+
+    // Store the initial S state of layer `il` (n_embd_s floats). False when that layer has no
+    // recurrent state or it is not float32.
+    bool set_init_state(uint32_t il, const float * data, size_t n);
+
+    // Copy the S state of cell `cell` of layer `il` out (debug/introspection: the M3 probe dumps it
+    // before and after a decode to prove the injected state is what the graph reads).
+    bool copy_state(uint32_t il, int32_t cell, float * out, size_t n) const;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;
