@@ -13,6 +13,7 @@
 #include "llama-memory-split.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-chip-emb.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
@@ -2287,6 +2288,123 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ---- chip positions: the next token comes from the hidden's output code, not from the LM head ---
+//
+// A qwen35 checkpoint can store only the text rows of token_embd and describe the circuit rows
+// with a `llama_chip_emb` blob (`llama-chip-emb.h`); the circuit's own layers then run inside
+// llama.cpp. At a chip position the reference implementation never consults an LM head: it reads
+// the nfam+npay output-code columns of the hidden after the chip layers, turns their signs into
+// (family id, payload) and looks the token up (circuit/chipformer/rv/chat.py: code_token ->
+// core.decode_code -> _model_id). This reproduces that rule, which is what lets a split-head
+// checkpoint -- whose output.weight holds the text rows only -- generate chip tokens at all.
+//
+// Everything except the printable table comes from the blob, which already carries it for the
+// embedding rebuild: code_cols[nfam+npay], ranges (family base/size, chip-space ids) and ctrls.
+// "Q" -- the text echo -- is the one family whose payload indexes data the blob does not have: the
+// printable tokens of tokenizer.json, emitted here from the checkpoint's chipformer.json.
+static const uint32_t CHIP_CODE_PRINTABLE[] = {
+    188, 189, 190, 191, 192, 193, 194, 195,
+    196, 197, 198, 199, 200, 201, 202, 203,
+    204, 205, 206, 207, 208, 209, 210, 211,
+    212, 213, 214, 215, 216, 217, 218, 219,
+    220, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22,
+    23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32, 33, 34, 35, 36, 37, 38,
+    39, 40, 41, 42, 43, 44, 45, 46,
+    47, 48, 49, 50, 51, 52, 53, 54,
+    55, 56, 57, 58, 59, 60, 61, 62,
+    63, 64, 65, 66, 67, 68, 69, 70,
+    71, 72, 73, 74, 75, 76, 77, 78,
+    79, 80, 81, 82, 83, 84, 85, 86,
+    87, 88, 89, 90, 91, 92, 93, 221,
+    222, 223, 224, 225, 226, 227, 228, 229,
+    230, 231, 232, 233, 234, 235, 236, 237,
+    238, 239, 240, 241, 242, 243, 244, 245,
+    246, 247, 248, 249, 250, 251, 252, 253,
+    254, 94, 95, 96, 97, 98, 99, 100,
+    101, 102, 103, 104, 105, 255, 106, 107,
+    108, 109, 110, 111, 112, 113, 114, 115,
+    116, 117, 118, 119, 120, 121, 122, 123,
+    124, 125, 126, 127, 128, 129, 130, 131,
+    132, 133, 134, 135, 136, 137, 138, 139,
+    140, 141, 142, 143, 144, 145, 146, 147,
+    148, 149, 150, 151, 152, 153, 154, 155,
+    156, 157, 158, 159, 160, 161, 162, 163,
+    164, 165, 166, 167, 168, 169, 170, 171,
+    172, 173, 174, 175, 176, 177, 178, 179,
+    180, 181, 182, 183, 184, 185, 186, 187,
+    248066, 248067, 248068, 248069,
+};
+static constexpr uint32_t CHIP_CODE_PRINTABLE_N =
+        sizeof(CHIP_CODE_PRINTABLE)/sizeof(CHIP_CODE_PRINTABLE[0]);
+
+// chipformer.json "chip_layers": the chip segment is source layers [0, 13), so its exit -- the
+// hidden whose output code holds the prediction -- is the input of source layer 13.
+static constexpr int QWEN35_CHIP_LAYERS = 13;
+
+// LLAMA_CHIP_CODE_TOKEN: 0 disables the decoding below, 1 (the default) takes it only where the
+// LM head cannot answer (a segment with no head of its own), and "force" takes it even when the
+// checkpoint still stores a full head -- that is the setting the two readings are compared under,
+// because it makes one file produce both the head's argmax and the code's token.
+static int chip_code_token_mode() {
+    static const int mode = []() -> int {
+        const char * e = std::getenv("LLAMA_CHIP_CODE_TOKEN");
+        if (e == nullptr) {
+            return 1;
+        }
+        if (e[0] == '0' && e[1] == '\0') {
+            return 0;
+        }
+        return std::string(e) == "force" ? 2 : 1;
+    }();
+    return mode;
+}
+
+// decode_code() + _model_id() for one hidden row: `out` is a model token id, i.e. a chip id
+// (v0 + the circuit's token) or, for the text echo, the Qwen id itself. Returns false when the
+// code names no token -- the reference implementation raises there.
+static bool llama_chip_code_token(const llama_chip_emb & ce, const float * hidden_row, int64_t & out) {
+    const int nfam = (int) ce.nfam;
+    const int npay = (int) ce.npay;
+    if (nfam <= 0 || npay <= 0 || (int) ce.code_cols.size() < nfam + npay || ce.ranges.empty()) {
+        return false;
+    }
+
+    uint32_t fid = 0, payload = 0;
+    for (int i = 0; i < nfam; ++i) {
+        fid |= (uint32_t) (hidden_row[ce.code_cols[i]] > 0.0f) << i;
+    }
+    for (int i = 0; i < npay; ++i) {
+        payload |= (uint32_t) (hidden_row[ce.code_cols[nfam + i]] > 0.0f) << i;
+    }
+
+    const uint32_t n_fam  = (uint32_t) ce.ranges.size();
+    const uint32_t n_ctrl = (uint32_t) ce.ctrls.size();
+
+    if (fid < n_fam) {
+        const auto & r = ce.ranges[fid];
+        if (payload >= r.size) {
+            return false;
+        }
+        out = (int64_t) ce.v0 + (int64_t) r.base + (int64_t) payload;
+        return true;
+    }
+    if (fid < n_fam + n_ctrl) {
+        out = (int64_t) ce.v0 + (int64_t) ce.ctrls[fid - n_fam].id;   // a control: no payload
+        return true;
+    }
+    if (fid == n_fam + n_ctrl) {
+        if (payload >= CHIP_CODE_PRINTABLE_N) {
+            return false;
+        }
+        out = (int64_t) CHIP_CODE_PRINTABLE[payload];                 // a Qwen id, no v0 offset
+        return true;
+    }
+    return false;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     // Both kinds of stage mean "this context drives a chain": a remote-only chain has an empty
     // split_stages, and checking just that sent the whole request down the plain path with the
@@ -4049,6 +4167,38 @@ int llama_context::decode_plain(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+            }
+        }
+
+        // k0v5: a chip position's next token, decoded from the hidden's output code (see
+        // llama_chip_code_token above). Only for a segment with no head of its own -- a split-head
+        // checkpoint's output.weight holds the text rows only, so its row of logits cannot name a
+        // chip token -- and only for a single-token decode, which is the reference implementation's
+        // own operating mode. A full head never takes this path, so its logits stay bit for bit.
+        if (logits.data && n_outputs > 0 && ubatch.n_tokens == 1 && ubatch.token != nullptr) {
+            const auto * chip_ce = model.chip_emb.get();
+            const bool chip_in = chip_ce != nullptr && !chip_ce->code_cols.empty() &&
+                    (int64_t) ubatch.token[0] >= (int64_t) chip_ce->v0;
+            const bool has_own_head = model.output != nullptr && model.output->ne[1] >= n_vocab;
+            const int  code_mode    = chip_code_token_mode();
+            if (chip_in && code_mode > 0 && (!has_own_head || code_mode == 2)) {
+                const int hc_local = QWEN35_CHIP_LAYERS - (int) hparams.layer_lo;
+                ggml_tensor * hc = hc_local >= 0 && hc_local < (int) hparams.n_layer()
+                        ? res->get_layer_inp(hc_local) : nullptr;
+                if (hc != nullptr && hc->data != nullptr && hc->ne[0] == hparams.n_embd) {
+                    // the hidden only has to be alive until the next ubatch is submitted
+                    synchronize();
+                    std::vector<float> hidden_row((size_t) hc->ne[0]);
+                    ggml_backend_tensor_get(hc, hidden_row.data(), 0,
+                                            hidden_row.size()*sizeof(float));
+                    int64_t chip_tok = -1;
+                    if (llama_chip_code_token(*chip_ce, hidden_row.data(), chip_tok) &&
+                        chip_tok >= 0 && chip_tok < n_vocab) {
+                        float * out = logits.data + (size_t) n_outputs_prev*n_vocab;
+                        std::fill(out, out + n_vocab, -std::numeric_limits<float>::infinity());
+                        out[chip_tok] = 0.0f;
+                    }
+                }
             }
         }
 
