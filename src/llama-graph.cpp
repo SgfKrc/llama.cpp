@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-chip-emb.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
@@ -132,11 +133,78 @@ static llm_attn_mask build_attn_inp_attn_mask(
 
 // impl
 
+// Fill `dst` ([n_embd, n]) with the embedding rows of `ids`, one row per id. The rows a
+// checkpoint stores are copied straight out of `table`; the rows it does not store are rebuilt
+// from `chip` (see llama-chip-emb.h). This is the token path of a table narrower than the
+// vocabulary: instead of gathering in the graph it produces the batch's rows on the host.
+static void llm_tok_rows_fill(
+        const ggml_tensor * table, const llama_chip_emb * chip,
+        const int32_t * ids, int64_t n, ggml_tensor * dst) {
+    GGML_ASSERT(table != nullptr && chip != nullptr && dst != nullptr);
+    GGML_ASSERT(ids != nullptr || n == 0);
+    // ggml_get_rows, whose place this takes on the token path, returns F32 whatever the table is
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd    = dst->ne[0];
+    const size_t  row_bytes = ggml_row_size(table->type, n_embd);
+
+    // A host-host copy is what the token table normally is (`token_embd` stays on the CPU); a
+    // device-resident table is read back row by row, which is still one small copy per token.
+    const bool host_table = table->buffer == nullptr ? table->data != nullptr
+                                                     : ggml_backend_buffer_is_host(table->buffer);
+
+    std::vector<float>   rows((size_t) n * n_embd);
+    std::vector<uint8_t> row(row_bytes);
+
+    for (int64_t i = 0; i < n; ++i) {
+        const uint32_t id = (uint32_t) ids[i];
+        float * out = rows.data() + (size_t) i * n_embd;
+
+        if ((int64_t) id < chip->n_stored) {
+            if (host_table) {
+                std::memcpy(row.data(), (const uint8_t *) table->data + (size_t) id * table->nb[1], row_bytes);
+            } else {
+                ggml_backend_tensor_get(table, row.data(), (size_t) id * table->nb[1], row_bytes);
+            }
+        } else {
+            GGML_ASSERT(row_bytes == (size_t) chip->hidden * 2);
+            chip->make_row((uint16_t *) row.data(), id);
+        }
+
+        if (table->type == GGML_TYPE_F32) {
+            std::memcpy(out, row.data(), row_bytes);
+        } else if (table->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) row.data(), out, n_embd);
+        } else {
+            GGML_ASSERT(table->type == GGML_TYPE_BF16);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) row.data(), out, n_embd);
+        }
+    }
+
+    if (n > 0) {
+        ggml_backend_tensor_set(dst, rows.data(), 0, rows.size() * sizeof(float));
+    }
+}
+
+void llm_graph_input_embd::build_tok_rows(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->token && embd_tok && tok_embd_w && chip_emb);
+
+    llm_tok_rows_fill(tok_embd_w, chip_emb, ubatch->token, ubatch->n_tokens, embd_tok);
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        // the token ids have no consumer when the rows are produced on the host (embd_tok): the
+        // scheduler then leaves the tensor without a buffer and writing it trips GGML_ASSERT(buf)
+        if (tokens->buffer) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
+
+        if (embd_tok) {
+            build_tok_rows(ubatch);
+        }
     }
 
     if (ubatch->embd_row && embd_rows) {
@@ -167,9 +235,16 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT((int64_t) ids.size() == mixed_tokens->ne[0]);
         GGML_ASSERT(n_embd == mixed_embd->ne[0]);
 
-        ggml_backend_tensor_set(mixed_tokens, ids.data(),    0, ggml_nbytes(mixed_tokens));
+        // the ids have no consumer when the rows are produced on the host (mixed_tok_embd)
+        if (!mixed_tok_embd && mixed_tokens->buffer) {
+            ggml_backend_tensor_set(mixed_tokens, ids.data(),    0, ggml_nbytes(mixed_tokens));
+        }
         ggml_backend_tensor_set(mixed_slots,  slots.data(),  0, ggml_nbytes(mixed_slots));
         ggml_backend_tensor_set(mixed_embd,   ubatch->embd,  0, ggml_nbytes(mixed_embd));
+
+        if (mixed_tok_embd) {
+            llm_tok_rows_fill(tok_embd_w, chip_emb, ids.data(), (int64_t) ids.size(), mixed_tok_embd);
+        }
     }
 
     if (scale_rows) {
@@ -200,6 +275,8 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    res &= (!embd_tok) || embd_tok->ne[1] == params.ubatch.n_tokens;
+    res &= (!mixed_tok_embd) || mixed_tok_embd->ne[1] == llm_graph_n_tok_rows(params.ubatch);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
     res &= (!mixed_embd)   || mixed_embd->ne[1]   == params.ubatch.n_tokens;
@@ -216,6 +293,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+
+        if (embd_tok) {
+            llm_tok_rows_fill(tok_embd_w, chip_emb, ubatch->token, n_tokens, embd_tok);
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
@@ -240,6 +321,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    res &= (!embd_tok)                 || embd_tok->ne[1] == params.ubatch.n_tokens;
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
@@ -2893,16 +2975,40 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         // logits (argmax 69811 vs 148466), i.e. out-of-bounds reads into a reused compute buffer.
         const bool has_tok_rows = tok_embd != nullptr && hparams.needs_tok_embd();
 
+        // A table narrower than the vocabulary has no row to gather for a circuit token: the rows
+        // are produced on the host instead (llm_tok_rows_fill), which is what keeps the 3.38 GiB
+        // of chip rows out of RAM and VRAM rather than only out of the file.
+        const bool prog_rows = has_tok_rows && model.chip_emb != nullptr;
+
         if (has_tok_rows) {
-            embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-            ggml_build_forward_order(gf, embd0);
+            if (prog_rows) {
+                inp->embd_tok = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+                cb(inp->embd_tok, "inp_embd_tok", -1);
+                ggml_set_input(inp->embd_tok);
+
+                inp->tok_embd_w = tok_embd;
+                inp->chip_emb   = model.chip_emb.get();
+
+                embd0 = inp->embd_tok;
+            } else {
+                embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+                ggml_build_forward_order(gf, embd0);
+            }
         }
 
         embd1 = inp->embd;
 
         if (has_mixed && has_tok_rows) {
-            embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
-            ggml_build_forward_order(gf, embd2);
+            if (prog_rows) {
+                inp->mixed_tok_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tok_rows);
+                cb(inp->mixed_tok_embd, "inp_mixed_tok_embd", -1);
+                ggml_set_input(inp->mixed_tok_embd);
+
+                embd2 = inp->mixed_tok_embd;
+            } else {
+                embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
+                ggml_build_forward_order(gf, embd2);
+            }
         }
     }
 
@@ -2972,7 +3078,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         inps[1] = embd1;
 
         assert(ggml_are_same_shape (inps[0], inps[1]));
-        assert(ggml_are_same_stride(inps[0], inps[1]));
+        // the token path carries the token embedding's type (bf16 for a quantised checkpoint), the
+        // vector path is always F32 -- the strides only agree when the two types are the same
+        assert(inps[0]->type != inps[1]->type || ggml_are_same_stride(inps[0], inps[1]));
 
         if (has_mixed) {
             inp->mixed_slots = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tok_rows);
@@ -2988,7 +3096,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             inps[2] = ggml_set_rows(ctx0, ggml_dup(ctx0, inp->mixed_embd), embd_mixed, inp->mixed_slots);
 
             assert(ggml_are_same_shape (inps[0], inps[2]));
-            assert(ggml_are_same_stride(inps[0], inps[2]));
+            assert(inps[0]->type != inps[2]->type || ggml_are_same_stride(inps[0], inps[2]));
         }
 
         const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;

@@ -18,6 +18,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_model;
+struct llama_chip_emb;
 
 // available models
 enum llm_type {
@@ -833,6 +834,13 @@ struct llama_model {
     struct ggml_tensor * pos_embd   = nullptr;
     struct ggml_tensor * tok_norm   = nullptr;
     struct ggml_tensor * tok_norm_b = nullptr;
+
+    // Rows of `tok_embd` that are not in the file at all: a k0v3 checkpoint stores only the text
+    // rows and describes the circuit-token rows with an 826-byte blob (see llama-chip-emb.h).
+    // Null for every other model, in which case `tok_embd` holds the whole vocabulary and the
+    // graph gathers from it as it always has. When set, `tok_embd->ne[1]` is the number of stored
+    // rows (smaller than the vocabulary) and token ids from there up are rebuilt on demand.
+    std::unique_ptr<llama_chip_emb> chip_emb;
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix

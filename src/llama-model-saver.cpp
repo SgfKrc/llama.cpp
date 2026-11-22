@@ -11,6 +11,7 @@
 #include "llama-vocab.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -517,6 +518,12 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
+    if (model->chip_emb) {
+        // The table holds only the text rows; the rest is a kv blob this saver does not write, so
+        // saving would silently produce a checkpoint that cannot be loaded back.
+        throw std::runtime_error(
+                "saving a model whose token embedding is rebuilt from a chip embedding blob is not supported");
+    }
     if (model->output != nullptr &&
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output

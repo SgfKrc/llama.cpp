@@ -18,6 +18,7 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
+struct llama_chip_emb;
 struct llama_layer;
 struct llama_model;
 struct llama_prec_policy;
@@ -140,6 +141,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // Materialise the token rows of this batch into `embd_tok` on the host: the stored rows are
+    // copied out of `tok_embd_w`, the rows a checkpoint did not store are rebuilt by `chip_emb`
+    // (see llama-chip-emb.h). Called instead of gathering from the table when that table is
+    // narrower than the vocabulary.
+    void build_tok_rows(const llama_ubatch * ubatch);
+
     ggml_tensor * tokens       = nullptr; // I32 [n_batch]
     ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
@@ -147,6 +154,14 @@ public:
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
     ggml_tensor * embd_rows    = nullptr; // I32 [n_batch], embd row path: rows of ctx_other's layer input device buffer
+
+    // token path for a table narrower than the vocabulary: the rows are produced on the host
+    // (stored rows copied, missing rows rebuilt) instead of gathered from the table in the graph
+    ggml_tensor * embd_tok       = nullptr; // F32 [n_embd, n_batch], the type ggml_get_rows returns
+    ggml_tensor * mixed_tok_embd = nullptr; // F32 [n_embd, n_tok_rows], mixed path
+
+    const ggml_tensor *     tok_embd_w = nullptr;
+    const llama_chip_emb *  chip_emb   = nullptr;
 
     float scale_tok = 1.0f;
 
@@ -167,6 +182,12 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch], the host input or the rows gathered with h_rows
     ggml_tensor * h_rows = nullptr; // I32 [n_batch], rows of the h_nextn device buffer of ctx_state_src, nullptr on the host path
+
+    // token path of a table narrower than the vocabulary: the token rows are produced on the
+    // host instead of gathered from the table, see llm_graph_input_embd::embd_tok
+    ggml_tensor *           embd_tok   = nullptr; // F32 [n_embd, n_batch], the type ggml_get_rows returns
+    const ggml_tensor *     tok_embd_w = nullptr;
+    const llama_chip_emb *  chip_emb   = nullptr;
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;

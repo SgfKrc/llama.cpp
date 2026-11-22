@@ -14,6 +14,7 @@ set(LLAMA_CORE_SOURCES
     llama-arch.cpp
     llama-batch.cpp
     llama-chat.cpp
+    llama-chip-emb.cpp
     llama-context.cpp
     llama-cparams.cpp
     llama-grammar.cpp

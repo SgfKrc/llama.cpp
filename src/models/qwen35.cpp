@@ -1,5 +1,10 @@
 #include "models.h"
+#include "llama-chip-emb.h"
 #include "llama-memory-recurrent.h"
+
+#include "gguf.h"
+
+#include <cinttypes>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -42,7 +47,118 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // A checkpoint may keep only the text rows of the token embedding and describe the
+    // circuit-token rows with a small kv blob (see llama-chip-emb.h). The row count comes from the
+    // file for the same reason the output head's does below: the file is the authority on how many
+    // rows exist, and a full (or tied) checkpoint still creates the usual { n_embd, n_vocab }
+    // tensor here, so its load path is unchanged.
+    //
+    // The chip rows are never materialised: the decoder rebuilds the rows a batch asks for (see
+    // llama-graph.cpp, llm_graph_input_embd::set_input), which is what takes the 3.38 GiB out of
+    // RAM/VRAM and not merely out of the file.
+    int64_t n_vocab_embd = n_vocab;
+    if (const struct ggml_tensor * t = ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str())) {
+        n_vocab_embd = t->ne[1];
+    }
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_embd }, 0);
+
+    if (n_vocab_embd < n_vocab) {
+        const struct gguf_context * kv = ml.metadata;
+
+        auto kv_lookup = [&](const char * key) -> int64_t {
+            return gguf_find_key(kv, key);
+        };
+        auto kv_u32 = [&](const char * key, bool required, uint32_t & out) -> bool {
+            const int64_t kid = kv_lookup(key);
+            if (kid < 0) {
+                if (required) {
+                    throw std::runtime_error(format("qwen35: missing key '%s' for a partial token embedding", key));
+                }
+                return false;
+            }
+            if (gguf_get_kv_type(kv, kid) != GGUF_TYPE_UINT32) {
+                throw std::runtime_error(format("qwen35: key '%s' is not a uint32", key));
+            }
+            out = gguf_get_val_u32(kv, kid);
+            return true;
+        };
+        auto kv_str = [&](const char * key, bool required, std::string & out) -> bool {
+            const int64_t kid = kv_lookup(key);
+            if (kid < 0) {
+                if (required) {
+                    throw std::runtime_error(format("qwen35: missing key '%s' for a partial token embedding", key));
+                }
+                return false;
+            }
+            if (gguf_get_kv_type(kv, kid) != GGUF_TYPE_STRING) {
+                throw std::runtime_error(format("qwen35: key '%s' is not a string", key));
+            }
+            out = gguf_get_val_str(kv, kid);
+            return true;
+        };
+        auto kv_u8_array = [&](const char * key, bool required) -> std::vector<uint8_t> {
+            const int64_t kid = kv_lookup(key);
+            if (kid < 0) {
+                if (required) {
+                    throw std::runtime_error(format("qwen35: missing key '%s' for a partial token embedding", key));
+                }
+                return {};
+            }
+            if (gguf_get_kv_type(kv, kid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(kv, kid) != GGUF_TYPE_UINT8) {
+                throw std::runtime_error(format("qwen35: key '%s' is not an array of uint8", key));
+            }
+            const size_t n = gguf_get_arr_n(kv, kid);
+            const void * data = gguf_get_arr_data(kv, kid);
+            if (n > 0 && data == nullptr) {
+                throw std::runtime_error(format("qwen35: key '%s' has no data", key));
+            }
+            const uint8_t * p = (const uint8_t *) data;
+            return std::vector<uint8_t>(p, p + n);
+        };
+
+        std::string format_name;
+        kv_str("qwen35.chip_emb_format", true, format_name);
+        if (format_name != "rv1-chip-emb-v1") {
+            throw std::runtime_error(format("qwen35: unsupported chip embedding format '%s'", format_name.c_str()));
+        }
+
+        uint32_t embedded_off = 0, n_chip = 0, n_kernel_rows = 0, n_pad_rows = 0;
+        kv_u32("qwen35.chip_emb_offset",      true,  embedded_off);
+        kv_u32("qwen35.chip_emb_rows",        true,  n_chip);
+        kv_u32("qwen35.chip_emb_kernel_rows", false, n_kernel_rows);
+        kv_u32("qwen35.chip_emb_pad_rows",    false, n_pad_rows);
+
+        if ((int64_t) embedded_off != n_vocab_embd) {
+            throw std::runtime_error(format(
+                    "qwen35: token_embd has %" PRId64 " rows but the chip rows start at %u",
+                    n_vocab_embd, embedded_off));
+        }
+        if (n_vocab_embd + n_chip + n_kernel_rows + n_pad_rows != (int64_t) n_vocab) {
+            throw std::runtime_error(format(
+                    "qwen35: %" PRId64 " stored + %u chip + %u kernel + %u pad rows do not add up to the %" PRId64 " tokens of the vocabulary",
+                    n_vocab_embd, n_chip, n_kernel_rows, n_pad_rows, n_vocab));
+        }
+
+        // The rebuild writes bf16 bit patterns, so a quantised table cannot take this path.
+        if (tok_embd->type != GGML_TYPE_BF16) {
+            throw std::runtime_error(format(
+                    "qwen35: a partial token embedding needs bf16 rows, this table is %s",
+                    ggml_type_name(tok_embd->type)));
+        }
+
+        const std::vector<uint8_t> blob   = kv_u8_array("qwen35.chip_emb_meta",   true);
+        const std::vector<uint8_t> kernel = kv_u8_array("qwen35.chip_emb_kernel", false);
+
+        auto chip = std::make_unique<llama_chip_emb>();
+        std::string err;
+        if (!chip->parse(blob, kernel, n_vocab_embd, n_vocab, n_embd, err)) {
+            throw std::runtime_error("qwen35: " + err);
+        }
+        LLAMA_LOG_INFO("%s: token_embd has %" PRId64 " rows in the file; %" PRId64
+                " circuit rows rebuilt on demand from a %zu-byte blob (+ %" PRId64 " kernel, %" PRId64
+                " pad rows)\n", __func__, chip->n_stored, chip->n_chip, blob.size(), chip->n_kernel, chip->n_pad);
+        chip_emb = std::move(chip);
+    }
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
@@ -69,6 +185,13 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
+        if (chip_emb) {
+            // A tied head is the token embedding itself, so it needs every row of the vocabulary;
+            // this checkpoint dropped the rows the tied head would have to emit.
+            throw std::runtime_error(
+                    "qwen35: a checkpoint with programmatic chip rows must also store a separate "
+                    "output.weight (the tied head is the full-vocabulary table)");
+        }
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -615,7 +738,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        if (model.chip_emb && tok_embd_w == model.tok_embd) {
+            // The main table stores only the text rows: the MTP block's token rows are produced on
+            // the host like the main graph's (see llm_graph_input_embd::embd_tok). A dedicated
+            // nextn.embed_tokens table is a full one and keeps the gather path.
+            inp->embd_tok = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd_tok);
+            ggml_set_name(inp->embd_tok, "mtp_tok_embd_rows");
+
+            inp->tok_embd_w = tok_embd_w;
+            inp->chip_emb   = model.chip_emb.get();
+
+            tok_embd = inp->embd_tok;
+        } else {
+            tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        }
 
         // a Hadamard-latent table stores rotated rows; restore the primal basis
         if (hdmd) {

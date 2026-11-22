@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-chip-emb.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -2466,6 +2467,15 @@ void llama_model_base::load_tensors_hadamard() {
         return;
     }
 
+    // The rows rebuilt from a chip embedding blob are the primal ones, while a Hadamard fold stores
+    // a rotated table; supporting both at once would mean rotating every rebuilt row, which nothing
+    // needs (k0v3 has neither prism.hadamard nor this combination).
+    if (chip_emb && (hdmd.weight_blocks.count("token_embd.weight") ||
+                     hdmd.inverse_blocks.count("token_embd.weight"))) {
+        throw std::runtime_error(
+                "a Hadamard-folded token embedding cannot also be rebuilt from a chip embedding blob");
+    }
+
     struct hadamard_rotation {
         uint32_t block_size;
         ggml_backend_buffer_type_t buft;
@@ -4354,20 +4364,54 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
     }
 }
 
+// rows [row0, row0 + n_rows) of the token embedding as F32. A checkpoint can store only the text
+// rows and describe the rest with a blob (see llama-chip-emb.h): those rows are rebuilt here
+// instead of being read from the tensor, whose ne[1] is the stored row count, not the vocabulary.
+static void llama_tok_embd_rows_to_f32(const struct llama_model * model, int64_t row0, int64_t n_rows, float * out) {
+    const ggml_tensor * tensor = model->tok_embd;
+
+    if (model->chip_emb == nullptr || row0 + n_rows <= tensor->ne[1]) {
+        llama_tensor_rows_to_f32(tensor, row0, n_rows, out);
+        return;
+    }
+
+    const int64_t n_embd    = tensor->ne[0];
+    const size_t  row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+
+    std::vector<uint8_t> row(row_bytes);
+    for (int64_t i = 0; i < n_rows; ++i) {
+        const int64_t r = row0 + i;
+        float * dst = out + (size_t) i * n_embd;
+
+        if (r < tensor->ne[1]) {
+            ggml_backend_tensor_get(tensor, row.data(), (size_t) r * tensor->nb[1], row_bytes);
+        } else {
+            model->chip_emb->make_row((uint16_t *) row.data(), (uint32_t) r);
+        }
+
+        // the rebuild path is bf16-only (checked when the model loaded)
+        GGML_ASSERT(tensor->type == GGML_TYPE_BF16);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) row.data(), dst, n_embd);
+    }
+}
+
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
     if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
         return 0;
     }
 
     const ggml_tensor * tensor = model->tok_embd;
-    const size_t nelements = ggml_nelements(tensor);
+    // the vocabulary, not the stored rows: a table narrower than the vocabulary still answers for
+    // every token, the missing rows being rebuilt on demand
+    const int64_t n_rows = model->chip_emb != nullptr ? model->vocab.n_tokens() : tensor->ne[1];
+    const size_t nelements = (size_t) n_rows * tensor->ne[0];
     GGML_ASSERT(nelements <= UINT32_MAX); // for the return type
 
     if (out == nullptr) {
         return (uint32_t) nelements;
     }
 
-    llama_tensor_rows_to_f32(tensor, 0, tensor->ne[1], out);
+    llama_tok_embd_rows_to_f32(model, 0, n_rows, out);
 
     return (uint32_t) nelements;
 }
@@ -4386,11 +4430,13 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
     }
 
     const ggml_tensor * tensor = model->tok_embd;
+    // bound against the vocabulary, not the stored rows (see llama_tok_embd_rows_to_f32)
+    const int64_t n_vocab = model->chip_emb != nullptr ? model->vocab.n_tokens() : tensor->ne[1];
     for (uint32_t i = 0; i < n_tokens; i++) {
-        if (tokens[i] < 0 || tokens[i] >= tensor->ne[1]) {
+        if (tokens[i] < 0 || tokens[i] >= n_vocab) {
             return 0;
         }
-        llama_tensor_rows_to_f32(tensor, tokens[i], 1, out + (size_t) i * tensor->ne[0]);
+        llama_tok_embd_rows_to_f32(model, tokens[i], 1, out + (size_t) i * tensor->ne[0]);
     }
 
     return n_tokens * (uint32_t) tensor->ne[0];
