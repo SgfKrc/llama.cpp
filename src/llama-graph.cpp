@@ -614,20 +614,39 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// Write the state copy map of this batch: entry i names the cache cell sequence i reads.
+//
+// Nothing reads the map when build_rs() aliases the state instead of gathering it (a single-cell
+// cache makes the map the identity, see the fast path there), and the scheduler then leaves the
+// input tensor without a buffer -- writing it would trip ggml_backend_buffer_get_type()'s
+// GGML_ASSERT(buffer), the same way an unconsumed token-id input does (see
+// llm_graph_input_embd::set_input). The loop has to run even without a buffer though: s_copy() is
+// what advances the per-sequence rollback index, so skipping the call would change which snapshot
+// slot the next batch writes.
+static void llm_rs_write_copy(const ggml_tensor * s_copy, const llama_memory_recurrent_context * mctx) {
+    if (s_copy == nullptr) {
+        return;
+    }
+
+    int32_t * data = nullptr;
+    if (s_copy->buffer != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+        data = (int32_t *) s_copy->data;
+    }
+
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (int64_t i = 0; i < s_copy->ne[0]; ++i) {
+        const int32_t v = mctx->s_copy((int) i);
+        if (data != nullptr) {
+            data[i] = v;
+        }
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    const int64_t n_rs = mctx->get_n_rs();
-
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
-        }
-    }
+    llm_rs_write_copy(s_copy, mctx);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1352,17 +1371,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_rs_write_copy(inp_rs->s_copy, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1398,17 +1407,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_rs_write_copy(inp_rs->s_copy, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1455,17 +1454,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_rs_write_copy(inp_rs->s_copy, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1534,17 +1523,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_rs_write_copy(inp_rs->s_copy, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -4372,7 +4351,6 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
@@ -4386,7 +4364,23 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_rs - i0}
     const int64_t i0 = n_rs - state_copy->ne[0];
 
-    ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+    // With a single cell the gather below is the identity: the cell is the whole window
+    // (rs_head == 0) and the zero state (rs_z) at once, so s_copy(0) == 0 no matter how the batch
+    // reached it, and states_all would only re-copy the bytes the consumer reads. That copy is not
+    // cheap: it is one row of the S state per recurrent layer (2 MiB each in a 14-layer chip
+    // segment), and on the CUDA backend it was the second largest kernel of a decode step. The
+    // write side already updates the cache in place (ggml_cuda_try_gdn_cache_fusion), so the read
+    // side was the only redundant recurrent-state traffic left. Guarded on the full map:
+    // get_state_rows' s_copy_tail has n_rs - 1 entries and must keep the gather.
+    const bool state_identity =
+        (int64_t) state_copy->ne[0] == (int64_t) n_rs &&   // the whole map, not the tail variant
+        rs_size == 1 &&                                   // one cell: cells[0].src0 is 0 even when fresh
+        rs_head == 0 &&
+        n_rs == (uint32_t) n_seqs;                        // nothing beyond the ubatch states to carry
+
+    // the identity map needs no buffer of its own: `s` already holds the rows in cell order
+    // (`states` is a 2D reshape of it, so reading `s` gives the same bytes and strides)
+    ggml_tensor * states_all = state_identity ? s : ggml_get_rows(ctx0, states, state_copy);
 
     ggml_tensor * output_states = get_state_rows ?
         get_state_rows(ctx0, states, state_copy_main) :
