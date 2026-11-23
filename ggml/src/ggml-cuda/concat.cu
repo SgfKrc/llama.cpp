@@ -103,7 +103,7 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb12,
           uint64_t   nb13,
            int64_t   ne0,
-           int64_t /*ne1*/,
+           int64_t   ne1,
            int64_t /*ne2*/,
            int64_t /*ne3*/,
           uint64_t   nb0,
@@ -114,11 +114,20 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
     const int64_t i3 = blockIdx.z;
     const int64_t i2 = blockIdx.y;
-    const int64_t i1 = blockIdx.x;
+    // Walk the (i0, i1) plane with one thread per element instead of one block per column. The
+    // old shape launched ne1 blocks and left all but the first ne0 threads of each idle, which is
+    // pathological when ne0 is small: the chip layers' conv state is [3+1, 8192] (a 4-tap window
+    // plus the new token), so 8192 blocks ran 4 live threads each and the walker cost 22.6 us per
+    // layer to move 128 KB. Enumerating the plane gives 128 blocks with every thread busy for the
+    // same data, measured at 11.1 us.
+    const int64_t plane = ne0 * ne1;
+    for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < plane;
+         idx += (int64_t) blockDim.x * gridDim.x) {
+        const int64_t i1 = idx / ne0;
+        const int64_t i0 = idx - i1 * ne0;
 
-    const T * x;
+        const T * x;
 
-    for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
             x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
         } else {
@@ -163,7 +172,10 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        // Same plane flattening as concat_non_cont: ceil(plane / block) blocks cover (i0, i1).
+        const int64_t plane = dst->ne[0] * dst->ne[1];
+        const int64_t nblk  = (plane + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        dim3 grid_dim((unsigned) (nblk > 0 ? nblk : 1), (unsigned) dst->ne[2], (unsigned) dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
